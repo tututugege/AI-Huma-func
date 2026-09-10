@@ -1,0 +1,39 @@
+# Build Artifacts
+a.out
+librefcpu.a
+*.o
+*.d
+compile_commands.json
+
+# Simulation Logs
+*.log
+spike.log
+sim_output*.log
+bzip2_fault*.log
+
+# SimPoint & BBV Files
+*.bb
+*.points
+*.weights
+SimPoint/*.bb
+SimPoint/*.points
+SimPoint/*.weights
+test.points
+
+# Checkpoints
+checkpoint/
+
+# IDE & System
+.cache/
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+
+# Temporary / OS generated
+tmp/
+
+# Large Spike-related prebuilt libs
+lib/libriscv.so
+lib/libfesvr.a
