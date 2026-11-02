@@ -269,3 +269,24 @@ bool refcpu_probe_pc_translation(RefCpuContext *ctx) {
   uint32_t p_addr = 0;
   return ctx->cpu.va2pa(p_addr, ctx->cpu.state.pc, 0);
 }
+
+// Data-side translation probe (no side effects): same decision as the load/store paths
+// in exec.cpp (and the fetch path for type 0). type: 0 = fetch, 1 = load, 2 = store. Returns false on a page fault.
+bool refcpu_translate_data(RefCpuContext *ctx, uint32_t v_addr, uint32_t type,
+                           uint32_t *p_addr) {
+  uint32_t p = v_addr;
+  bool ok = true;
+  if (ctx != nullptr) {
+    const uint32_t mstatus = ctx->cpu.state.csr[csr_mstatus];
+    const uint32_t eff_priv = (type != 0 && (mstatus & MSTATUS_MPRV))
+                                  ? GET_MPP(mstatus)
+                                  : ctx->cpu.privilege;
+    if ((ctx->cpu.state.csr[csr_satp] & 0x80000000u) && eff_priv != RISCV_MODE_M) {
+      ok = ctx->cpu.va2pa(p, v_addr, type);
+    }
+  }
+  if (p_addr != nullptr) {
+    *p_addr = p;
+  }
+  return ok;
+}

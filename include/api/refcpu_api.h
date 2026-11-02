@@ -77,3 +77,5 @@ void refcpu_set_sim_end(RefCpuContext *ctx, bool value);
 void refcpu_set_sim_time(RefCpuContext *ctx, uint64_t sim_time);
 
 bool refcpu_probe_pc_translation(RefCpuContext *ctx);
+bool refcpu_translate_data(RefCpuContext *ctx, uint32_t v_addr, uint32_t type,
+                           uint32_t *p_addr);
