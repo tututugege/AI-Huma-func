@@ -38,6 +38,7 @@ constexpr bool kLogUserTrapSummary = false;
 constexpr bool kLogUserEntrySummary = false;
 constexpr bool kLogUserSyscallSummary = false;
 constexpr bool kMirrorUserWriteSyscalls = true;
+uint64_t g_dbg_trap_count[64] = {0};  // index: cause (bit5 set: interrupt) | (taken in S: +32 offset not used)
 static uint64_t g_ref_timer_offset = 0;
 static uint64_t g_ref_timer_cmp = ~0ull;
 static bool g_disable_uart_console_output = false;
@@ -1404,6 +1405,15 @@ void Ref_cpu::exception(uint32_t trap_val) {
                 << state.gpr[13] << std::dec << std::endl;
     }
   }
+  if (std::getenv("REF_TRAP_TRACE")) {
+    static long seen = 0; static int shown = 0;
+    static const long every = std::getenv("REF_TRAP_EVERY") ? std::atol(std::getenv("REF_TRAP_EVERY")) : 1;
+    if (seen++ % every == 0 && shown++ < 60)
+      fprintf(stderr, "[trap] t=%llu pc=0x%08x priv=%u M=%d S=%d mip=0x%x mie=0x%x mideleg=0x%x cmp=0x%llx now=0x%llx\n",
+              (unsigned long long)sim_time, state.pc, (unsigned)privilege, (int)MTrap, (int)STrap, visible_mip(),
+              state.csr[csr_mie], state.csr[csr_mideleg], (unsigned long long)g_ref_timer_cmp,
+              (unsigned long long)ref_timer_now(sim_time));
+  }
   if (MTrap) {
     state.csr[csr_mepc] = state.pc;
     uint32_t cause = 0;
@@ -1438,6 +1448,7 @@ void Ref_cpu::exception(uint32_t trap_val) {
       exception_code = 2;
 
     cause |= exception_code;
+    g_dbg_trap_count[(exception_code & 15) | (is_interrupt ? 16 : 0)]++;
     state.csr[csr_mcause] = cause;
     if (kLogVerboseTimer && exception_code == 7) {
       std::cerr << "[RefCPU][TRAP] M-timer pc=0x" << std::hex << state.pc
@@ -1739,6 +1750,15 @@ void Ref_cpu::RISCV() {
   }
   check_mem_range_or_log("instruction fetch", p_addr, 4);
   Instruction = load_word(p_addr);
+  {  // debug: ring of the last executed PCs, printed at ebreak when REF_PC_RING is set
+    static uint32_t ring[64];
+    static uint64_t n = 0;
+    ring[n++ & 63] = state.pc;
+    static const uint64_t every = std::getenv("REF_PC_EVERY") ? std::strtoull(std::getenv("REF_PC_EVERY"), nullptr, 0) : 0;
+    if (every && n % every == 0) { fprintf(stderr, "[pc] n=%llu pc=0x%08x priv=%u time=%llu | Mtraps: illegal=%llu ecallS=%llu Mtimer=%llu\n", (unsigned long long)n, state.pc, (unsigned)privilege, (unsigned long long)sim_time, (unsigned long long)g_dbg_trap_count[2], (unsigned long long)g_dbg_trap_count[9], (unsigned long long)g_dbg_trap_count[16 + 7]); }
+    if (Instruction == INST_EBREAK && std::getenv("REF_PC_RING"))
+      for (int k = 0; k < 64; k++) fprintf(stderr, "pc=0x%08x\n", ring[(n + k) & 63]);
+  }
 
   if (kLogUserEntrySummary && privilege == RISCV_MODE_U &&
       (state.pc == 0x10000u || state.pc == 0x10428u)) {
@@ -1763,7 +1783,7 @@ void Ref_cpu::RISCV() {
                 << " a0=0x" << exit_code << " sp=0x" << state.gpr[2]
                 << " ra=0x" << state.gpr[1] << std::dec << std::endl;
     }
-    std::cout << "ebreak signal received. code = 0x" << std::hex << exit_code
+    std::cout << "ebreak signal received. pc = 0x" << std::hex << state.pc << " priv=" << privilege << " ra=0x" << state.gpr[1] << " code = 0x" << exit_code
               << std::dec << std::endl;
     std::cout << "total_sim_time: " << sim_time << std::endl;
     if (exit_code == 0) {

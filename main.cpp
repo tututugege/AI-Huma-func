@@ -81,6 +81,7 @@ int main(int argc, char *argv[]) {
     ref_cpu.load_flash_image(config.flash_image_file);
   if (!config.sdcard_image_file.empty())
     ref_cpu.load_sdcard_image(config.sdcard_image_file);
+  if (std::getenv("REF_UNBUF")) { setvbuf(stdout, nullptr, _IONBF, 0); std::cout << std::unitbuf; }  // live console when redirected
   ref_cpu.uart_print = true;
   if (const char *env = std::getenv("REF_FORCE_REF_ONLY");
       env != nullptr && env[0] != '\0' && env[0] != '0') {
