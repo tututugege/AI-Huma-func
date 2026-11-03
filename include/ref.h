@@ -278,20 +278,26 @@ public:
     }
   }
 
-  // Fast path for plain runs: decoded-instruction cache (like Spike's icache) plus per-instruction handlers for the
-  // common integer instructions.  Anything unusual (MMIO, faults, misaligned, CSR/AMO/FP, interrupts) falls back to
-  // RISCV() before any state is changed.  Cache entries are keyed by virtual pc, (satp, privilege) and an epoch that
-  // is bumped when the translation or the code memory may have changed.
-  struct ICacheEntry {
-    uint32_t pc = 0, raw = 0, imm = 0, epoch = 0;
-    uint64_t key = 0;
+  // Fast path for plain runs: a basic-block cache with threaded dispatch for the common integer instructions.  Anything
+  // unusual (MMIO, faults, misaligned accesses, CSR/AMO/FP, interrupts, the timer deadline) falls back to RISCV() before
+  // any state is changed.  Blocks are keyed by virtual pc, (satp, privilege) and an epoch that is bumped when the
+  // translation or the code memory may have changed.
+  struct FastInsn {
+    const void *h = nullptr;  // handler (label address)
+    uint32_t imm = 0;
     uint8_t op = 0, rd = 0, rs1 = 0, rs2 = 0;
   };
-  static constexpr uint32_t kICacheSize = 4096;
-  ICacheEntry icache[kICacheSize];
-  uint32_t icache_epoch = 1;
-  bool fast_fill(ICacheEntry &e, uint32_t pc, uint64_t key, bool translate);
+  static constexpr uint32_t kMaxBlockOps = 32;
+  static constexpr uint32_t kFastBlocks = 1024;
+  struct FastBlock {
+    uint64_t ctx = 0;  // (satp << 32) | (privilege << 30) | epoch; 0 = invalid
+    uint32_t pc = 0, n = 0;  // n = instructions executed by a full run (the end pseudo-op is not counted)
+    FastInsn ops[kMaxBlockOps + 1];
+  };
+  std::vector<FastBlock> fblocks;
+  uint32_t icache_epoch = 1;  // 30 bits
   void fast_run(uint32_t &finished_intervals);
+  template <bool U, bool DX> void fast_run_impl(uint32_t &finished_intervals, uint64_t budget);
   void RISCV();
   void FORCE_INLINE RV32IM();
   __attribute__((noinline)) void RV32A();  // cold: keeps RISCV()'s frame small

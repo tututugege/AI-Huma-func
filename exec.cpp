@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <map>
+#include <vector>
 extern "C" {
 #ifdef USE_SIMULATOR_SOFTFLOAT
 #include "softfloat.h"
@@ -1099,12 +1100,15 @@ void Ref_cpu::checkpoint_mmio_sync_devices() {
 }
 
 // ---------------------------------------------------------------------------------------------------------------
-// Fast path for plain runs (see ref.h): decoded-instruction cache plus per-instruction handlers for the common
-// integer instructions.  A handler either executes the instruction exactly as RV32IM() would, or leaves every piece
-// of state untouched and returns to the caller, which then runs RISCV() for that instruction.
+// Fast path for plain runs (see ref.h): a basic-block cache with threaded dispatch for the common integer
+// instructions.  A block is a run of consecutive fast instructions inside one page, ending at a jump/branch, before an
+// instruction the fast path does not handle, at the page end or at kMaxBlockOps.  It is decoded once and validated once
+// on entry (virtual pc, (satp, privilege) and an epoch); inside a block each instruction is a computed jump to its
+// handler.  A handler either executes the instruction exactly as RV32IM() would, or leaves all state untouched and
+// returns to the caller, which then runs RISCV() for that instruction.
 namespace {
 enum FastOp : uint8_t {
-  F_SLOW = 0, F_NOP,
+  F_SLOW = 0, F_NOP, F_CONT, F_EXIT,
   F_LUI, F_AUIPC, F_JAL, F_JALR,
   F_BEQ, F_BNE, F_BLT, F_BGE, F_BLTU, F_BGEU,
   F_LB, F_LH, F_LW, F_LBU, F_LHU,
@@ -1112,10 +1116,12 @@ enum FastOp : uint8_t {
   F_ADDI, F_SLTI, F_SLTIU, F_XORI, F_ORI, F_ANDI, F_SLLI, F_SRLI, F_SRAI,
   F_ADD, F_SUB, F_SLL, F_SLT, F_SLTU, F_XOR, F_SRL, F_SRA, F_OR, F_AND,
   F_MUL, F_MULH, F_MULHSU, F_MULHU, F_DIV, F_DIVU, F_REM, F_REMU,
+  F_NUM
 };
 
 // REF_NO_FAST=1 runs everything through RISCV(); REF_STATE_DIGEST=N prints a hash of (pc, x1..x31) every N
-// instructions.  The two together compare the fast path against the original path instruction by instruction.
+// instructions (the fast path then uses one-instruction blocks).  The two together compare the fast path against the
+// original path instruction by instruction.
 const bool g_no_fast = std::getenv("REF_NO_FAST") != nullptr;
 const uint64_t g_digest_every =
     std::getenv("REF_STATE_DIGEST") ? std::strtoull(std::getenv("REF_STATE_DIGEST"), nullptr, 0) : 0;
@@ -1123,21 +1129,44 @@ const uint64_t g_digest_every =
 // REF_FAST_STATS=1: report, at exit, how many instructions the fast path ran and why it handed over to RISCV()
 const bool g_fast_stats = std::getenv("REF_FAST_STATS") != nullptr;
 struct FastStats {
-  uint64_t fast_insts = 0, runs = 0, stop[8] = {0}, slow_op[128 * 8] = {0};
+  uint64_t fast_insts = 0, runs = 0, blocks = 0, stop[8] = {0}, slow_op[128 * 8] = {0};
   ~FastStats() {
     if (!g_fast_stats) return;
-    fprintf(stderr, "[fast] instructions=%llu runs=%llu stops: interrupt/timer=%llu budget=%llu misalign_pc=%llu fill_fail=%llu slow_op=%llu mem_fallback=%llu\n",
-            (unsigned long long)fast_insts, (unsigned long long)runs, (unsigned long long)stop[0], (unsigned long long)stop[1],
-            (unsigned long long)stop[2], (unsigned long long)stop[3], (unsigned long long)stop[4], (unsigned long long)stop[5]);
+    fprintf(stderr,
+            "[fast] instructions=%llu runs=%llu blocks_built=%llu stops: interrupt/timer=%llu budget=%llu "
+            "fill_fail=%llu slow_op=%llu mem_fallback=%llu\n",
+            (unsigned long long)fast_insts, (unsigned long long)runs, (unsigned long long)blocks,
+            (unsigned long long)stop[0], (unsigned long long)stop[1], (unsigned long long)stop[3],
+            (unsigned long long)stop[4], (unsigned long long)stop[5]);
     for (int pass = 0; pass < 12; pass++) {
-      int best = -1; uint64_t bc = 0;
-      for (int i = 0; i < 128 * 8; i++) if (slow_op[i] > bc) { bc = slow_op[i]; best = i; }
+      int best = -1;
+      uint64_t bc = 0;
+      for (int i = 0; i < 128 * 8; i++)
+        if (slow_op[i] > bc) { bc = slow_op[i]; best = i; }
       if (best < 0) break;
       fprintf(stderr, "[fast]   slow opcode=0x%02x funct3=%d : %llu\n", best / 8, best % 8, (unsigned long long)bc);
       slow_op[best] = 0;
     }
   }
 } g_fs;
+
+// REF_STATE_DIGEST_BLOCK=N: the fast path keeps its normal blocks and prints a digest at the first block boundary at or
+// after every N instructions (with the exact instruction count); REF_DIGEST_LIST=file then makes a REF_NO_FAST run
+// print digests at exactly those counts, so both can be compared.
+const uint64_t g_digest_block =
+    std::getenv("REF_STATE_DIGEST_BLOCK") ? std::strtoull(std::getenv("REF_STATE_DIGEST_BLOCK"), nullptr, 0) : 0;
+uint64_t g_next_digest = g_digest_block;
+std::vector<uint64_t> g_digest_list = [] {
+  std::vector<uint64_t> v;
+  if (const char *f = std::getenv("REF_DIGEST_LIST")) {
+    FILE *fp = std::fopen(f, "r");
+    unsigned long long t;
+    while (fp && std::fscanf(fp, "%llu", &t) == 1) v.push_back(t);
+    if (fp) std::fclose(fp);
+  }
+  return v;
+}();
+size_t g_digest_list_pos = 0;
 
 void print_state_digest(uint64_t t, const CPU_state &st) {
   uint64_t h = 1469598103934665603ull;
@@ -1148,9 +1177,8 @@ void print_state_digest(uint64_t t, const CPU_state &st) {
 }
 
 // Classify an instruction word.  Only exact base-ISA / M encodings are fast; everything else (Zba/Zbb/Zbc/Zbs,
-// CSR, AMO, FP, system, unknown funct3/funct7 combinations) stays F_SLOW and goes through RISCV().
-void fast_decode(uint32_t in, Ref_cpu::ICacheEntry &e) {
-  e.raw = in;
+// CSR, AMO, FP, system, unknown funct3/funct7 combinations) is F_SLOW and goes through RISCV().
+void fast_decode(uint32_t in, Ref_cpu::FastInsn &e) {
   e.rd = BITS(in, 11, 7);
   e.rs1 = BITS(in, 19, 15);
   e.rs2 = BITS(in, 24, 20);
@@ -1221,35 +1249,343 @@ void fast_decode(uint32_t in, Ref_cpu::ICacheEntry &e) {
     break;
   case number_9_opcode_fence: op = F_NOP; break;
   }
+  // an instruction without side effects that writes x0 does nothing
+  if (e.rd == 0 && (op == F_LUI || op == F_AUIPC || op >= F_ADDI)) {
+    op = F_NOP;
+  }
   e.op = op;
 }
+
+inline bool fast_is_control(uint8_t op) { return op >= F_JAL && op <= F_BGEU; }
 }  // namespace
 
-bool Ref_cpu::fast_fill(ICacheEntry &e, uint32_t pc, uint64_t key, bool translate) {
-  uint32_t p = pc;
-  if (translate && !va2pa(p, pc, 0)) {
-    return false;  // instruction page fault: RISCV() raises it
+// Run blocks until an instruction needs the general path, an interrupt could be taken, or the timer deadline is near.
+// U: the privilege is U (basic-block and interval bookkeeping); DX: loads and stores are translated.
+template <bool U, bool DX>
+void Ref_cpu::fast_run_impl(uint32_t &finished_intervals, uint64_t budget) {
+  static const void *const tbl[F_NUM] = {
+      &&L_SLOW, &&L_NOP, &&L_CONT, &&L_EXIT,
+      &&L_LUI, &&L_AUIPC, &&L_JAL, &&L_JALR,
+      &&L_BEQ, &&L_BNE, &&L_BLT, &&L_BGE, &&L_BLTU, &&L_BGEU,
+      &&L_LB, &&L_LH, &&L_LW, &&L_LBU, &&L_LHU,
+      &&L_SB, &&L_SH, &&L_SW,
+      &&L_ADDI, &&L_SLTI, &&L_SLTIU, &&L_XORI, &&L_ORI, &&L_ANDI, &&L_SLLI, &&L_SRLI, &&L_SRAI,
+      &&L_ADD, &&L_SUB, &&L_SLL, &&L_SLT, &&L_SLTU, &&L_XOR, &&L_SRL, &&L_SRA, &&L_OR, &&L_AND,
+      &&L_MUL, &&L_MULH, &&L_MULHSU, &&L_MULHU, &&L_DIV, &&L_DIVU, &&L_REM, &&L_REMU};
+
+  uint32_t *const x = state.gpr;
+  uint32_t *const mem = memory;
+  uint8_t *const pgf = pt_page_flag.data();
+  const uint32_t satp = state.csr[csr_satp];
+  const uint32_t priv = privilege;
+  const bool fetch_translate = (satp & 0x80000000) && priv != RISCV_MODE_M;
+  const uint64_t ctx_base = (static_cast<uint64_t>(satp) << 32) | (static_cast<uint64_t>(priv) << 30);
+  const uint32_t maxlen = g_digest_every ? 1u : kMaxBlockOps;
+  FastBlock *const blocks = fblocks.data();
+
+  uint64_t left = budget;             // instructions still allowed
+  const uint64_t budget0 = budget;
+  uint32_t pc = state.pc;
+  uint32_t ep = icache_epoch;         // epoch the current ctx was built with
+  uint64_t ctx = ctx_base | ep;
+  uint64_t bbl = current_bb_len;      // U mode: instructions in the current basic block (written back at exit)
+  uint64_t last_digest = 0;
+
+  FastBlock *b = nullptr;
+  const FastInsn *op = nullptr;
+  uint32_t bpc = 0, ipc = 0, v = 0, p = 0, n = 0, ex = 0;
+  const FastInsn *ip = nullptr;
+  uint32_t q = 0, cpc = 0, cnt = 0;
+
+dispatch_block:
+  if (__builtin_expect(g_digest_block != 0, 0)) {
+    const uint64_t c = budget0 - left;
+    if (c > 0 && sim_time + c >= g_next_digest) {
+      state.pc = pc;
+      print_state_digest(sim_time + c, state);
+      g_next_digest = sim_time + c + g_digest_block;
+    }
   }
-  if (!is_ddr_range(p, 4)) {
-    return false;
+  if (__builtin_expect(g_digest_every != 0, 0)) {
+    const uint64_t c = budget0 - left;
+    if (c > 0 && c != last_digest && (sim_time + c) % g_digest_every == 0) {
+      state.pc = pc;
+      print_state_digest(sim_time + c, state);
+      last_digest = c;
+    }
   }
-  fast_decode(memory[(p - kRamBase) >> 2], e);
-  e.pc = pc;
-  e.key = key;
-  e.epoch = icache_epoch;
+  if (pc & 3u) {
+    goto out;  // misaligned pc: the general path fetches the aligned word
+  }
+  b = &blocks[(pc >> 2) & (kFastBlocks - 1)];
+  if (__builtin_expect(b->pc != pc || b->ctx != ctx, 0)) {
+    goto build;
+  }
+run_block:
+  if (left < b->n) {
+    if (g_fast_stats) g_fs.stop[1]++;
+    goto out;  // not enough budget left for the whole block: the general path steps the last instructions
+  }
+  left -= b->n;
+  bpc = pc;
+  if (U && bbl == 0) {
+    current_bb_head_pc = pc;
+  }
+  op = b->ops;
+  goto *op->h;
+
+build : {
+  // decode a new block starting at pc
+  p = pc;
+  if (fetch_translate && !va2pa(p, pc, 0)) {
+    if (g_fast_stats) g_fs.stop[3]++;
+    goto out;  // instruction page fault: RISCV() raises it
+  }
+  if ((int32_t)p >= 0) {
+    if (g_fast_stats) g_fs.stop[3]++;
+    goto out;  // not DDR (SDRAM, MMIO, boot ROM): RISCV() fetches it
+  }
+  n = 0;
+  q = p;
+  cpc = pc;
+  uint8_t end_op = F_CONT;
+  for (;;) {
+    if (n == maxlen) { end_op = F_CONT; break; }
+    FastInsn &fi = b->ops[n];
+    fast_decode(mem[(q & 0x7FFFFFFFu) >> 2], fi);
+    if (fi.op == F_SLOW) {
+      if (g_fast_stats) g_fs.slow_op[(mem[(q & 0x7FFFFFFFu) >> 2] & 0x7F) * 8 + ((mem[(q & 0x7FFFFFFFu) >> 2] >> 12) & 7)]++;
+      end_op = F_EXIT;
+      break;
+    }
+    fi.h = tbl[fi.op];
+    n++;
+    q += 4;
+    cpc += 4;
+    if (fast_is_control(fi.op)) { end_op = F_NOP; break; }  // the control instruction ends the block
+    if ((cpc & 0xFFFu) == 0) { end_op = F_CONT; break; }    // the next instruction is on another page
+  }
+  if (end_op != F_NOP) {
+    FastInsn &fi = b->ops[n];
+    fi.op = end_op;
+    fi.h = tbl[end_op];
+  }
+  b->pc = pc;
+  b->ctx = ctx;
+  b->n = n;
   mark_code_page(p);
-  return true;
+  if (g_fast_stats) g_fs.blocks++;
+  if (n == 0) {
+    // the first instruction is not a fast one: run the EXIT end op to hand over
+  }
+  goto run_block;
 }
 
-// Run instructions until one needs the general path, an interrupt could be taken, or the timer deadline is reached.
+#define NEXT() do { ++op; goto *op->h; } while (0)
+#define PC_OF(o) (bpc + (uint32_t)(((o) - b->ops) << 2))
+// leaving the block before executing 'op': give back the budget of the instructions not executed
+#define BAIL()                                                                                                       \
+  do {                                                                                                               \
+    ex = (uint32_t)(op - b->ops);                                                                                    \
+    left += b->n - ex;                                                                                               \
+    if (U) bbl += ex;                                                                                                \
+    pc = bpc + (ex << 2);                                                                                            \
+    if (g_fast_stats) g_fs.stop[5]++;                                                                                \
+    goto out;                                                                                                        \
+  } while (0)
+// a control instruction ends the block: U-mode bookkeeping, then the next block
+#define END_CONTROL()                                                                                                \
+  do {                                                                                                               \
+    if (U) {                                                                                                         \
+      bbl += b->n;                                                                                                   \
+      interval_inst_count += bbl;                                                                                    \
+      bbl = 0;                                                                                                       \
+      if (interval_inst_count >= INTERVAL_SIZE) {                                                                    \
+        finished_intervals++;                                                                                        \
+        interval_inst_count = 0;                                                                                     \
+      }                                                                                                              \
+    }                                                                                                                \
+    goto dispatch_block;                                                                                             \
+  } while (0)
+
+L_SLOW:
+  goto out;  // never in a block (F_SLOW ends a block with F_EXIT)
+L_NOP:
+  NEXT();
+L_CONT:
+  if (U) bbl += b->n;
+  pc = bpc + (b->n << 2);
+  goto dispatch_block;
+L_EXIT:
+  if (U) bbl += b->n;
+  pc = bpc + (b->n << 2);
+  if (g_fast_stats) g_fs.stop[4]++;
+  goto out;
+
+L_LUI: x[op->rd] = op->imm; NEXT();
+L_AUIPC: x[op->rd] = op->imm + PC_OF(op); NEXT();
+L_JAL:
+  ipc = PC_OF(op);
+  x[op->rd] = ipc + 4;
+  x[0] = 0;
+  pc = ipc + op->imm;
+  END_CONTROL();
+L_JALR:
+  ipc = PC_OF(op);
+  v = (x[op->rs1] + op->imm) & 0xFFFFFFFCu;
+  x[op->rd] = ipc + 4;
+  x[0] = 0;
+  pc = v;
+  END_CONTROL();
+#define FAST_BRANCH(COND)                                                                                            \
+  ipc = PC_OF(op);                                                                                                   \
+  pc = (COND) ? ipc + op->imm : ipc + 4;                                                                             \
+  END_CONTROL();
+L_BEQ: FAST_BRANCH(x[op->rs1] == x[op->rs2])
+L_BNE: FAST_BRANCH(x[op->rs1] != x[op->rs2])
+L_BLT: FAST_BRANCH((int32_t)x[op->rs1] < (int32_t)x[op->rs2])
+L_BGE: FAST_BRANCH((int32_t)x[op->rs1] >= (int32_t)x[op->rs2])
+L_BLTU: FAST_BRANCH(x[op->rs1] < x[op->rs2])
+L_BGEU: FAST_BRANCH(x[op->rs1] >= x[op->rs2])
+#undef FAST_BRANCH
+
+// loads: misaligned, page-fault and non-DDR cases leave the instruction to RISCV()
+#define FAST_LOAD(ALIGN_MASK, EXPR)                                                                                  \
+  v = x[op->rs1] + op->imm;                                                                                          \
+  if (v & (ALIGN_MASK)) BAIL();                                                                                      \
+  p = v;                                                                                                             \
+  if (DX && !va2pa(p, v, 1)) BAIL();                                                                                 \
+  if ((int32_t)p >= 0) BAIL();                                                                                       \
+  {                                                                                                                  \
+    const uint32_t w = mem[(p & 0x7FFFFFFFu) >> 2] >> ((p & 3u) * 8);                                                \
+    x[op->rd] = (EXPR);                                                                                              \
+  }                                                                                                                  \
+  x[0] = 0;                                                                                                          \
+  NEXT();
+L_LB: FAST_LOAD(0u, (uint32_t)(int32_t)(int8_t)(w & 0xFF))
+L_LBU: FAST_LOAD(0u, w & 0xFF)
+L_LH: FAST_LOAD(1u, (uint32_t)(int32_t)(int16_t)(w & 0xFFFF))
+L_LHU: FAST_LOAD(1u, w & 0xFFFF)
+L_LW: FAST_LOAD(3u, w)
+#undef FAST_LOAD
+
+// stores: same fallbacks; a store into a page that holds page tables or decoded code flushes the caches, after which
+// the rest of the block is abandoned (the next instruction is fetched again)
+#define FAST_STORE(ALIGN_MASK, SIZE_MASK)                                                                            \
+  v = x[op->rs1] + op->imm;                                                                                          \
+  if (v & (ALIGN_MASK)) BAIL();                                                                                      \
+  p = v;                                                                                                             \
+  if (DX && !va2pa(p, v, 2)) BAIL();                                                                                 \
+  if ((int32_t)p >= 0) BAIL();                                                                                       \
+  {                                                                                                                  \
+    if (state.reserve_valid && state.reserve_addr == p) state.reserve_valid = false;                                 \
+    const uint32_t off = p & 3u;                                                                                     \
+    const uint32_t m = (SIZE_MASK) << (off * 8);                                                                     \
+    const uint32_t wd = (x[op->rs2] & (SIZE_MASK)) << (off * 8);                                                     \
+    uint32_t &word = mem[(p & 0x7FFFFFFFu) >> 2];                                                                    \
+    const uint8_t f = pgf[p >> 12];                                                                                  \
+    if (__builtin_expect(f != 0, 0)) {                                                                               \
+      page_flag_hit(f);                                                                                              \
+      word = (m & wd) | (~m & word);                                                                                 \
+      ex = (uint32_t)(op - b->ops) + 1;                                                                              \
+      left += b->n - ex;                                                                                             \
+      if (U) bbl += ex;                                                                                              \
+      pc = bpc + (ex << 2);                                                                                          \
+      ep = icache_epoch;                                                                                             \
+      ctx = ctx_base | ep;                                                                                           \
+      goto dispatch_block;                                                                                           \
+    }                                                                                                                \
+    word = (m & wd) | (~m & word);                                                                                   \
+  }                                                                                                                  \
+  NEXT();
+L_SB: FAST_STORE(0u, 0xFFu)
+L_SH: FAST_STORE(1u, 0xFFFFu)
+L_SW: FAST_STORE(3u, 0xFFFFFFFFu)
+#undef FAST_STORE
+
+L_ADDI: x[op->rd] = x[op->rs1] + op->imm; NEXT();
+L_SLTI: x[op->rd] = (int32_t)x[op->rs1] < (int32_t)op->imm ? 1 : 0; NEXT();
+L_SLTIU: x[op->rd] = x[op->rs1] < op->imm ? 1 : 0; NEXT();
+L_XORI: x[op->rd] = x[op->rs1] ^ op->imm; NEXT();
+L_ORI: x[op->rd] = x[op->rs1] | op->imm; NEXT();
+L_ANDI: x[op->rd] = x[op->rs1] & op->imm; NEXT();
+L_SLLI: x[op->rd] = x[op->rs1] << op->imm; NEXT();
+L_SRLI: x[op->rd] = x[op->rs1] >> op->imm; NEXT();
+L_SRAI: x[op->rd] = (uint32_t)((int32_t)x[op->rs1] >> op->imm); NEXT();
+L_ADD: x[op->rd] = x[op->rs1] + x[op->rs2]; NEXT();
+L_SUB: x[op->rd] = x[op->rs1] - x[op->rs2]; NEXT();
+L_SLL: x[op->rd] = x[op->rs1] << (x[op->rs2] & 0x1F); NEXT();
+L_SLT: x[op->rd] = (int32_t)x[op->rs1] < (int32_t)x[op->rs2] ? 1 : 0; NEXT();
+L_SLTU: x[op->rd] = x[op->rs1] < x[op->rs2] ? 1 : 0; NEXT();
+L_XOR: x[op->rd] = x[op->rs1] ^ x[op->rs2]; NEXT();
+L_SRL: x[op->rd] = x[op->rs1] >> (x[op->rs2] & 0x1F); NEXT();
+L_SRA: x[op->rd] = (uint32_t)((int32_t)x[op->rs1] >> (x[op->rs2] & 0x1F)); NEXT();
+L_OR: x[op->rd] = x[op->rs1] | x[op->rs2]; NEXT();
+L_AND: x[op->rd] = x[op->rs1] & x[op->rs2]; NEXT();
+L_MUL: x[op->rd] = x[op->rs1] * x[op->rs2]; NEXT();
+L_MULH: x[op->rd] = (uint32_t)(((int64_t)(int32_t)x[op->rs1] * (int64_t)(int32_t)x[op->rs2]) >> 32); NEXT();
+L_MULHSU: x[op->rd] = (uint32_t)(((int64_t)(int32_t)x[op->rs1] * (int64_t)(uint32_t)x[op->rs2]) >> 32); NEXT();
+L_MULHU: x[op->rd] = (uint32_t)(((uint64_t)x[op->rs1] * (uint64_t)x[op->rs2]) >> 32); NEXT();
+L_DIV: {
+  const int32_t a = (int32_t)x[op->rs1], d = (int32_t)x[op->rs2];
+  x[op->rd] = d == 0 ? 0xFFFFFFFFu : (a == INT32_MIN && d == -1 ? (uint32_t)INT32_MIN : (uint32_t)(a / d));
+  NEXT();
+}
+L_DIVU: x[op->rd] = x[op->rs2] == 0 ? 0xFFFFFFFFu : x[op->rs1] / x[op->rs2]; NEXT();
+L_REM: {
+  const int32_t a = (int32_t)x[op->rs1], d = (int32_t)x[op->rs2];
+  x[op->rd] = d == 0 ? (uint32_t)a : (a == INT32_MIN && d == -1 ? 0u : (uint32_t)(a % d));
+  NEXT();
+}
+L_REMU: x[op->rd] = x[op->rs2] == 0 ? x[op->rs1] : x[op->rs1] % x[op->rs2]; NEXT();
+
+#undef NEXT
+#undef PC_OF
+#undef BAIL
+#undef END_CONTROL
+
+out:
+  state.pc = pc;
+  {
+    const uint64_t done = budget0 - left;
+    sim_time += done;
+    if (U) {
+      current_bb_len = static_cast<uint32_t>(bbl);
+    }
+    if (g_fast_stats) {
+      g_fs.fast_insts += done;
+    }
+    if (__builtin_expect(g_digest_every != 0, 0) && done > 0 && done != last_digest &&
+        sim_time % g_digest_every == 0) {
+      print_state_digest(sim_time, state);
+    }
+    if (__builtin_expect(g_digest_block != 0, 0) && done > 0 && sim_time >= g_next_digest) {
+      print_state_digest(sim_time, state);
+      g_next_digest = sim_time + g_digest_block;
+    }
+    if (done > 0) {
+      // leave the per-instruction flags as RISCV() would for a plain instruction
+      is_csr = is_exception = false;
+      is_br = br_taken = false;
+      is_io = false;
+      force_sync = false;
+      asy = false;
+      illegal_exception = page_fault_load = page_fault_inst = page_fault_store = false;
+      breakpoint_exception = false;
+      state.store = false;
+      sync_timer_csrs(state, sim_time, device_effects_enable && interrupt_delivery_enable);
+    }
+  }
+}
+
 void Ref_cpu::fast_run(uint32_t &finished_intervals) {
   if (sim_time >= MAX_SIM_TIME) {
     return;
   }
   const uint32_t mie = state.csr[csr_mie];
+  if (g_fast_stats) g_fs.runs++;
   // No interrupt may be pending-and-enabled, and the timer must not fire before the next instruction: both are
   // exactly the conditions under which RISCV() would take no interrupt and no trap before executing the instruction.
-  if (g_fast_stats) g_fs.runs++;
   if (interrupt_delivery_enable && (state.csr[csr_mip] & mie & 0x00000AAAu)) {
     if (g_fast_stats) g_fs.stop[0]++;
     return;
@@ -1263,212 +1599,19 @@ void Ref_cpu::fast_run(uint32_t &finished_intervals) {
     }
     budget = std::min<uint64_t>(budget, g_ref_timer_cmp - now);
   }
-
-  uint32_t *const x = state.gpr;
-  const uint32_t satp = state.csr[csr_satp];
-  const uint32_t mstatus = state.csr[csr_mstatus];
-  const uint32_t priv = privilege;
-  const bool fetch_translate = (satp & 0x80000000) && priv != RISCV_MODE_M;
-  const uint32_t data_priv = (mstatus & MSTATUS_MPRV) ? GET_MPP(mstatus) : priv;
-  const bool data_translate = (satp & 0x80000000) && data_priv != RISCV_MODE_M;
-  const uint64_t key = (static_cast<uint64_t>(satp) << 8) | priv;
-
-  uint32_t pc = state.pc;
-  uint64_t done = 0;
-  bool last_br = false, last_taken = false, last_store = false;
-
-  while (done < budget) {
-    if (pc & 3u) {
-      if (g_fast_stats) g_fs.stop[2]++;
-      break;  // misaligned pc: the general path fetches the aligned word
-    }
-    ICacheEntry &e = icache[(pc >> 2) & (kICacheSize - 1)];
-    if (__builtin_expect(!(e.pc == pc && e.key == key && e.epoch == icache_epoch), 0)) {
-      if (!fast_fill(e, pc, key, fetch_translate)) {
-        if (g_fast_stats) g_fs.stop[3]++;
-        break;
-      }
-    }
-    uint32_t next = pc + 4;
-    bool br = false, taken = false, store = false;
-
-    switch (e.op) {
-    case F_SLOW:
-      if (g_fast_stats) { g_fs.stop[4]++; g_fs.slow_op[(e.raw & 0x7F) * 8 + ((e.raw >> 12) & 7)]++; }
-      goto out;
-    case F_NOP:
-      break;
-    case F_LUI: x[e.rd] = e.imm; break;
-    case F_AUIPC: x[e.rd] = e.imm + pc; break;
-    case F_JAL:
-      br = taken = true;
-      next = pc + e.imm;
-      x[e.rd] = pc + 4;
-      break;
-    case F_JALR: {
-      br = taken = true;
-      const uint32_t t = (x[e.rs1] + e.imm) & 0xFFFFFFFCu;
-      x[e.rd] = pc + 4;
-      next = t;
-      break;
-    }
-#define FAST_BRANCH(COND)                                                                                           \
-  br = true;                                                                                                        \
-  if (COND) {                                                                                                       \
-    taken = true;                                                                                                   \
-    next = pc + e.imm;                                                                                              \
-  }                                                                                                                 \
-  break;
-    case F_BEQ: FAST_BRANCH(x[e.rs1] == x[e.rs2])
-    case F_BNE: FAST_BRANCH(x[e.rs1] != x[e.rs2])
-    case F_BLT: FAST_BRANCH((int32_t)x[e.rs1] < (int32_t)x[e.rs2])
-    case F_BGE: FAST_BRANCH((int32_t)x[e.rs1] >= (int32_t)x[e.rs2])
-    case F_BLTU: FAST_BRANCH(x[e.rs1] < x[e.rs2])
-    case F_BGEU: FAST_BRANCH(x[e.rs1] >= x[e.rs2])
-#undef FAST_BRANCH
-
-    case F_LB: case F_LH: case F_LW: case F_LBU: case F_LHU: {
-      const uint32_t v = x[e.rs1] + e.imm;
-      const uint32_t size = (e.op == F_LB || e.op == F_LBU) ? 1 : (e.op == F_LW ? 4 : 2);
-      if (v & (size - 1)) {
-        goto out;  // misaligned: the general path reports it
-      }
-      uint32_t p = v;
-      if (data_translate && !va2pa(p, v, 1)) {
-        goto out;  // page fault
-      }
-      if (!is_ddr_range(p, size)) {
-        if (g_fast_stats) g_fs.stop[5]++;
-        goto out;  // MMIO or SDRAM
-      }
-      const uint32_t w = memory[(p - kRamBase) >> 2] >> ((p & 3u) * 8);
-      switch (e.op) {
-      case F_LB: x[e.rd] = (uint32_t)(int32_t)(int8_t)(w & 0xFF); break;
-      case F_LBU: x[e.rd] = w & 0xFF; break;
-      case F_LH: x[e.rd] = (uint32_t)(int32_t)(int16_t)(w & 0xFFFF); break;
-      case F_LHU: x[e.rd] = w & 0xFFFF; break;
-      default: x[e.rd] = w; break;
-      }
-      break;
-    }
-    case F_SB: case F_SH: case F_SW: {
-      const uint32_t v = x[e.rs1] + e.imm;
-      const uint32_t size = e.op == F_SB ? 1 : (e.op == F_SH ? 2 : 4);
-      if (v & (size - 1)) {
-        goto out;
-      }
-      uint32_t p = v;
-      if (data_translate && !va2pa(p, v, 2)) {
-        goto out;
-      }
-      if (!is_ddr_range(p, size)) {
-        if (g_fast_stats) g_fs.stop[5]++;
-        goto out;
-      }
-      uint32_t sval = x[e.rs2];
-      const uint32_t strb = size == 1 ? 0b1u : (size == 2 ? 0b11u : 0b1111u);
-      sval &= size == 1 ? 0xFFu : (size == 2 ? 0xFFFFu : 0xFFFFFFFFu);
-      if (state.reserve_valid && state.reserve_addr == p) {
-        state.reserve_valid = false;
-      }
-      const uint32_t off = p & 3u;
-      const uint32_t wdata = sval << (off * 8);
-      const uint32_t mask = (size == 1 ? 0xFFu : (size == 2 ? 0xFFFFu : 0xFFFFFFFFu)) << (off * 8);
-      const uint32_t idx = (p - kRamBase) >> 2;
-      if (const uint8_t f = pt_page_flag[p >> 12]) {
-        page_flag_hit(f);  // may flush the instruction cache; the entry reference is not used after this
-      }
-      memory[idx] = (mask & wdata) | (~mask & memory[idx]);
-      state.store_addr = p;
-      state.store_data = wdata;
-      state.store_strb = strb << (off * 8);
-      store = true;
-      break;
-    }
-
-    case F_ADDI: x[e.rd] = x[e.rs1] + e.imm; break;
-    case F_SLTI: x[e.rd] = (int32_t)x[e.rs1] < (int32_t)e.imm ? 1 : 0; break;
-    case F_SLTIU: x[e.rd] = x[e.rs1] < e.imm ? 1 : 0; break;
-    case F_XORI: x[e.rd] = x[e.rs1] ^ e.imm; break;
-    case F_ORI: x[e.rd] = x[e.rs1] | e.imm; break;
-    case F_ANDI: x[e.rd] = x[e.rs1] & e.imm; break;
-    case F_SLLI: x[e.rd] = x[e.rs1] << e.imm; break;
-    case F_SRLI: x[e.rd] = x[e.rs1] >> e.imm; break;
-    case F_SRAI: x[e.rd] = (uint32_t)((int32_t)x[e.rs1] >> e.imm); break;
-
-    case F_ADD: x[e.rd] = x[e.rs1] + x[e.rs2]; break;
-    case F_SUB: x[e.rd] = x[e.rs1] - x[e.rs2]; break;
-    case F_SLL: x[e.rd] = x[e.rs1] << (x[e.rs2] & 0x1F); break;
-    case F_SLT: x[e.rd] = (int32_t)x[e.rs1] < (int32_t)x[e.rs2] ? 1 : 0; break;
-    case F_SLTU: x[e.rd] = x[e.rs1] < x[e.rs2] ? 1 : 0; break;
-    case F_XOR: x[e.rd] = x[e.rs1] ^ x[e.rs2]; break;
-    case F_SRL: x[e.rd] = x[e.rs1] >> (x[e.rs2] & 0x1F); break;
-    case F_SRA: x[e.rd] = (uint32_t)((int32_t)x[e.rs1] >> (x[e.rs2] & 0x1F)); break;
-    case F_OR: x[e.rd] = x[e.rs1] | x[e.rs2]; break;
-    case F_AND: x[e.rd] = x[e.rs1] & x[e.rs2]; break;
-
-    case F_MUL: x[e.rd] = x[e.rs1] * x[e.rs2]; break;
-    case F_MULH: x[e.rd] = (uint32_t)(((int64_t)(int32_t)x[e.rs1] * (int64_t)(int32_t)x[e.rs2]) >> 32); break;
-    case F_MULHSU: x[e.rd] = (uint32_t)(((int64_t)(int32_t)x[e.rs1] * (int64_t)(uint32_t)x[e.rs2]) >> 32); break;
-    case F_MULHU: x[e.rd] = (uint32_t)(((uint64_t)x[e.rs1] * (uint64_t)x[e.rs2]) >> 32); break;
-    case F_DIV: {
-      const int32_t a = (int32_t)x[e.rs1], b = (int32_t)x[e.rs2];
-      x[e.rd] = b == 0 ? 0xFFFFFFFFu : (a == INT32_MIN && b == -1 ? (uint32_t)INT32_MIN : (uint32_t)(a / b));
-      break;
-    }
-    case F_DIVU: x[e.rd] = x[e.rs2] == 0 ? 0xFFFFFFFFu : x[e.rs1] / x[e.rs2]; break;
-    case F_REM: {
-      const int32_t a = (int32_t)x[e.rs1], b = (int32_t)x[e.rs2];
-      x[e.rd] = b == 0 ? (uint32_t)a : (a == INT32_MIN && b == -1 ? 0u : (uint32_t)(a % b));
-      break;
-    }
-    case F_REMU: x[e.rd] = x[e.rs2] == 0 ? x[e.rs1] : x[e.rs1] % x[e.rs2]; break;
-    default:
-      goto out;
-    }
-    x[0] = 0;
-
-    // the same bookkeeping RISCV() and the main loop do for U-mode basic blocks and intervals
-    if (priv == RISCV_MODE_U) {
-      if (current_bb_len == 0) {
-        current_bb_head_pc = pc;
-      }
-      current_bb_len++;
-      if (br) {
-        interval_inst_count += current_bb_len;
-        current_bb_len = 0;
-        if (interval_inst_count >= INTERVAL_SIZE) {
-          finished_intervals++;
-          interval_inst_count = 0;
-        }
-      }
-    }
-    pc = next;
-    sim_time++;
-    done++;
-    last_br = br;
-    last_taken = taken;
-    last_store = store;
-    if (__builtin_expect(g_digest_every != 0, 0) && sim_time % g_digest_every == 0) {
-      state.pc = pc;
-      print_state_digest(sim_time, state);
-    }
+  if (fblocks.empty()) {
+    fblocks.resize(kFastBlocks);
   }
-out:
-  state.pc = pc;
-  if (g_fast_stats) { g_fs.fast_insts += done; if (done == budget) g_fs.stop[1]++; }
-  if (done > 0) {
-    // leave the per-instruction flags as RISCV() would after the last instruction executed here
-    is_csr = is_exception = false;
-    is_br = last_br;
-    br_taken = last_taken;
-    is_io = false;
-    force_sync = false;
-    asy = false;
-    illegal_exception = page_fault_load = page_fault_inst = page_fault_store = false;
-    breakpoint_exception = false;
-    state.store = last_store;
-    sync_timer_csrs(state, sim_time, device_effects_enable && interrupt_delivery_enable);
+  const uint32_t mstatus = state.csr[csr_mstatus];
+  const uint32_t data_priv = (mstatus & MSTATUS_MPRV) ? GET_MPP(mstatus) : privilege;
+  const bool dx = (state.csr[csr_satp] & 0x80000000) && data_priv != RISCV_MODE_M;
+  const bool u = privilege == RISCV_MODE_U;
+  if (u) {
+    if (dx) fast_run_impl<true, true>(finished_intervals, budget);
+    else fast_run_impl<true, false>(finished_intervals, budget);
+  } else {
+    if (dx) fast_run_impl<false, true>(finished_intervals, budget);
+    else fast_run_impl<false, false>(finished_intervals, budget);
   }
 }
 
@@ -1565,6 +1708,14 @@ void Ref_cpu::exec(const SimConfig &config) {
       }
       if (__builtin_expect(g_digest_every != 0, 0) && sim_time % g_digest_every == 0)
         print_state_digest(sim_time, state);
+      if (__builtin_expect(g_digest_block != 0, 0) && sim_time >= g_next_digest && !g_no_fast) {
+        print_state_digest(sim_time, state);
+        g_next_digest = sim_time + g_digest_block;
+      }
+      if (__builtin_expect(g_digest_list_pos < g_digest_list.size(), 0) && sim_time == g_digest_list[g_digest_list_pos]) {
+        print_state_digest(sim_time, state);
+        g_digest_list_pos++;
+      }
     }
   }
   while (!(config.mode == SimMode::NORMAL && !config.difftest && config.max_insts == 0 && !kLogProgressSimTime) &&
@@ -3577,8 +3728,8 @@ void Ref_cpu::tlb_flush() {
 }
 
 void Ref_cpu::icache_flush() {
-  if (++icache_epoch == 0) {
-    for (auto &e : icache) e.epoch = 0;
+  if (++icache_epoch >= (1u << 30)) {  // the epoch is 30 bits in a block's ctx: start over, every block invalid
+    for (auto &fb : fblocks) fb.ctx = 0;
     icache_epoch = 1;
   }
   for (uint32_t p : code_marked) pt_page_flag[p] &= ~2;
