@@ -55,6 +55,8 @@ int main(int argc, char *argv[]) {
         config.restore_file = argv[++i];
       else if (arg == "--max-insts")
         config.max_insts = std::stoull(argv[++i]);
+      else if (arg == "--restore-mem-only")
+        config.restore_mem_only = true;
       else if (arg == "--diff")
         config.difftest = true;
     }

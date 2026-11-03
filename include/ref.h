@@ -155,6 +155,10 @@ struct SimConfig {
   // Mode: RESTORE
   std::string restore_file; // 输入: Checkpoint 文件路径
   uint64_t max_insts = 0;   // 运行多少条指令后停止 (0代表一直运行)
+  // Front-door restore: load only the memory of the checkpoint; the CPU and the devices start from reset and a restore
+  // program (tools/ckpt2stub.py, loaded with --flash-image) sets the registers, CSRs and devices and ends with mret.
+  // The instruction counters restart at the first mret.
+  bool restore_mem_only = false;
 };
 
 typedef struct CPU_state {
@@ -333,7 +337,7 @@ public:
   void bbv_init_file(const char *filename);
   void dump_bbv();
   void save_checkpoint(const std::string &filename);
-  void restore_checkpoint(const std::string &filename);
+  void restore_checkpoint(const std::string &filename, bool mem_only = false);
 
 #ifdef ENABLE_SPIKE
   std::unique_ptr<SpikeRef> spike_ref;

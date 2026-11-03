@@ -195,7 +195,7 @@ void Ref_cpu::save_checkpoint(const std::string &filename) {
   std::cout << "Checkpoint saved to " << final_name << std::endl;
 }
 
-void Ref_cpu::restore_checkpoint(const std::string &filename) {
+void Ref_cpu::restore_checkpoint(const std::string &filename, bool mem_only) {
   std::string final_name = filename;
   gzFile file = gzopen(final_name.c_str(), "rb");
   if (!file && final_name.find(".gz") == std::string::npos) {
@@ -215,7 +215,9 @@ void Ref_cpu::restore_checkpoint(const std::string &filename) {
     exit(1);
   }
   const uint16_t checkpoint_version = header.format_ver;
-  privilege = static_cast<uint8_t>(header.privilege_mode & 0x3u);
+  if (!mem_only) {
+    privilege = static_cast<uint8_t>(header.privilege_mode & 0x3u);
+  }
   if (checkpoint_version != CKPT_VERSION &&
       checkpoint_version != CKPT_VERSION_LEGACY) {
     std::cerr << "Error: Unsupported checkpoint version: "
@@ -240,9 +242,16 @@ void Ref_cpu::restore_checkpoint(const std::string &filename) {
     exit(1);
   }
 
-  // 1. 恢复 CPU 状态
-  gz_read_pod(file, state);
-  gz_read_pod(file, interval_inst_count);
+  // 1. 恢复 CPU 状态 (front-door restore: read and discard, the restore program sets the state)
+  if (mem_only) {
+    CPU_state discarded_state;
+    uint64_t discarded_interval = 0;
+    gz_read_pod(file, discarded_state);
+    gz_read_pod(file, discarded_interval);
+  } else {
+    gz_read_pod(file, state);
+    gz_read_pod(file, interval_inst_count);
+  }
 
   // 2. 恢复 RAM
   if (memory == nullptr) {
@@ -260,6 +269,14 @@ void Ref_cpu::restore_checkpoint(const std::string &filename) {
                   checkpoint_sdram_size);
   } else {
     std::memset(sdram_memory, 0, SDRAM_SIZE);
+  }
+
+  if (mem_only) {  // devices are restored by the restore program
+    gzclose(file);
+    tlb_flush();
+    std::cout << "Checkpoint memory restored from " << final_name << " (front-door restore: CPU and devices at reset)"
+              << std::endl;
+    return;
   }
 
   // 3. 恢复并校验 IO 布局（base + size）

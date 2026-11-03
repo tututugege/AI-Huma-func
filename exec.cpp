@@ -1196,11 +1196,24 @@ std::vector<uint64_t> g_digest_list = [] {
 }();
 size_t g_digest_list_pos = 0;
 
-void print_state_digest(uint64_t t, const CPU_state &st) {
+// REF_STATE_DIGEST_FULL=1: the digests also cover the privilege and the CSRs, except the bits a front-door restore cannot
+// reproduce (mstatus.MPP/MPIE, mepc and their sstatus shadow): mret sets MPP to U and MPIE to 1, and mepc to the target.
+const bool g_digest_full = std::getenv("REF_STATE_DIGEST_FULL") != nullptr;
+
+void print_state_digest(uint64_t t, const CPU_state &st, uint8_t priv = 0) {
   uint64_t h = 1469598103934665603ull;
   auto mix = [&h](uint32_t v) { h = (h ^ v) * 1099511628211ull; };
   mix(st.pc);
   for (int i = 1; i < 32; i++) mix(st.gpr[i]);
+  if (g_digest_full) {
+    mix(priv);
+    for (int i = 0; i < 21; i++) {
+      if (i == csr_mepc || i == csr_sip) continue;  // sip is a shadow that depends on the timer at the moment of the last sync
+      uint32_t v = st.csr[i];
+      if (i == csr_mstatus || i == csr_sstatus) v &= ~0x1880u;
+      mix(v);
+    }
+  }
   fprintf(stderr, "[digest] t=%llu h=%016llx\n", (unsigned long long)t, (unsigned long long)h);
 }
 
@@ -1353,7 +1366,7 @@ dispatch_block:
     const uint64_t c = budget0 - left;
     if (c > 0 && st0 + c >= g_next_digest) {
       state.pc = pc;
-      print_state_digest(st0 + c, state);
+      print_state_digest(st0 + c, state, priv);
       g_next_digest = st0 + c + g_digest_block;
     }
   }
@@ -1361,7 +1374,7 @@ dispatch_block:
     const uint64_t c = budget0 - left;
     if (c > 0 && c != last_digest && (st0 + c) % g_digest_every == 0) {
       state.pc = pc;
-      print_state_digest(st0 + c, state);
+      print_state_digest(st0 + c, state, priv);
       last_digest = c;
     }
   }
@@ -1710,10 +1723,10 @@ out:
     }
     if (__builtin_expect(g_digest_every != 0, 0) && done > 0 && done != last_digest &&
         sim_time % g_digest_every == 0) {
-      print_state_digest(sim_time, state);
+      print_state_digest(sim_time, state, privilege);
     }
     if (__builtin_expect(g_digest_block != 0, 0) && done > 0 && sim_time >= g_next_digest) {
-      print_state_digest(sim_time, state);
+      print_state_digest(sim_time, state, privilege);
       g_next_digest = sim_time + g_digest_block;
     }
     if (done > 0) {
@@ -1842,10 +1855,14 @@ void Ref_cpu::exec(const SimConfig &config) {
   } else if (config.mode == SimMode::GEN_BBV) {
     bbv_init_file(config.bbv_output_file.c_str());
   } else if (config.mode == SimMode::RESTORE) {
-    restore_checkpoint(config.restore_file);
+    restore_checkpoint(config.restore_file, config.restore_mem_only);
   }
 
   uint64_t restored_inst_count = 0;
+  // Front-door restore: the restore program (flash image) runs from reset; its first mret hands over to the checkpoint's
+  // code. The instruction limit and all counters start counting there.
+  bool front_door_pending = config.mode == SimMode::RESTORE && config.restore_mem_only;
+  uint64_t front_door_insts = 0;
 
   // Interval boundary (an interval of U-mode instructions just ended): mode-specific dump / checkpoint, then restart the count
   auto interval_boundary = [&]() {
@@ -1922,13 +1939,13 @@ void Ref_cpu::exec(const SimConfig &config) {
         interval_inst_count = 0;
       }
       if (__builtin_expect(g_digest_every != 0, 0) && sim_time % g_digest_every == 0)
-        print_state_digest(sim_time, state);
+        print_state_digest(sim_time, state, privilege);
       if (__builtin_expect(g_digest_block != 0, 0) && sim_time >= g_next_digest && !g_no_fast) {
-        print_state_digest(sim_time, state);
+        print_state_digest(sim_time, state, privilege);
         g_next_digest = sim_time + g_digest_block;
       }
       if (__builtin_expect(g_digest_list_pos < g_digest_list.size(), 0) && sim_time == g_digest_list[g_digest_list_pos]) {
-        print_state_digest(sim_time, state);
+        print_state_digest(sim_time, state, privilege);
         g_digest_list_pos++;
       }
     }
@@ -1952,7 +1969,7 @@ void Ref_cpu::exec(const SimConfig &config) {
           cap = it->first - sim_time - 1;
         }
       }
-      if (config.max_insts > 0) {
+      if (config.max_insts > 0 && !front_door_pending) {
         const uint64_t cur = (config.mode == SimMode::RESTORE) ? restored_inst_count : sim_time;
         cap = std::min<uint64_t>(cap, cur + 1 >= config.max_insts ? 0 : config.max_insts - cur - 1);
       }
@@ -2024,13 +2041,13 @@ void Ref_cpu::exec(const SimConfig &config) {
 
     sim_time++;
     if (__builtin_expect(g_digest_every != 0, 0) && sim_time % g_digest_every == 0)
-      print_state_digest(sim_time, state);
+      print_state_digest(sim_time, state, privilege);
     if (__builtin_expect(g_digest_block != 0, 0) && sim_time >= g_next_digest && !g_no_fast) {
-      print_state_digest(sim_time, state);
+      print_state_digest(sim_time, state, privilege);
       g_next_digest = sim_time + g_digest_block;
     }
     if (__builtin_expect(g_digest_list_pos < g_digest_list.size(), 0) && sim_time == g_digest_list[g_digest_list_pos]) {
-      print_state_digest(sim_time, state);
+      print_state_digest(sim_time, state, privilege);
       g_digest_list_pos++;
     }
 
@@ -2070,7 +2087,7 @@ void Ref_cpu::exec(const SimConfig &config) {
     }
 
     // 3. 指令数限制检查
-    if (config.max_insts > 0) {
+    if (config.max_insts > 0 && !front_door_pending) {
       if (config.mode == SimMode::RESTORE) {
         restored_inst_count++;
         if (restored_inst_count >= config.max_insts) {
@@ -2086,6 +2103,22 @@ void Ref_cpu::exec(const SimConfig &config) {
     // 4. Interval 边界处理
     if (interval_inst_count >= INTERVAL_SIZE) {
       interval_boundary();
+    }
+
+    // 5. Front-door restore: the restore program ended with its mret. Start counting from the checkpoint's code; the
+    // timer offset absorbs the reset of sim_time so mtime stays continuous.
+    if (__builtin_expect(front_door_pending, 0) && Instruction == INST_MRET) {
+      front_door_pending = false;
+      front_door_insts = sim_time;
+      std::cout << "[front-door] restore program done after " << std::dec << front_door_insts
+                << " instructions; pc=0x" << std::hex << state.pc << " priv=" << std::dec << (unsigned)privilege
+                << " mtime=" << ref_timer_now(sim_time) << " mtimecmp=" << g_ref_timer_cmp << std::endl;
+      g_ref_timer_offset += sim_time;
+      sim_time = 0;
+      restored_inst_count = 0;
+      interval_inst_count = 0;
+      current_bb_len = 0;
+      finished_intervals = 0;
     }
   }
 
