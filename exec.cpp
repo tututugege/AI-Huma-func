@@ -6,6 +6,7 @@
 #include "ref.h"
 #include <cstdio>
 #include <cstdint>
+#include <algorithm>
 #include <cstdlib>
 #include <iostream>
 #include <map>
@@ -1097,6 +1098,380 @@ void Ref_cpu::checkpoint_mmio_sync_devices() {
   refresh_external_interrupt();
 }
 
+// ---------------------------------------------------------------------------------------------------------------
+// Fast path for plain runs (see ref.h): decoded-instruction cache plus per-instruction handlers for the common
+// integer instructions.  A handler either executes the instruction exactly as RV32IM() would, or leaves every piece
+// of state untouched and returns to the caller, which then runs RISCV() for that instruction.
+namespace {
+enum FastOp : uint8_t {
+  F_SLOW = 0, F_NOP,
+  F_LUI, F_AUIPC, F_JAL, F_JALR,
+  F_BEQ, F_BNE, F_BLT, F_BGE, F_BLTU, F_BGEU,
+  F_LB, F_LH, F_LW, F_LBU, F_LHU,
+  F_SB, F_SH, F_SW,
+  F_ADDI, F_SLTI, F_SLTIU, F_XORI, F_ORI, F_ANDI, F_SLLI, F_SRLI, F_SRAI,
+  F_ADD, F_SUB, F_SLL, F_SLT, F_SLTU, F_XOR, F_SRL, F_SRA, F_OR, F_AND,
+  F_MUL, F_MULH, F_MULHSU, F_MULHU, F_DIV, F_DIVU, F_REM, F_REMU,
+};
+
+// REF_NO_FAST=1 runs everything through RISCV(); REF_STATE_DIGEST=N prints a hash of (pc, x1..x31) every N
+// instructions.  The two together compare the fast path against the original path instruction by instruction.
+const bool g_no_fast = std::getenv("REF_NO_FAST") != nullptr;
+const uint64_t g_digest_every =
+    std::getenv("REF_STATE_DIGEST") ? std::strtoull(std::getenv("REF_STATE_DIGEST"), nullptr, 0) : 0;
+
+// REF_FAST_STATS=1: report, at exit, how many instructions the fast path ran and why it handed over to RISCV()
+const bool g_fast_stats = std::getenv("REF_FAST_STATS") != nullptr;
+struct FastStats {
+  uint64_t fast_insts = 0, runs = 0, stop[8] = {0}, slow_op[128 * 8] = {0};
+  ~FastStats() {
+    if (!g_fast_stats) return;
+    fprintf(stderr, "[fast] instructions=%llu runs=%llu stops: interrupt/timer=%llu budget=%llu misalign_pc=%llu fill_fail=%llu slow_op=%llu mem_fallback=%llu\n",
+            (unsigned long long)fast_insts, (unsigned long long)runs, (unsigned long long)stop[0], (unsigned long long)stop[1],
+            (unsigned long long)stop[2], (unsigned long long)stop[3], (unsigned long long)stop[4], (unsigned long long)stop[5]);
+    for (int pass = 0; pass < 12; pass++) {
+      int best = -1; uint64_t bc = 0;
+      for (int i = 0; i < 128 * 8; i++) if (slow_op[i] > bc) { bc = slow_op[i]; best = i; }
+      if (best < 0) break;
+      fprintf(stderr, "[fast]   slow opcode=0x%02x funct3=%d : %llu\n", best / 8, best % 8, (unsigned long long)bc);
+      slow_op[best] = 0;
+    }
+  }
+} g_fs;
+
+void print_state_digest(uint64_t t, const CPU_state &st) {
+  uint64_t h = 1469598103934665603ull;
+  auto mix = [&h](uint32_t v) { h = (h ^ v) * 1099511628211ull; };
+  mix(st.pc);
+  for (int i = 1; i < 32; i++) mix(st.gpr[i]);
+  fprintf(stderr, "[digest] t=%llu h=%016llx\n", (unsigned long long)t, (unsigned long long)h);
+}
+
+// Classify an instruction word.  Only exact base-ISA / M encodings are fast; everything else (Zba/Zbb/Zbc/Zbs,
+// CSR, AMO, FP, system, unknown funct3/funct7 combinations) stays F_SLOW and goes through RISCV().
+void fast_decode(uint32_t in, Ref_cpu::ICacheEntry &e) {
+  e.raw = in;
+  e.rd = BITS(in, 11, 7);
+  e.rs1 = BITS(in, 19, 15);
+  e.rs2 = BITS(in, 24, 20);
+  e.imm = 0;
+  const uint32_t opc = BITS(in, 6, 0), f3 = BITS(in, 14, 12), f7 = BITS(in, 31, 25);
+  uint8_t op = F_SLOW;
+  switch (opc) {
+  case number_0_opcode_lui: op = F_LUI; e.imm = immU(in); break;
+  case number_1_opcode_auipc: op = F_AUIPC; e.imm = immU(in); break;
+  case number_2_opcode_jal: op = F_JAL; e.imm = immJ(in); break;
+  case number_3_opcode_jalr: op = F_JALR; e.imm = immI(in); break;
+  case number_4_opcode_beq:
+    e.imm = immB(in);
+    switch (f3) {
+    case 0: op = F_BEQ; break;
+    case 1: op = F_BNE; break;
+    case 4: op = F_BLT; break;
+    case 5: op = F_BGE; break;
+    case 6: op = F_BLTU; break;
+    case 7: op = F_BGEU; break;
+    }
+    break;
+  case number_5_opcode_lb:
+    e.imm = immI(in);
+    switch (f3) {
+    case 0: op = F_LB; break;
+    case 1: op = F_LH; break;
+    case 2: op = F_LW; break;
+    case 4: op = F_LBU; break;
+    case 5: op = F_LHU; break;
+    }
+    break;
+  case number_6_opcode_sb:
+    e.imm = immS(in);
+    switch (f3) {
+    case 0: op = F_SB; break;
+    case 1: op = F_SH; break;
+    case 2: op = F_SW; break;
+    }
+    break;
+  case number_7_opcode_addi:
+    e.imm = immI(in);
+    switch (f3) {
+    case 0: op = F_ADDI; break;
+    case 2: op = F_SLTI; break;
+    case 3: op = F_SLTIU; break;
+    case 4: op = F_XORI; break;
+    case 6: op = F_ORI; break;
+    case 7: op = F_ANDI; break;
+    case 1: if (f7 == 0) { op = F_SLLI; e.imm &= 0x1F; } break;
+    case 5:
+      if (f7 == 0) { op = F_SRLI; e.imm &= 0x1F; }
+      else if (f7 == 0x20) { op = F_SRAI; e.imm &= 0x1F; }
+      break;
+    }
+    break;
+  case number_8_opcode_add:
+    if (f7 == 1) {
+      static const uint8_t m[8] = {F_MUL, F_MULH, F_MULHSU, F_MULHU, F_DIV, F_DIVU, F_REM, F_REMU};
+      op = m[f3];
+    } else if (f7 == 0) {
+      static const uint8_t b[8] = {F_ADD, F_SLL, F_SLT, F_SLTU, F_XOR, F_SRL, F_OR, F_AND};
+      op = b[f3];
+    } else if (f7 == 0x20) {
+      if (f3 == 0) op = F_SUB;
+      else if (f3 == 5) op = F_SRA;
+    }
+    break;
+  case number_9_opcode_fence: op = F_NOP; break;
+  }
+  e.op = op;
+}
+}  // namespace
+
+bool Ref_cpu::fast_fill(ICacheEntry &e, uint32_t pc, uint64_t key, bool translate) {
+  uint32_t p = pc;
+  if (translate && !va2pa(p, pc, 0)) {
+    return false;  // instruction page fault: RISCV() raises it
+  }
+  if (!is_ddr_range(p, 4)) {
+    return false;
+  }
+  fast_decode(memory[(p - kRamBase) >> 2], e);
+  e.pc = pc;
+  e.key = key;
+  e.epoch = icache_epoch;
+  mark_code_page(p);
+  return true;
+}
+
+// Run instructions until one needs the general path, an interrupt could be taken, or the timer deadline is reached.
+void Ref_cpu::fast_run(uint32_t &finished_intervals) {
+  if (sim_time >= MAX_SIM_TIME) {
+    return;
+  }
+  const uint32_t mie = state.csr[csr_mie];
+  // No interrupt may be pending-and-enabled, and the timer must not fire before the next instruction: both are
+  // exactly the conditions under which RISCV() would take no interrupt and no trap before executing the instruction.
+  if (g_fast_stats) g_fs.runs++;
+  if (interrupt_delivery_enable && (state.csr[csr_mip] & mie & 0x00000AAAu)) {
+    if (g_fast_stats) g_fs.stop[0]++;
+    return;
+  }
+  uint64_t budget = MAX_SIM_TIME - sim_time;
+  if (device_effects_enable && interrupt_delivery_enable && (mie & MIP_MTIP)) {
+    const uint64_t now = sim_time + g_ref_timer_offset;
+    if (now >= g_ref_timer_cmp) {
+      if (g_fast_stats) g_fs.stop[0]++;
+      return;
+    }
+    budget = std::min<uint64_t>(budget, g_ref_timer_cmp - now);
+  }
+
+  uint32_t *const x = state.gpr;
+  const uint32_t satp = state.csr[csr_satp];
+  const uint32_t mstatus = state.csr[csr_mstatus];
+  const uint32_t priv = privilege;
+  const bool fetch_translate = (satp & 0x80000000) && priv != RISCV_MODE_M;
+  const uint32_t data_priv = (mstatus & MSTATUS_MPRV) ? GET_MPP(mstatus) : priv;
+  const bool data_translate = (satp & 0x80000000) && data_priv != RISCV_MODE_M;
+  const uint64_t key = (static_cast<uint64_t>(satp) << 8) | priv;
+
+  uint32_t pc = state.pc;
+  uint64_t done = 0;
+  bool last_br = false, last_taken = false, last_store = false;
+
+  while (done < budget) {
+    if (pc & 3u) {
+      if (g_fast_stats) g_fs.stop[2]++;
+      break;  // misaligned pc: the general path fetches the aligned word
+    }
+    ICacheEntry &e = icache[(pc >> 2) & (kICacheSize - 1)];
+    if (__builtin_expect(!(e.pc == pc && e.key == key && e.epoch == icache_epoch), 0)) {
+      if (!fast_fill(e, pc, key, fetch_translate)) {
+        if (g_fast_stats) g_fs.stop[3]++;
+        break;
+      }
+    }
+    uint32_t next = pc + 4;
+    bool br = false, taken = false, store = false;
+
+    switch (e.op) {
+    case F_SLOW:
+      if (g_fast_stats) { g_fs.stop[4]++; g_fs.slow_op[(e.raw & 0x7F) * 8 + ((e.raw >> 12) & 7)]++; }
+      goto out;
+    case F_NOP:
+      break;
+    case F_LUI: x[e.rd] = e.imm; break;
+    case F_AUIPC: x[e.rd] = e.imm + pc; break;
+    case F_JAL:
+      br = taken = true;
+      next = pc + e.imm;
+      x[e.rd] = pc + 4;
+      break;
+    case F_JALR: {
+      br = taken = true;
+      const uint32_t t = (x[e.rs1] + e.imm) & 0xFFFFFFFCu;
+      x[e.rd] = pc + 4;
+      next = t;
+      break;
+    }
+#define FAST_BRANCH(COND)                                                                                           \
+  br = true;                                                                                                        \
+  if (COND) {                                                                                                       \
+    taken = true;                                                                                                   \
+    next = pc + e.imm;                                                                                              \
+  }                                                                                                                 \
+  break;
+    case F_BEQ: FAST_BRANCH(x[e.rs1] == x[e.rs2])
+    case F_BNE: FAST_BRANCH(x[e.rs1] != x[e.rs2])
+    case F_BLT: FAST_BRANCH((int32_t)x[e.rs1] < (int32_t)x[e.rs2])
+    case F_BGE: FAST_BRANCH((int32_t)x[e.rs1] >= (int32_t)x[e.rs2])
+    case F_BLTU: FAST_BRANCH(x[e.rs1] < x[e.rs2])
+    case F_BGEU: FAST_BRANCH(x[e.rs1] >= x[e.rs2])
+#undef FAST_BRANCH
+
+    case F_LB: case F_LH: case F_LW: case F_LBU: case F_LHU: {
+      const uint32_t v = x[e.rs1] + e.imm;
+      const uint32_t size = (e.op == F_LB || e.op == F_LBU) ? 1 : (e.op == F_LW ? 4 : 2);
+      if (v & (size - 1)) {
+        goto out;  // misaligned: the general path reports it
+      }
+      uint32_t p = v;
+      if (data_translate && !va2pa(p, v, 1)) {
+        goto out;  // page fault
+      }
+      if (!is_ddr_range(p, size)) {
+        if (g_fast_stats) g_fs.stop[5]++;
+        goto out;  // MMIO or SDRAM
+      }
+      const uint32_t w = memory[(p - kRamBase) >> 2] >> ((p & 3u) * 8);
+      switch (e.op) {
+      case F_LB: x[e.rd] = (uint32_t)(int32_t)(int8_t)(w & 0xFF); break;
+      case F_LBU: x[e.rd] = w & 0xFF; break;
+      case F_LH: x[e.rd] = (uint32_t)(int32_t)(int16_t)(w & 0xFFFF); break;
+      case F_LHU: x[e.rd] = w & 0xFFFF; break;
+      default: x[e.rd] = w; break;
+      }
+      break;
+    }
+    case F_SB: case F_SH: case F_SW: {
+      const uint32_t v = x[e.rs1] + e.imm;
+      const uint32_t size = e.op == F_SB ? 1 : (e.op == F_SH ? 2 : 4);
+      if (v & (size - 1)) {
+        goto out;
+      }
+      uint32_t p = v;
+      if (data_translate && !va2pa(p, v, 2)) {
+        goto out;
+      }
+      if (!is_ddr_range(p, size)) {
+        if (g_fast_stats) g_fs.stop[5]++;
+        goto out;
+      }
+      uint32_t sval = x[e.rs2];
+      const uint32_t strb = size == 1 ? 0b1u : (size == 2 ? 0b11u : 0b1111u);
+      sval &= size == 1 ? 0xFFu : (size == 2 ? 0xFFFFu : 0xFFFFFFFFu);
+      if (state.reserve_valid && state.reserve_addr == p) {
+        state.reserve_valid = false;
+      }
+      const uint32_t off = p & 3u;
+      const uint32_t wdata = sval << (off * 8);
+      const uint32_t mask = (size == 1 ? 0xFFu : (size == 2 ? 0xFFFFu : 0xFFFFFFFFu)) << (off * 8);
+      const uint32_t idx = (p - kRamBase) >> 2;
+      if (const uint8_t f = pt_page_flag[p >> 12]) {
+        page_flag_hit(f);  // may flush the instruction cache; the entry reference is not used after this
+      }
+      memory[idx] = (mask & wdata) | (~mask & memory[idx]);
+      state.store_addr = p;
+      state.store_data = wdata;
+      state.store_strb = strb << (off * 8);
+      store = true;
+      break;
+    }
+
+    case F_ADDI: x[e.rd] = x[e.rs1] + e.imm; break;
+    case F_SLTI: x[e.rd] = (int32_t)x[e.rs1] < (int32_t)e.imm ? 1 : 0; break;
+    case F_SLTIU: x[e.rd] = x[e.rs1] < e.imm ? 1 : 0; break;
+    case F_XORI: x[e.rd] = x[e.rs1] ^ e.imm; break;
+    case F_ORI: x[e.rd] = x[e.rs1] | e.imm; break;
+    case F_ANDI: x[e.rd] = x[e.rs1] & e.imm; break;
+    case F_SLLI: x[e.rd] = x[e.rs1] << e.imm; break;
+    case F_SRLI: x[e.rd] = x[e.rs1] >> e.imm; break;
+    case F_SRAI: x[e.rd] = (uint32_t)((int32_t)x[e.rs1] >> e.imm); break;
+
+    case F_ADD: x[e.rd] = x[e.rs1] + x[e.rs2]; break;
+    case F_SUB: x[e.rd] = x[e.rs1] - x[e.rs2]; break;
+    case F_SLL: x[e.rd] = x[e.rs1] << (x[e.rs2] & 0x1F); break;
+    case F_SLT: x[e.rd] = (int32_t)x[e.rs1] < (int32_t)x[e.rs2] ? 1 : 0; break;
+    case F_SLTU: x[e.rd] = x[e.rs1] < x[e.rs2] ? 1 : 0; break;
+    case F_XOR: x[e.rd] = x[e.rs1] ^ x[e.rs2]; break;
+    case F_SRL: x[e.rd] = x[e.rs1] >> (x[e.rs2] & 0x1F); break;
+    case F_SRA: x[e.rd] = (uint32_t)((int32_t)x[e.rs1] >> (x[e.rs2] & 0x1F)); break;
+    case F_OR: x[e.rd] = x[e.rs1] | x[e.rs2]; break;
+    case F_AND: x[e.rd] = x[e.rs1] & x[e.rs2]; break;
+
+    case F_MUL: x[e.rd] = x[e.rs1] * x[e.rs2]; break;
+    case F_MULH: x[e.rd] = (uint32_t)(((int64_t)(int32_t)x[e.rs1] * (int64_t)(int32_t)x[e.rs2]) >> 32); break;
+    case F_MULHSU: x[e.rd] = (uint32_t)(((int64_t)(int32_t)x[e.rs1] * (int64_t)(uint32_t)x[e.rs2]) >> 32); break;
+    case F_MULHU: x[e.rd] = (uint32_t)(((uint64_t)x[e.rs1] * (uint64_t)x[e.rs2]) >> 32); break;
+    case F_DIV: {
+      const int32_t a = (int32_t)x[e.rs1], b = (int32_t)x[e.rs2];
+      x[e.rd] = b == 0 ? 0xFFFFFFFFu : (a == INT32_MIN && b == -1 ? (uint32_t)INT32_MIN : (uint32_t)(a / b));
+      break;
+    }
+    case F_DIVU: x[e.rd] = x[e.rs2] == 0 ? 0xFFFFFFFFu : x[e.rs1] / x[e.rs2]; break;
+    case F_REM: {
+      const int32_t a = (int32_t)x[e.rs1], b = (int32_t)x[e.rs2];
+      x[e.rd] = b == 0 ? (uint32_t)a : (a == INT32_MIN && b == -1 ? 0u : (uint32_t)(a % b));
+      break;
+    }
+    case F_REMU: x[e.rd] = x[e.rs2] == 0 ? x[e.rs1] : x[e.rs1] % x[e.rs2]; break;
+    default:
+      goto out;
+    }
+    x[0] = 0;
+
+    // the same bookkeeping RISCV() and the main loop do for U-mode basic blocks and intervals
+    if (priv == RISCV_MODE_U) {
+      if (current_bb_len == 0) {
+        current_bb_head_pc = pc;
+      }
+      current_bb_len++;
+      if (br) {
+        interval_inst_count += current_bb_len;
+        current_bb_len = 0;
+        if (interval_inst_count >= INTERVAL_SIZE) {
+          finished_intervals++;
+          interval_inst_count = 0;
+        }
+      }
+    }
+    pc = next;
+    sim_time++;
+    done++;
+    last_br = br;
+    last_taken = taken;
+    last_store = store;
+    if (__builtin_expect(g_digest_every != 0, 0) && sim_time % g_digest_every == 0) {
+      state.pc = pc;
+      print_state_digest(sim_time, state);
+    }
+  }
+out:
+  state.pc = pc;
+  if (g_fast_stats) { g_fs.fast_insts += done; if (done == budget) g_fs.stop[1]++; }
+  if (done > 0) {
+    // leave the per-instruction flags as RISCV() would after the last instruction executed here
+    is_csr = is_exception = false;
+    is_br = last_br;
+    br_taken = last_taken;
+    is_io = false;
+    force_sync = false;
+    asy = false;
+    illegal_exception = page_fault_load = page_fault_inst = page_fault_store = false;
+    breakpoint_exception = false;
+    state.store = last_store;
+    sync_timer_csrs(state, sim_time, device_effects_enable && interrupt_delivery_enable);
+  }
+}
+
 void Ref_cpu::exec(const SimConfig &config) {
   // Initialize Spike Reference Simulator if enabled
 #ifdef ENABLE_SPIKE
@@ -1171,6 +1546,11 @@ void Ref_cpu::exec(const SimConfig &config) {
   // this, so skip its per-instruction mode and limit checks.
   if (config.mode == SimMode::NORMAL && !config.difftest && config.max_insts == 0 && !kLogProgressSimTime) {
     while (!sim_end && sim_time < MAX_SIM_TIME) {
+      if (!g_no_fast) {
+        fast_run(finished_intervals);
+        if (sim_end || sim_time >= MAX_SIM_TIME)
+          break;
+      }
       RISCV();
       if (sim_end)
         break;
@@ -1183,6 +1563,8 @@ void Ref_cpu::exec(const SimConfig &config) {
         finished_intervals++;
         interval_inst_count = 0;
       }
+      if (__builtin_expect(g_digest_every != 0, 0) && sim_time % g_digest_every == 0)
+        print_state_digest(sim_time, state);
     }
   }
   while (!(config.mode == SimMode::NORMAL && !config.difftest && config.max_insts == 0 && !kLogProgressSimTime) &&
@@ -3069,12 +3451,12 @@ void Ref_cpu::store_word(uint32_t addr, uint32_t data) {
     return;
   }
   if (is_sdram_range(word_addr, 4)) {
-    if (pt_page_flag[word_addr >> 12]) tlb_flush();
+    if (const uint8_t f = pt_page_flag[word_addr >> 12]) page_flag_hit(f);
     sdram_memory[(word_addr - kSdramBase) >> 2] = data;
     return;
   }
   if (is_ddr_range(word_addr, 4)) {
-    if (pt_page_flag[word_addr >> 12]) tlb_flush();
+    if (const uint8_t f = pt_page_flag[word_addr >> 12]) page_flag_hit(f);
     memory[(word_addr - kRamBase) >> 2] = data;
     return;
   }
@@ -3189,8 +3571,18 @@ void Ref_cpu::tlb_flush() {
     for (auto &e : tlb) e.epoch = 0;
     tlb_epoch = 1;
   }
-  for (uint32_t p : pt_marked) pt_page_flag[p] = 0;
+  for (uint32_t p : pt_marked) pt_page_flag[p] &= ~1;
   pt_marked.clear();
+  icache_flush();
+}
+
+void Ref_cpu::icache_flush() {
+  if (++icache_epoch == 0) {
+    for (auto &e : icache) e.epoch = 0;
+    icache_epoch = 1;
+  }
+  for (uint32_t p : code_marked) pt_page_flag[p] &= ~2;
+  code_marked.clear();
 }
 
 bool Ref_cpu::va2pa(uint32_t &p_addr, uint32_t v_addr, uint32_t type) {

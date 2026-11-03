@@ -252,16 +252,46 @@ public:
   static constexpr uint32_t kTlbSize = 1024;
   TlbEntry tlb[kTlbSize] = {};
   uint32_t tlb_epoch = 1;
+  // Per physical page flags: bit 0 = a page-table page a cached translation depends on, bit 1 = a page decoded
+  // instructions were cached from.  A store into a flagged page flushes the matching cache.
   std::vector<uint8_t> pt_page_flag = std::vector<uint8_t>(1u << 20, 0);
   std::vector<uint32_t> pt_marked;
+  std::vector<uint32_t> code_marked;
   void tlb_flush();
+  void icache_flush();
+  void page_flag_hit(uint8_t f) {
+    if (f & 1) tlb_flush();  // also flushes the instruction cache (virtual to physical mapping may have changed)
+    if (f & 2) icache_flush();
+  }
   void mark_pt_page(uint32_t addr) {
     const uint32_t p = addr >> 12;
-    if (!pt_page_flag[p]) {
-      pt_page_flag[p] = 1;
+    if (!(pt_page_flag[p] & 1)) {
+      pt_page_flag[p] |= 1;
       pt_marked.push_back(p);
     }
   }
+  void mark_code_page(uint32_t addr) {
+    const uint32_t p = addr >> 12;
+    if (!(pt_page_flag[p] & 2)) {
+      pt_page_flag[p] |= 2;
+      code_marked.push_back(p);
+    }
+  }
+
+  // Fast path for plain runs: decoded-instruction cache (like Spike's icache) plus per-instruction handlers for the
+  // common integer instructions.  Anything unusual (MMIO, faults, misaligned, CSR/AMO/FP, interrupts) falls back to
+  // RISCV() before any state is changed.  Cache entries are keyed by virtual pc, (satp, privilege) and an epoch that
+  // is bumped when the translation or the code memory may have changed.
+  struct ICacheEntry {
+    uint32_t pc = 0, raw = 0, imm = 0, epoch = 0;
+    uint64_t key = 0;
+    uint8_t op = 0, rd = 0, rs1 = 0, rs2 = 0;
+  };
+  static constexpr uint32_t kICacheSize = 4096;
+  ICacheEntry icache[kICacheSize];
+  uint32_t icache_epoch = 1;
+  bool fast_fill(ICacheEntry &e, uint32_t pc, uint64_t key, bool translate);
+  void fast_run(uint32_t &finished_intervals);
   void RISCV();
   void FORCE_INLINE RV32IM();
   __attribute__((noinline)) void RV32A();  // cold: keeps RISCV()'s frame small
