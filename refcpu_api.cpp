@@ -144,6 +144,7 @@ void refcpu_sync_ram_from_dut(RefCpuContext *ctx, const uint32_t *ram_src,
   const size_t limit = static_cast<size_t>(ctx->cpu.ram_size);
   const size_t bytes = std::min(size_bytes, limit);
   std::memcpy(ctx->cpu.memory, ram_src, bytes);
+  ctx->cpu.tlb_flush();
 }
 
 void refcpu_sync_sdram_from_dut(RefCpuContext *ctx,
@@ -155,13 +156,16 @@ void refcpu_sync_sdram_from_dut(RefCpuContext *ctx,
   }
   const size_t bytes = std::min(size_bytes, static_cast<size_t>(SDRAM_SIZE));
   std::memcpy(ctx->cpu.sdram_memory, sdram_src, bytes);
+  ctx->cpu.tlb_flush();
 }
 
 uint32_t *refcpu_get_ram_ptr(RefCpuContext *ctx) {
+  if (ctx != nullptr) ctx->cpu.tlb_flush();  // the caller may write through the pointer
   return ctx == nullptr ? nullptr : ctx->cpu.memory;
 }
 
 uint32_t *refcpu_get_sdram_ptr(RefCpuContext *ctx) {
+  if (ctx != nullptr) ctx->cpu.tlb_flush();  // the caller may write through the pointer
   return ctx == nullptr ? nullptr : ctx->cpu.sdram_memory;
 }
 

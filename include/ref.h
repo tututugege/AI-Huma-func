@@ -244,11 +244,29 @@ public:
   void checkpoint_mmio_sync_devices();
   void exec(const SimConfig &config);
   bool va2pa(uint32_t &p_addr, uint32_t v_addr, uint32_t type);
+  bool va2pa_walk(uint32_t &p_addr, uint32_t v_addr, uint32_t type);
+  // Software TLB over va2pa_walk.  The walk is a pure function of (satp, mstatus MXR/SUM/MPRV/MPP, privilege,
+  // v_addr, type, page-table memory), so a cached result stays exact as long as no page-table word changed: every
+  // physical page a walk read is marked, any store into a marked page (and any bulk write to memory) flushes the TLB.
+  struct TlbEntry { uint32_t epoch, vpn, satp, frame, ctx; };
+  static constexpr uint32_t kTlbSize = 1024;
+  TlbEntry tlb[kTlbSize] = {};
+  uint32_t tlb_epoch = 1;
+  std::vector<uint8_t> pt_page_flag = std::vector<uint8_t>(1u << 20, 0);
+  std::vector<uint32_t> pt_marked;
+  void tlb_flush();
+  void mark_pt_page(uint32_t addr) {
+    const uint32_t p = addr >> 12;
+    if (!pt_page_flag[p]) {
+      pt_page_flag[p] = 1;
+      pt_marked.push_back(p);
+    }
+  }
   void RISCV();
   void FORCE_INLINE RV32IM();
-  void FORCE_INLINE RV32A();
-  void FORCE_INLINE RV32CSR();
-  void FORCE_INLINE RV32Zfinx();
+  __attribute__((noinline)) void RV32A();  // cold: keeps RISCV()'s frame small
+  __attribute__((noinline)) void RV32CSR();  // cold: keeps RISCV()'s frame small
+  __attribute__((noinline)) void RV32Zfinx();  // cold: keeps RISCV()'s frame small
   void exception(uint32_t trap_val);
   void store_data();
   uint32_t load_word(uint32_t addr) const;

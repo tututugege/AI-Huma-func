@@ -294,6 +294,7 @@ void Ref_cpu::restore_checkpoint(const std::string &filename) {
   checkpoint_mmio_sync_devices();
 
   gzclose(file);
+  tlb_flush();  // memory and state were overwritten
   std::cout << "Checkpoint restored from " << final_name << std::endl;
 }
 

@@ -17,6 +17,9 @@ extern "C" {
 #endif
 }
 
+// REF_PC_EVERY / REF_PC_RING debug output is on only when one of them is set (read once at load time)
+static const bool g_dbg_hot = std::getenv("REF_PC_EVERY") != nullptr || std::getenv("REF_PC_RING") != nullptr;
+
 namespace {
 constexpr uint32_t kSdramBase = SDRAM_BASE;
 constexpr uint64_t kSdramUpperBound =
@@ -279,7 +282,7 @@ inline bool is_ddr_range(uint32_t addr, uint32_t size) {
 }
 
 inline bool is_ram_range(uint32_t addr, uint32_t size) {
-  return is_sdram_range(addr, size) || is_ddr_range(addr, size);
+  return is_ddr_range(addr, size) || is_sdram_range(addr, size);  // DDR is by far the common case
 }
 
 inline bool is_mmio_range(uint32_t addr, uint32_t size) {
@@ -1164,7 +1167,26 @@ void Ref_cpu::exec(const SimConfig &config) {
   uint64_t restored_inst_count = 0;
 
   // --- 主循环 ---
-  while (!sim_end && sim_time < MAX_SIM_TIME) {
+  // Plain run (no difftest, no instruction limit, no checkpoint/BBV mode): the generic loop below reduces to exactly
+  // this, so skip its per-instruction mode and limit checks.
+  if (config.mode == SimMode::NORMAL && !config.difftest && config.max_insts == 0 && !kLogProgressSimTime) {
+    while (!sim_end && sim_time < MAX_SIM_TIME) {
+      RISCV();
+      if (sim_end)
+        break;
+      sim_time++;
+      if (privilege == RISCV_MODE_U && is_br) {
+        interval_inst_count += current_bb_len;
+        current_bb_len = 0;
+      }
+      if (interval_inst_count >= INTERVAL_SIZE) {
+        finished_intervals++;
+        interval_inst_count = 0;
+      }
+    }
+  }
+  while (!(config.mode == SimMode::NORMAL && !config.difftest && config.max_insts == 0 && !kLogProgressSimTime) &&
+         !sim_end && sim_time < MAX_SIM_TIME) {
 
     if (kLogProgressSimTime && sim_time % 100000000 == 0) {
       std::cout << "SimTime: " << sim_time
@@ -1637,6 +1659,14 @@ void Ref_cpu::evaluate_interrupts(uint32_t mip_reg) {
   const bool mstatus_mie = (mstatus & MSTATUS_MIE) != 0;
   const bool mstatus_sie = (mstatus & MSTATUS_SIE) != 0;
 
+  // Every term below needs (mip & mie) of its own bit (MSIP/SSIP/MTIP/STIP/MEIP/SEIP = 0xAAA), so without any such
+  // bit all six flags are false: the common case, evaluated once per instruction.
+  if ((mip_reg & mie_reg & 0x00000AAAu) == 0) {
+    M_software_interrupt = M_timer_interrupt = M_external_interrupt = false;
+    S_software_interrupt = S_timer_interrupt = S_external_interrupt = false;
+    return;
+  }
+
   M_software_interrupt = (mip_reg & MIP_MSIP) && (mie_reg & MIP_MSIP) &&
                          !(mideleg & MIP_MSIP) &&
                          (privilege < RISCV_MODE_M || mstatus_mie);
@@ -1748,9 +1778,13 @@ void Ref_cpu::RISCV() {
       return;
     }
   }
-  check_mem_range_or_log("instruction fetch", p_addr, 4);
-  Instruction = load_word(p_addr);
-  {  // debug: ring of the last executed PCs, printed at ebreak when REF_PC_RING is set
+  if (__builtin_expect(is_ddr_range(p_addr, 4), 1)) {
+    Instruction = memory[(p_addr - kRamBase) >> 2];  // same word load_word() returns for DDR
+  } else {
+    check_mem_range_or_log("instruction fetch", p_addr, 4);
+    Instruction = load_word(p_addr);
+  }
+  if (__builtin_expect(g_dbg_hot, 0)) {  // debug: ring of the last executed PCs, printed at ebreak when REF_PC_RING is set
     static uint32_t ring[64];
     static uint64_t n = 0;
     ring[n++ & 63] = state.pc;
@@ -1825,34 +1859,42 @@ void Ref_cpu::RISCV() {
   if (!interrupt_delivery_enable) {
     mip_reg = 0;
   }
-  uint32_t medeleg = state.csr[csr_medeleg];
 
-  // 异常委托位 (Exceptions)
-  bool medeleg_U_ecall = (medeleg >> 8) & 1;
-  bool medeleg_S_ecall = (medeleg >> 9) & 1;
-  // bool medeleg_M_ecall = (medeleg >> 11) & 1; // 通常M-ecall不委托
+  // Fast path: no interrupt bit is both pending and enabled (0xAAA = MSIP/SSIP/MTIP/STIP/MEIP/SEIP) and the
+  // instruction is not ecall/mret/sret.  Then every interrupt flag is false and no trap is taken here (page_fault_inst
+  // returned above, illegal_exception is still false), exactly what the general path below computes.
+  if ((mip_reg & mie_reg & 0x00000AAAu) == 0 && !ecall && !mret && !sret) {
+    M_software_interrupt = M_timer_interrupt = M_external_interrupt = false;
+    S_software_interrupt = S_timer_interrupt = S_external_interrupt = false;
+    asy = false;
+  } else {
+    uint32_t medeleg = state.csr[csr_medeleg];
 
-  bool medeleg_page_fault_inst = (medeleg >> 12) & 1;
-  bool medeleg_page_fault_load = (medeleg >> 13) & 1;
-  bool medeleg_page_fault_store = (medeleg >> 15) & 1;
+    // 异常委托位 (Exceptions)
+    bool medeleg_U_ecall = (medeleg >> 8) & 1;
+    bool medeleg_S_ecall = (medeleg >> 9) & 1;
+    // bool medeleg_M_ecall = (medeleg >> 11) & 1; // 通常M-ecall不委托
 
-  evaluate_interrupts(mip_reg);
+    bool medeleg_page_fault_inst = (medeleg >> 12) & 1;
 
-  // Trap 判断
-  bool MTrap =
-      M_software_interrupt || M_timer_interrupt || M_external_interrupt ||
-      ((privilege == 0) && !medeleg_U_ecall && ecall) || // ecall from U
-      ((privilege == 1) && !medeleg_S_ecall && ecall) || // ecall from S
-      ((privilege == 3) && ecall) ||                     // ecall from M
-      (page_fault_inst && !medeleg_page_fault_inst) || illegal_exception;
+    evaluate_interrupts(mip_reg);
 
-  bool STrap = S_software_interrupt || S_timer_interrupt ||
-               S_external_interrupt ||
-               ((privilege == 0) && medeleg_U_ecall && ecall) ||
-               ((privilege == 1) && medeleg_S_ecall && ecall) ||
-               (page_fault_inst && medeleg_page_fault_inst);
+    // Trap 判断
+    bool MTrap =
+        M_software_interrupt || M_timer_interrupt || M_external_interrupt ||
+        ((privilege == 0) && !medeleg_U_ecall && ecall) || // ecall from U
+        ((privilege == 1) && !medeleg_S_ecall && ecall) || // ecall from S
+        ((privilege == 3) && ecall) ||                     // ecall from M
+        (page_fault_inst && !medeleg_page_fault_inst) || illegal_exception;
 
-  asy = MTrap || STrap || mret || sret;
+    bool STrap = S_software_interrupt || S_timer_interrupt ||
+                 S_external_interrupt ||
+                 ((privilege == 0) && medeleg_U_ecall && ecall) ||
+                 ((privilege == 1) && medeleg_S_ecall && ecall) ||
+                 (page_fault_inst && medeleg_page_fault_inst);
+
+    asy = MTrap || STrap || mret || sret;
+  }
 
   if (page_fault_inst) {
     exception(state.pc);
@@ -2960,11 +3002,11 @@ void Ref_cpu::RV32IM() {
 
 uint32_t Ref_cpu::load_word(uint32_t addr) const {
   const uint32_t word_addr = addr & ~0x3u;
-  if (is_sdram_range(word_addr, 4)) {
-    return sdram_memory[(word_addr - kSdramBase) >> 2];
-  }
   if (is_ddr_range(word_addr, 4)) {
     return memory[(word_addr - kRamBase) >> 2];
+  }
+  if (is_sdram_range(word_addr, 4)) {
+    return sdram_memory[(word_addr - kSdramBase) >> 2];
   }
 
   check_mem_range_or_log("word load", word_addr, 4);
@@ -3027,10 +3069,12 @@ void Ref_cpu::store_word(uint32_t addr, uint32_t data) {
     return;
   }
   if (is_sdram_range(word_addr, 4)) {
+    if (pt_page_flag[word_addr >> 12]) tlb_flush();
     sdram_memory[(word_addr - kSdramBase) >> 2] = data;
     return;
   }
   if (is_ddr_range(word_addr, 4)) {
+    if (pt_page_flag[word_addr >> 12]) tlb_flush();
     memory[(word_addr - kRamBase) >> 2] = data;
     return;
   }
@@ -3140,7 +3184,42 @@ void Ref_cpu::store_data() {
   state.store_strb = state.store_strb << offset * 8;
 }
 
+void Ref_cpu::tlb_flush() {
+  if (++tlb_epoch == 0) {  // epoch wrapped: make every entry invalid explicitly
+    for (auto &e : tlb) e.epoch = 0;
+    tlb_epoch = 1;
+  }
+  for (uint32_t p : pt_marked) pt_page_flag[p] = 0;
+  pt_marked.clear();
+}
+
 bool Ref_cpu::va2pa(uint32_t &p_addr, uint32_t v_addr, uint32_t type) {
+  const uint32_t mstatus = state.csr[csr_mstatus];
+  const uint32_t satp = state.csr[csr_satp];
+  uint32_t eff_priv = privilege;  // as in va2pa_walk: MPRV applies to everything but instruction fetch
+  if (type != 0 && (mstatus & MSTATUS_MPRV)) {
+    eff_priv = (mstatus >> MSTATUS_MPP_SHIFT) & 0x3;
+  }
+  const uint32_t ctx = (type & 3u) | (eff_priv << 2) | ((mstatus & MSTATUS_MXR) ? 16u : 0u) |
+                       ((mstatus & MSTATUS_SUM) ? 32u : 0u);
+  const uint32_t vpn = v_addr >> 12;
+  TlbEntry &e = tlb[(vpn ^ (type << 7)) & (kTlbSize - 1)];
+  if (e.epoch == tlb_epoch && e.vpn == vpn && e.satp == satp && e.ctx == ctx) {
+    p_addr = (e.frame << 12) | (v_addr & 0xFFF);
+    return true;
+  }
+  if (!va2pa_walk(p_addr, v_addr, type)) {
+    return false;  // faults are not cached
+  }
+  e.epoch = tlb_epoch;
+  e.vpn = vpn;
+  e.satp = satp;
+  e.ctx = ctx;
+  e.frame = p_addr >> 12;
+  return true;
+}
+
+bool Ref_cpu::va2pa_walk(uint32_t &p_addr, uint32_t v_addr, uint32_t type) {
   uint32_t mstatus = state.csr[csr_mstatus];
   uint32_t sstatus = state.csr[csr_sstatus];
   uint32_t satp = state.csr[csr_satp];
@@ -3169,6 +3248,7 @@ bool Ref_cpu::va2pa(uint32_t &p_addr, uint32_t v_addr, uint32_t type) {
 
   // 直接读取，注意这里需要确保 memory 是按字寻址还是字节寻址
   check_mem_range_or_log("ptw-l1", pte1_addr, 4);
+  mark_pt_page(pte1_addr);
   uint32_t pte1 = load_word(pte1_addr);
 
   // 3. 检查 PTE 有效性
@@ -3227,6 +3307,7 @@ bool Ref_cpu::va2pa(uint32_t &p_addr, uint32_t v_addr, uint32_t type) {
   uint32_t pte2_addr = (ppn1 << 12) | (vpn0 << 2);
 
   check_mem_range_or_log("ptw-l2", pte2_addr, 4);
+  mark_pt_page(pte2_addr);
   uint32_t pte2 = load_word(pte2_addr);
 
   // 重复有效性检查
