@@ -1363,6 +1363,7 @@ void Ref_cpu::exception(uint32_t trap_val) {
   bool medeleg_page_fault_load = (medeleg >> 13) & 1;
   bool medeleg_page_fault_store = (medeleg >> 15) & 1;
   bool medeleg_illegal_inst = (medeleg >> 2) & 1;
+  bool medeleg_breakpoint = ((medeleg >> 3) & 1) && privilege != 3;  // a trap taken in M mode is never delegated
 
   // 这里直接复用成员变量里的中断状态 (假设RISCV函数刚跑完，状态是新的)
   // 如果不是，需要重新计算 M_software_interrupt 等
@@ -1375,7 +1376,8 @@ void Ref_cpu::exception(uint32_t trap_val) {
       (page_fault_inst && !medeleg_page_fault_inst) ||
       (page_fault_load && !medeleg_page_fault_load) ||
       (page_fault_store && !medeleg_page_fault_store) ||
-      (illegal_exception && !medeleg_illegal_inst);
+      (illegal_exception && !medeleg_illegal_inst) ||
+      (breakpoint_exception && !medeleg_breakpoint);
 
   bool STrap = S_software_interrupt || S_timer_interrupt ||
                S_external_interrupt ||
@@ -1384,7 +1386,8 @@ void Ref_cpu::exception(uint32_t trap_val) {
                (page_fault_inst && medeleg_page_fault_inst) ||
                (page_fault_load && medeleg_page_fault_load) ||
                (page_fault_store && medeleg_page_fault_store) ||
-               (illegal_exception && medeleg_illegal_inst);
+               (illegal_exception && medeleg_illegal_inst) ||
+               (breakpoint_exception && medeleg_breakpoint);
 
   if (M_software_interrupt || M_timer_interrupt || M_external_interrupt ||
       S_software_interrupt || S_timer_interrupt || S_external_interrupt) {
@@ -1429,6 +1432,8 @@ void Ref_cpu::exception(uint32_t trap_val) {
       exception_code = 13;
     else if (page_fault_store && !medeleg_page_fault_store)
       exception_code = 15;
+    else if (breakpoint_exception)
+      exception_code = 3;
     else if (illegal_exception)
       exception_code = 2;
 
@@ -1494,6 +1499,8 @@ void Ref_cpu::exception(uint32_t trap_val) {
       exception_code = 13;
     else if (page_fault_store && medeleg_page_fault_store)
       exception_code = 15;
+    else if (breakpoint_exception && medeleg_breakpoint)
+      exception_code = 3;
     else if (illegal_exception && medeleg_illegal_inst)
       exception_code = 2;
 
@@ -1694,6 +1701,7 @@ bool Ref_cpu::take_forced_interrupt(uint32_t cause, uint8_t target_privilege,
   state.store_addr = state.store_data = state.store_strb = 0;
   page_fault_inst = page_fault_load = page_fault_store = false;
   illegal_exception = false;
+  breakpoint_exception = false;
   is_io = false;
   force_sync = false;
   exception(0);
@@ -1714,6 +1722,7 @@ void Ref_cpu::RISCV() {
   is_csr = is_exception = is_br = br_taken = false;
   illegal_exception = page_fault_load = page_fault_inst = page_fault_store =
       asy = false;
+  breakpoint_exception = false;
   state.store = false;
   is_io = false;
   force_sync = false;
@@ -1736,6 +1745,15 @@ void Ref_cpu::RISCV() {
     std::cerr << "[RefCPU][U-ENTRY] pc=0x" << std::hex << state.pc
               << " sp=0x" << state.gpr[2] << " ra=0x" << state.gpr[1]
               << " satp=0x" << state.csr[csr_satp] << std::dec << std::endl;
+  }
+
+  // RISC-V semihosting marker: slli x0,x0,0x1f ; ebreak ; srai x0,x0,7. OpenSBI's generic platform probes it and
+  // expects a breakpoint trap; any other ebreak keeps ending the simulation (the bare-metal tests' exit).
+  if (Instruction == INST_EBREAK && load_word(p_addr - 4) == 0x01f01013u && load_word(p_addr + 4) == 0x40705013u) {
+    if (std::getenv("REF_PC_RING")) fprintf(stderr, "[bp] pc=0x%08x mtvec=0x%08x a3=0x%08x\n", state.pc, state.csr[csr_mtvec], state.gpr[13]);
+    breakpoint_exception = true;
+    exception(state.pc);
+    return;
   }
 
   if (Instruction == INST_EBREAK) {

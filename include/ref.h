@@ -191,6 +191,7 @@ public:
   bool page_fault_load;
   bool page_fault_store;
   bool illegal_exception;
+  bool breakpoint_exception; // ebreak inside the semihosting marker sequence: a real breakpoint trap (cause 3)
 
   bool M_software_interrupt;
   bool M_timer_interrupt;
