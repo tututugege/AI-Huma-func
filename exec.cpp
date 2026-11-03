@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdint>
 #include <algorithm>
+#include <array>
 #include <cstdlib>
 #include <iostream>
 #include <map>
@@ -1107,6 +1108,17 @@ void Ref_cpu::checkpoint_mmio_sync_devices() {
 // handler.  A handler either executes the instruction exactly as RV32IM() would, or leaves all state untouched and
 // returns to the caller, which then runs RISCV() for that instruction.
 namespace {
+// Adjacent instruction pairs executed by one handler (chosen from the dynamic pair frequencies of Linux/SPEC runs).  The
+// handler is the first instruction's body, 'op' moved to the second slot, then the second body, so a fallback in the
+// second instruction (fault, MMIO, misaligned) leaves the first one executed and the block position exact.
+// NC: the second instruction does not end the block; C: it is a jump or branch (ends the block).
+#define FUSE_LIST_NC(X)                                                                                               \
+  X(LW, LW) X(SW, SW) X(ADDI, ADDI) X(LW, ADDI) X(ADDI, SW) X(ADDI, LW) X(SW, LW) X(SW, ADDI) X(LW, SLLI)            \
+  X(LW, ANDI) X(ADD, LW) X(SLLI, ADD) X(LUI, ADDI) X(AUIPC, LW) X(AUIPC, ADDI) X(SRLI, ANDI) X(ADD, ADD) X(AND, AND)
+#define FUSE_LIST_C(X)                                                                                                \
+  X(ANDI, BEQ) X(ANDI, BNE) X(LW, BEQ) X(LW, BNE) X(ADDI, BEQ) X(ADDI, BNE) X(ADDI, BGE) X(AND, BNE) X(ADDI, JALR)   \
+  X(ADDI, JAL) X(AUIPC, JALR)
+
 enum FastOp : uint8_t {
   F_SLOW = 0, F_NOP, F_CONT, F_EXIT,
   F_LUI, F_AUIPC, F_JAL, F_JALR,
@@ -1117,6 +1129,10 @@ enum FastOp : uint8_t {
   F_ADDI, F_SLTI, F_SLTIU, F_XORI, F_ORI, F_ANDI, F_SLLI, F_SRLI, F_SRAI,
   F_ADD, F_SUB, F_SLL, F_SLT, F_SLTU, F_XOR, F_SRL, F_SRA, F_OR, F_AND,
   F_MUL, F_MULH, F_MULHSU, F_MULHU, F_DIV, F_DIVU, F_REM, F_REMU,
+  // fused pairs (produced only by the fusion pass, never by decode): the first slot runs both instructions
+#define X(a, b) F_##a##_##b,
+  FUSE_LIST_NC(X) FUSE_LIST_C(X)
+#undef X
   F_NUM
 };
 
@@ -1131,6 +1147,7 @@ const uint64_t g_digest_every =
 const bool g_fast_stats = std::getenv("REF_FAST_STATS") != nullptr;
 struct FastStats {
   uint64_t fast_insts = 0, runs = 0, blocks = 0, stop[8] = {0}, slow_op[128 * 8] = {0};
+  uint64_t pair[128][128] = {};  // dynamic count of adjacent op pairs inside executed blocks
   ~FastStats() {
     if (!g_fast_stats) return;
     fprintf(stderr,
@@ -1139,6 +1156,16 @@ struct FastStats {
             (unsigned long long)fast_insts, (unsigned long long)runs, (unsigned long long)blocks,
             (unsigned long long)stop[0], (unsigned long long)stop[1], (unsigned long long)stop[3],
             (unsigned long long)stop[4], (unsigned long long)stop[5]);
+    for (int pass = 0; pass < 24; pass++) {
+      int bi = -1, bj = -1;
+      uint64_t bc = 0;
+      for (int i = 0; i < 128; i++)
+        for (int j = 0; j < 128; j++)
+          if (pair[i][j] > bc) { bc = pair[i][j]; bi = i; bj = j; }
+      if (bi < 0) break;
+      fprintf(stderr, "[fast]   pair op%d,op%d : %llu\n", bi, bj, (unsigned long long)bc);
+      pair[bi][bj] = 0;
+    }
     for (int pass = 0; pass < 12; pass++) {
       int best = -1;
       uint64_t bc = 0;
@@ -1278,7 +1305,11 @@ void Ref_cpu::fast_run_impl(uint32_t &finished_intervals, uint64_t budget, uint3
       &&L_CSR,
       &&L_ADDI, &&L_SLTI, &&L_SLTIU, &&L_XORI, &&L_ORI, &&L_ANDI, &&L_SLLI, &&L_SRLI, &&L_SRAI,
       &&L_ADD, &&L_SUB, &&L_SLL, &&L_SLT, &&L_SLTU, &&L_XOR, &&L_SRL, &&L_SRA, &&L_OR, &&L_AND,
-      &&L_MUL, &&L_MULH, &&L_MULHSU, &&L_MULHU, &&L_DIV, &&L_DIVU, &&L_REM, &&L_REMU};
+      &&L_MUL, &&L_MULH, &&L_MULHSU, &&L_MULHU, &&L_DIV, &&L_DIVU, &&L_REM, &&L_REMU,
+#define X(a, b) &&L_F_##a##_##b,
+      FUSE_LIST_NC(X) FUSE_LIST_C(X)
+#undef X
+  };
 
   uint32_t *const x = state.gpr;
   uint32_t *const mem = memory;
@@ -1296,8 +1327,14 @@ void Ref_cpu::fast_run_impl(uint32_t &finished_intervals, uint64_t budget, uint3
   const uint32_t mie0 = state.csr[csr_mie];
   const uint32_t mip0 = state.csr[csr_mip];
   const uint32_t mst0 = state.csr[csr_mstatus];
+  constexpr uint32_t kMstatusDataMask = MSTATUS_MPRV | MSTATUS_MPP | MSTATUS_MXR | MSTATUS_SUM;  // what data translation depends on
   const uint32_t data_priv0 = (mst0 & MSTATUS_MPRV) ? GET_MPP(mst0) : priv;
   const bool irq_possible = (mip_eff & mie0 & 0x00000AAAu) != 0;  // something is pending and enabled (but not deliverable now)
+  // TLB context of a load / store, exactly as va2pa() forms it (access type, effective privilege, MXR, SUM); the TLB
+  // is probed inline below and va2pa() is only called on a miss
+  const uint32_t tctx_common = (data_priv0 << 2) | ((mst0 & MSTATUS_MXR) ? 16u : 0u) | ((mst0 & MSTATUS_SUM) ? 32u : 0u);
+  const uint32_t tctx_ld = 1u | tctx_common, tctx_st = 2u | tctx_common;
+  constexpr uint32_t kTlbMask = Ref_cpu::kTlbSize - 1;
   uint32_t pc = state.pc;
   uint32_t ep = icache_epoch;         // epoch the current ctx was built with
   uint64_t ctx = ctx_base | ep;
@@ -1340,6 +1377,9 @@ run_block:
     goto out;  // not enough budget left for the whole block: the general path steps the last instructions
   }
   left -= b->n;
+  if (__builtin_expect(g_fast_stats, 0)) {
+    for (uint32_t k = 0; k + 1 < b->n; k++) g_fs.pair[b->ops[k].op][b->ops[k + 1].op]++;
+  }
   bpc = pc;
   if (U && bbl == 0) {
     current_bb_head_pc = pc;
@@ -1382,6 +1422,26 @@ build : {
     FastInsn &fi = b->ops[n];
     fi.op = end_op;
     fi.h = tbl[end_op];
+  }
+  {
+    // fuse adjacent pairs (greedy, left to right); slot i runs instructions i and i+1, slot i+1 stays intact
+    static const auto fuse_tbl = [] {
+      std::array<std::array<uint8_t, F_NUM>, F_NUM> t{};
+#define X(a, b) t[F_##a][F_##b] = F_##a##_##b;
+      FUSE_LIST_NC(X) FUSE_LIST_C(X)
+#undef X
+      return t;
+    }();
+    for (uint32_t i = 0; i + 1 < n;) {
+      const uint8_t f = fuse_tbl[b->ops[i].op][b->ops[i + 1].op];
+      if (f) {
+        b->ops[i].op = f;
+        b->ops[i].h = tbl[f];
+        i += 2;
+      } else {
+        i++;
+      }
+    }
   }
   b->pc = pc;
   b->ctx = ctx;
@@ -1435,60 +1495,69 @@ L_EXIT:
   if (g_fast_stats) g_fs.stop[4]++;
   goto out;
 
-L_LUI: x[op->rd] = op->imm; NEXT();
-L_AUIPC: x[op->rd] = op->imm + PC_OF(op); NEXT();
-L_JAL:
-  ipc = PC_OF(op);
-  x[op->rd] = ipc + 4;
-  x[0] = 0;
-  pc = ipc + op->imm;
+// ---- instruction bodies: each assumes 'op' is its own slot and falls through (or leaves via a macro) without dispatching ----
+#define B_LUI x[op->rd] = op->imm;
+#define B_AUIPC x[op->rd] = op->imm + PC_OF(op);
+#define B_JAL                                                                                                        \
+  ipc = PC_OF(op);                                                                                                   \
+  x[op->rd] = ipc + 4;                                                                                               \
+  x[0] = 0;                                                                                                          \
+  pc = ipc + op->imm;                                                                                                \
   END_CONTROL();
-L_JALR:
-  ipc = PC_OF(op);
-  v = (x[op->rs1] + op->imm) & 0xFFFFFFFCu;
-  x[op->rd] = ipc + 4;
-  x[0] = 0;
-  pc = v;
+#define B_JALR                                                                                                       \
+  ipc = PC_OF(op);                                                                                                   \
+  v = (x[op->rs1] + op->imm) & 0xFFFFFFFCu;                                                                          \
+  x[op->rd] = ipc + 4;                                                                                               \
+  x[0] = 0;                                                                                                          \
+  pc = v;                                                                                                            \
   END_CONTROL();
-#define FAST_BRANCH(COND)                                                                                            \
+#define B_BRANCH(COND)                                                                                               \
   ipc = PC_OF(op);                                                                                                   \
   pc = (COND) ? ipc + op->imm : ipc + 4;                                                                             \
   END_CONTROL();
-L_BEQ: FAST_BRANCH(x[op->rs1] == x[op->rs2])
-L_BNE: FAST_BRANCH(x[op->rs1] != x[op->rs2])
-L_BLT: FAST_BRANCH((int32_t)x[op->rs1] < (int32_t)x[op->rs2])
-L_BGE: FAST_BRANCH((int32_t)x[op->rs1] >= (int32_t)x[op->rs2])
-L_BLTU: FAST_BRANCH(x[op->rs1] < x[op->rs2])
-L_BGEU: FAST_BRANCH(x[op->rs1] >= x[op->rs2])
-#undef FAST_BRANCH
+#define B_BEQ B_BRANCH(x[op->rs1] == x[op->rs2])
+#define B_BNE B_BRANCH(x[op->rs1] != x[op->rs2])
+#define B_BLT B_BRANCH((int32_t)x[op->rs1] < (int32_t)x[op->rs2])
+#define B_BGE B_BRANCH((int32_t)x[op->rs1] >= (int32_t)x[op->rs2])
+#define B_BLTU B_BRANCH(x[op->rs1] < x[op->rs2])
+#define B_BGEU B_BRANCH(x[op->rs1] >= x[op->rs2])
+
+// data address translation: inline TLB probe, va2pa() (page walk) on a miss; a fault leaves the instruction to RISCV()
+#define FAST_XLATE(TYPE, TCTX)                                                                                       \
+  if (DX) {                                                                                                          \
+    const TlbEntry &te = tlb[((v >> 12) ^ ((TYPE) << 7)) & kTlbMask];                                                \
+    if (__builtin_expect(te.epoch == tlb_epoch && te.vpn == (v >> 12) && te.satp == satp && te.ctx == (TCTX), 1)) { \
+      p = (te.frame << 12) | (v & 0xFFFu);                                                                           \
+    } else if (!va2pa(p, v, (TYPE))) {                                                                               \
+      BAIL();                                                                                                        \
+    }                                                                                                                \
+  }
 
 // loads: misaligned, page-fault and non-DDR cases leave the instruction to RISCV()
-#define FAST_LOAD(ALIGN_MASK, EXPR)                                                                                  \
+#define B_LOAD(ALIGN_MASK, EXPR)                                                                                     \
   v = x[op->rs1] + op->imm;                                                                                          \
   if (v & (ALIGN_MASK)) BAIL();                                                                                      \
   p = v;                                                                                                             \
-  if (DX && !va2pa(p, v, 1)) BAIL();                                                                                 \
+  FAST_XLATE(1u, tctx_ld)                                                                                            \
   if ((int32_t)p >= 0) BAIL();                                                                                       \
   {                                                                                                                  \
     const uint32_t w = mem[(p & 0x7FFFFFFFu) >> 2] >> ((p & 3u) * 8);                                                \
     x[op->rd] = (EXPR);                                                                                              \
   }                                                                                                                  \
-  x[0] = 0;                                                                                                          \
-  NEXT();
-L_LB: FAST_LOAD(0u, (uint32_t)(int32_t)(int8_t)(w & 0xFF))
-L_LBU: FAST_LOAD(0u, w & 0xFF)
-L_LH: FAST_LOAD(1u, (uint32_t)(int32_t)(int16_t)(w & 0xFFFF))
-L_LHU: FAST_LOAD(1u, w & 0xFFFF)
-L_LW: FAST_LOAD(3u, w)
-#undef FAST_LOAD
+  x[0] = 0;
+#define B_LB B_LOAD(0u, (uint32_t)(int32_t)(int8_t)(w & 0xFF))
+#define B_LBU B_LOAD(0u, w & 0xFF)
+#define B_LH B_LOAD(1u, (uint32_t)(int32_t)(int16_t)(w & 0xFFFF))
+#define B_LHU B_LOAD(1u, w & 0xFFFF)
+#define B_LW B_LOAD(3u, w)
 
 // stores: same fallbacks; a store into a page that holds page tables or decoded code flushes the caches, after which
 // the rest of the block is abandoned (the next instruction is fetched again)
-#define FAST_STORE(ALIGN_MASK, SIZE_MASK)                                                                            \
+#define B_STORE(ALIGN_MASK, SIZE_MASK)                                                                               \
   v = x[op->rs1] + op->imm;                                                                                          \
   if (v & (ALIGN_MASK)) BAIL();                                                                                      \
   p = v;                                                                                                             \
-  if (DX && !va2pa(p, v, 2)) BAIL();                                                                                 \
+  FAST_XLATE(2u, tctx_st)                                                                                            \
   if ((int32_t)p >= 0) BAIL();                                                                                       \
   {                                                                                                                  \
     if (state.reserve_valid && state.reserve_addr == p) state.reserve_valid = false;                                 \
@@ -1509,12 +1578,46 @@ L_LW: FAST_LOAD(3u, w)
       goto dispatch_block;                                                                                           \
     }                                                                                                                \
     word = (m & wd) | (~m & word);                                                                                   \
-  }                                                                                                                  \
-  NEXT();
-L_SB: FAST_STORE(0u, 0xFFu)
-L_SH: FAST_STORE(1u, 0xFFFFu)
-L_SW: FAST_STORE(3u, 0xFFFFFFFFu)
-#undef FAST_STORE
+  }
+#define B_SB B_STORE(0u, 0xFFu)
+#define B_SH B_STORE(1u, 0xFFFFu)
+#define B_SW B_STORE(3u, 0xFFFFFFFFu)
+
+#define B_ADDI x[op->rd] = x[op->rs1] + op->imm;
+#define B_SLTI x[op->rd] = (int32_t)x[op->rs1] < (int32_t)op->imm ? 1 : 0;
+#define B_SLTIU x[op->rd] = x[op->rs1] < op->imm ? 1 : 0;
+#define B_XORI x[op->rd] = x[op->rs1] ^ op->imm;
+#define B_ORI x[op->rd] = x[op->rs1] | op->imm;
+#define B_ANDI x[op->rd] = x[op->rs1] & op->imm;
+#define B_SLLI x[op->rd] = x[op->rs1] << op->imm;
+#define B_SRLI x[op->rd] = x[op->rs1] >> op->imm;
+#define B_SRAI x[op->rd] = (uint32_t)((int32_t)x[op->rs1] >> op->imm);
+#define B_ADD x[op->rd] = x[op->rs1] + x[op->rs2];
+#define B_SUB x[op->rd] = x[op->rs1] - x[op->rs2];
+#define B_SLL x[op->rd] = x[op->rs1] << (x[op->rs2] & 0x1F);
+#define B_SLT x[op->rd] = (int32_t)x[op->rs1] < (int32_t)x[op->rs2] ? 1 : 0;
+#define B_SLTU x[op->rd] = x[op->rs1] < x[op->rs2] ? 1 : 0;
+#define B_XOR x[op->rd] = x[op->rs1] ^ x[op->rs2];
+#define B_SRL x[op->rd] = x[op->rs1] >> (x[op->rs2] & 0x1F);
+#define B_SRA x[op->rd] = (uint32_t)((int32_t)x[op->rs1] >> (x[op->rs2] & 0x1F));
+#define B_OR x[op->rd] = x[op->rs1] | x[op->rs2];
+#define B_AND x[op->rd] = x[op->rs1] & x[op->rs2];
+#define B_MUL x[op->rd] = x[op->rs1] * x[op->rs2];
+#define B_MULH x[op->rd] = (uint32_t)(((int64_t)(int32_t)x[op->rs1] * (int64_t)(int32_t)x[op->rs2]) >> 32);
+#define B_MULHSU x[op->rd] = (uint32_t)(((int64_t)(int32_t)x[op->rs1] * (int64_t)(uint32_t)x[op->rs2]) >> 32);
+#define B_MULHU x[op->rd] = (uint32_t)(((uint64_t)x[op->rs1] * (uint64_t)x[op->rs2]) >> 32);
+#define B_DIV                                                                                                        \
+  {                                                                                                                  \
+    const int32_t a = (int32_t)x[op->rs1], d = (int32_t)x[op->rs2];                                                  \
+    x[op->rd] = d == 0 ? 0xFFFFFFFFu : (a == INT32_MIN && d == -1 ? (uint32_t)INT32_MIN : (uint32_t)(a / d));        \
+  }
+#define B_DIVU x[op->rd] = x[op->rs2] == 0 ? 0xFFFFFFFFu : x[op->rs1] / x[op->rs2];
+#define B_REM                                                                                                        \
+  {                                                                                                                  \
+    const int32_t a = (int32_t)x[op->rs1], d = (int32_t)x[op->rs2];                                                  \
+    x[op->rd] = d == 0 ? (uint32_t)a : (a == INT32_MIN && d == -1 ? 0u : (uint32_t)(a % d));                         \
+  }
+#define B_REMU x[op->rd] = x[op->rs2] == 0 ? x[op->rs1] : x[op->rs1] % x[op->rs2];
 
 // CSR instruction: run the general implementation for it (same code RISCV() would call), then continue in the fast path
 // only if nothing the fast path assumes has changed.
@@ -1540,7 +1643,7 @@ L_CSR: {
     const uint32_t mst = state.csr[csr_mstatus];
     bool ok = !is_exception && !illegal_exception && state.pc == ipc + 4 && privilege == priv &&
               state.csr[csr_satp] == satp && state.csr[csr_mie] == mie0 && state.csr[csr_mip] == mip0 &&
-              (((mst & MSTATUS_MPRV) ? GET_MPP(mst) : priv) == data_priv0);
+              ((mst & kMstatusDataMask) == (mst0 & kMstatusDataMask));
     if (ok && irq_possible) {
       // an interrupt that is pending and enabled may have become deliverable (mstatus.SIE/MIE, ...)
       evaluate_interrupts(mip_eff);
@@ -1556,41 +1659,25 @@ L_CSR: {
   goto dispatch_block;
 }
 
-L_ADDI: x[op->rd] = x[op->rs1] + op->imm; NEXT();
-L_SLTI: x[op->rd] = (int32_t)x[op->rs1] < (int32_t)op->imm ? 1 : 0; NEXT();
-L_SLTIU: x[op->rd] = x[op->rs1] < op->imm ? 1 : 0; NEXT();
-L_XORI: x[op->rd] = x[op->rs1] ^ op->imm; NEXT();
-L_ORI: x[op->rd] = x[op->rs1] | op->imm; NEXT();
-L_ANDI: x[op->rd] = x[op->rs1] & op->imm; NEXT();
-L_SLLI: x[op->rd] = x[op->rs1] << op->imm; NEXT();
-L_SRLI: x[op->rd] = x[op->rs1] >> op->imm; NEXT();
-L_SRAI: x[op->rd] = (uint32_t)((int32_t)x[op->rs1] >> op->imm); NEXT();
-L_ADD: x[op->rd] = x[op->rs1] + x[op->rs2]; NEXT();
-L_SUB: x[op->rd] = x[op->rs1] - x[op->rs2]; NEXT();
-L_SLL: x[op->rd] = x[op->rs1] << (x[op->rs2] & 0x1F); NEXT();
-L_SLT: x[op->rd] = (int32_t)x[op->rs1] < (int32_t)x[op->rs2] ? 1 : 0; NEXT();
-L_SLTU: x[op->rd] = x[op->rs1] < x[op->rs2] ? 1 : 0; NEXT();
-L_XOR: x[op->rd] = x[op->rs1] ^ x[op->rs2]; NEXT();
-L_SRL: x[op->rd] = x[op->rs1] >> (x[op->rs2] & 0x1F); NEXT();
-L_SRA: x[op->rd] = (uint32_t)((int32_t)x[op->rs1] >> (x[op->rs2] & 0x1F)); NEXT();
-L_OR: x[op->rd] = x[op->rs1] | x[op->rs2]; NEXT();
-L_AND: x[op->rd] = x[op->rs1] & x[op->rs2]; NEXT();
-L_MUL: x[op->rd] = x[op->rs1] * x[op->rs2]; NEXT();
-L_MULH: x[op->rd] = (uint32_t)(((int64_t)(int32_t)x[op->rs1] * (int64_t)(int32_t)x[op->rs2]) >> 32); NEXT();
-L_MULHSU: x[op->rd] = (uint32_t)(((int64_t)(int32_t)x[op->rs1] * (int64_t)(uint32_t)x[op->rs2]) >> 32); NEXT();
-L_MULHU: x[op->rd] = (uint32_t)(((uint64_t)x[op->rs1] * (uint64_t)x[op->rs2]) >> 32); NEXT();
-L_DIV: {
-  const int32_t a = (int32_t)x[op->rs1], d = (int32_t)x[op->rs2];
-  x[op->rd] = d == 0 ? 0xFFFFFFFFu : (a == INT32_MIN && d == -1 ? (uint32_t)INT32_MIN : (uint32_t)(a / d));
-  NEXT();
-}
-L_DIVU: x[op->rd] = x[op->rs2] == 0 ? 0xFFFFFFFFu : x[op->rs1] / x[op->rs2]; NEXT();
-L_REM: {
-  const int32_t a = (int32_t)x[op->rs1], d = (int32_t)x[op->rs2];
-  x[op->rd] = d == 0 ? (uint32_t)a : (a == INT32_MIN && d == -1 ? 0u : (uint32_t)(a % d));
-  NEXT();
-}
-L_REMU: x[op->rd] = x[op->rs2] == 0 ? x[op->rs1] : x[op->rs1] % x[op->rs2]; NEXT();
+
+// ---- one handler per instruction ----
+#define H(NAME) L_##NAME: B_##NAME NEXT();
+#define HC(NAME) L_##NAME: B_##NAME
+H(LUI) H(AUIPC) HC(JAL) HC(JALR) HC(BEQ) HC(BNE) HC(BLT) HC(BGE) HC(BLTU) HC(BGEU)
+H(LB) H(LH) H(LW) H(LBU) H(LHU) H(SB) H(SH) H(SW)
+H(ADDI) H(SLTI) H(SLTIU) H(XORI) H(ORI) H(ANDI) H(SLLI) H(SRLI) H(SRAI)
+H(ADD) H(SUB) H(SLL) H(SLT) H(SLTU) H(XOR) H(SRL) H(SRA) H(OR) H(AND)
+H(MUL) H(MULH) H(MULHSU) H(MULHU) H(DIV) H(DIVU) H(REM) H(REMU)
+#undef H
+#undef HC
+
+// ---- fused pairs: first body, move to the second slot, second body ----
+#define FH_NC(a, b) L_F_##a##_##b: B_##a ++op; B_##b NEXT();
+#define FH_C(a, b) L_F_##a##_##b: B_##a ++op; B_##b
+FUSE_LIST_NC(FH_NC)
+FUSE_LIST_C(FH_C)
+#undef FH_NC
+#undef FH_C
 
 #undef NEXT
 #undef PC_OF
