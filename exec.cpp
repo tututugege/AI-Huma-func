@@ -1113,6 +1113,7 @@ enum FastOp : uint8_t {
   F_BEQ, F_BNE, F_BLT, F_BGE, F_BLTU, F_BGEU,
   F_LB, F_LH, F_LW, F_LBU, F_LHU,
   F_SB, F_SH, F_SW,
+  F_CSR,
   F_ADDI, F_SLTI, F_SLTIU, F_XORI, F_ORI, F_ANDI, F_SLLI, F_SRLI, F_SRAI,
   F_ADD, F_SUB, F_SLL, F_SLT, F_SLTU, F_XOR, F_SRL, F_SRA, F_OR, F_AND,
   F_MUL, F_MULH, F_MULHSU, F_MULHU, F_DIV, F_DIVU, F_REM, F_REMU,
@@ -1248,6 +1249,9 @@ void fast_decode(uint32_t in, Ref_cpu::FastInsn &e) {
     }
     break;
   case number_9_opcode_fence: op = F_NOP; break;
+  case number_10_opcode_ecall:
+    if (f3 != 0 && f3 != 4) { op = F_CSR; e.imm = in; }  // executed by RV32CSR(); funct3 0 (ecall, mret, wfi, ...) is slow
+    break;
   }
   // an instruction without side effects that writes x0 does nothing
   if (e.rd == 0 && (op == F_LUI || op == F_AUIPC || op >= F_ADDI)) {
@@ -1257,18 +1261,21 @@ void fast_decode(uint32_t in, Ref_cpu::FastInsn &e) {
 }
 
 inline bool fast_is_control(uint8_t op) { return op >= F_JAL && op <= F_BGEU; }
+// F_CSR also ends a block: afterwards the fast-path assumptions are re-checked
+inline bool fast_ends_block(uint8_t op) { return fast_is_control(op) || op == F_CSR; }
 }  // namespace
 
 // Run blocks until an instruction needs the general path, an interrupt could be taken, or the timer deadline is near.
 // U: the privilege is U (basic-block and interval bookkeeping); DX: loads and stores are translated.
 template <bool U, bool DX>
-void Ref_cpu::fast_run_impl(uint32_t &finished_intervals, uint64_t budget) {
+void Ref_cpu::fast_run_impl(uint32_t &finished_intervals, uint64_t budget, uint32_t mip_eff) {
   static const void *const tbl[F_NUM] = {
       &&L_SLOW, &&L_NOP, &&L_CONT, &&L_EXIT,
       &&L_LUI, &&L_AUIPC, &&L_JAL, &&L_JALR,
       &&L_BEQ, &&L_BNE, &&L_BLT, &&L_BGE, &&L_BLTU, &&L_BGEU,
       &&L_LB, &&L_LH, &&L_LW, &&L_LBU, &&L_LHU,
       &&L_SB, &&L_SH, &&L_SW,
+      &&L_CSR,
       &&L_ADDI, &&L_SLTI, &&L_SLTIU, &&L_XORI, &&L_ORI, &&L_ANDI, &&L_SLLI, &&L_SRLI, &&L_SRAI,
       &&L_ADD, &&L_SUB, &&L_SLL, &&L_SLT, &&L_SLTU, &&L_XOR, &&L_SRL, &&L_SRA, &&L_OR, &&L_AND,
       &&L_MUL, &&L_MULH, &&L_MULHSU, &&L_MULHU, &&L_DIV, &&L_DIVU, &&L_REM, &&L_REMU};
@@ -1285,6 +1292,12 @@ void Ref_cpu::fast_run_impl(uint32_t &finished_intervals, uint64_t budget) {
 
   uint64_t left = budget;             // instructions still allowed
   const uint64_t budget0 = budget;
+  const uint64_t st0 = sim_time;      // sim_time at entry; the member is brought up to date at exit and before RV32CSR()
+  const uint32_t mie0 = state.csr[csr_mie];
+  const uint32_t mip0 = state.csr[csr_mip];
+  const uint32_t mst0 = state.csr[csr_mstatus];
+  const uint32_t data_priv0 = (mst0 & MSTATUS_MPRV) ? GET_MPP(mst0) : priv;
+  const bool irq_possible = (mip_eff & mie0 & 0x00000AAAu) != 0;  // something is pending and enabled (but not deliverable now)
   uint32_t pc = state.pc;
   uint32_t ep = icache_epoch;         // epoch the current ctx was built with
   uint64_t ctx = ctx_base | ep;
@@ -1300,17 +1313,17 @@ void Ref_cpu::fast_run_impl(uint32_t &finished_intervals, uint64_t budget) {
 dispatch_block:
   if (__builtin_expect(g_digest_block != 0, 0)) {
     const uint64_t c = budget0 - left;
-    if (c > 0 && sim_time + c >= g_next_digest) {
+    if (c > 0 && st0 + c >= g_next_digest) {
       state.pc = pc;
-      print_state_digest(sim_time + c, state);
-      g_next_digest = sim_time + c + g_digest_block;
+      print_state_digest(st0 + c, state);
+      g_next_digest = st0 + c + g_digest_block;
     }
   }
   if (__builtin_expect(g_digest_every != 0, 0)) {
     const uint64_t c = budget0 - left;
-    if (c > 0 && c != last_digest && (sim_time + c) % g_digest_every == 0) {
+    if (c > 0 && c != last_digest && (st0 + c) % g_digest_every == 0) {
       state.pc = pc;
-      print_state_digest(sim_time + c, state);
+      print_state_digest(st0 + c, state);
       last_digest = c;
     }
   }
@@ -1362,7 +1375,7 @@ build : {
     n++;
     q += 4;
     cpc += 4;
-    if (fast_is_control(fi.op)) { end_op = F_NOP; break; }  // the control instruction ends the block
+    if (fast_ends_block(fi.op)) { end_op = F_NOP; break; }  // a jump, branch or CSR instruction ends the block
     if ((cpc & 0xFFFu) == 0) { end_op = F_CONT; break; }    // the next instruction is on another page
   }
   if (end_op != F_NOP) {
@@ -1503,6 +1516,46 @@ L_SH: FAST_STORE(1u, 0xFFFFu)
 L_SW: FAST_STORE(3u, 0xFFFFFFFFu)
 #undef FAST_STORE
 
+// CSR instruction: run the general implementation for it (same code RISCV() would call), then continue in the fast path
+// only if nothing the fast path assumes has changed.
+L_CSR: {
+  ipc = PC_OF(op);
+  state.pc = ipc;
+  Instruction = op->imm;
+  sim_time = st0 + (budget0 - left) - 1;  // the instructions completed before this one
+  is_csr = true;
+  is_exception = is_br = br_taken = false;
+  illegal_exception = page_fault_load = page_fault_inst = page_fault_store = false;
+  breakpoint_exception = false;
+  asy = false;
+  state.store = false;
+  is_io = false;
+  force_sync = false;
+  sync_timer_csrs(state, sim_time, device_effects_enable && interrupt_delivery_enable);
+  RV32CSR();
+  state.gpr[0] = 0;
+  sim_time = st0 + (budget0 - left);
+  if (U) bbl += b->n;
+  {
+    const uint32_t mst = state.csr[csr_mstatus];
+    bool ok = !is_exception && !illegal_exception && state.pc == ipc + 4 && privilege == priv &&
+              state.csr[csr_satp] == satp && state.csr[csr_mie] == mie0 && state.csr[csr_mip] == mip0 &&
+              (((mst & MSTATUS_MPRV) ? GET_MPP(mst) : priv) == data_priv0);
+    if (ok && irq_possible) {
+      // an interrupt that is pending and enabled may have become deliverable (mstatus.SIE/MIE, ...)
+      evaluate_interrupts(mip_eff);
+      ok = !(M_software_interrupt || M_timer_interrupt || M_external_interrupt || S_software_interrupt ||
+             S_timer_interrupt || S_external_interrupt);
+    }
+    if (!ok) {
+      pc = state.pc;
+      goto out;
+    }
+  }
+  pc = state.pc;
+  goto dispatch_block;
+}
+
 L_ADDI: x[op->rd] = x[op->rs1] + op->imm; NEXT();
 L_SLTI: x[op->rd] = (int32_t)x[op->rs1] < (int32_t)op->imm ? 1 : 0; NEXT();
 L_SLTIU: x[op->rd] = x[op->rs1] < op->imm ? 1 : 0; NEXT();
@@ -1548,7 +1601,7 @@ out:
   state.pc = pc;
   {
     const uint64_t done = budget0 - left;
-    sim_time += done;
+    sim_time = st0 + done;
     if (U) {
       current_bb_len = static_cast<uint32_t>(bbl);
     }
@@ -1584,20 +1637,26 @@ void Ref_cpu::fast_run(uint32_t &finished_intervals) {
   }
   const uint32_t mie = state.csr[csr_mie];
   if (g_fast_stats) g_fs.runs++;
-  // No interrupt may be pending-and-enabled, and the timer must not fire before the next instruction: both are
-  // exactly the conditions under which RISCV() would take no interrupt and no trap before executing the instruction.
-  if (interrupt_delivery_enable && (state.csr[csr_mip] & mie & 0x00000AAAu)) {
+  // RISCV() takes no interrupt and no trap before executing an ordinary instruction exactly when none of the six
+  // interrupt flags of evaluate_interrupts() is set.  Pending-and-enabled interrupts that are not deliverable (for
+  // example the supervisor timer while sstatus.SIE is 0) do not stop the fast path.  The machine timer is the only
+  // source that changes by itself: when it is enabled and not yet due, run at most until the deadline.
+  uint32_t mip_eff = 0;
+  if (interrupt_delivery_enable) {
+    mip_eff = ref_effective_mip(state.csr[csr_mip], sim_time, device_effects_enable);
+  }
+  evaluate_interrupts(mip_eff);
+  if (M_software_interrupt || M_timer_interrupt || M_external_interrupt || S_software_interrupt || S_timer_interrupt ||
+      S_external_interrupt) {
     if (g_fast_stats) g_fs.stop[0]++;
     return;
   }
   uint64_t budget = MAX_SIM_TIME - sim_time;
   if (device_effects_enable && interrupt_delivery_enable && (mie & MIP_MTIP)) {
     const uint64_t now = sim_time + g_ref_timer_offset;
-    if (now >= g_ref_timer_cmp) {
-      if (g_fast_stats) g_fs.stop[0]++;
-      return;
+    if (now < g_ref_timer_cmp) {
+      budget = std::min<uint64_t>(budget, g_ref_timer_cmp - now);
     }
-    budget = std::min<uint64_t>(budget, g_ref_timer_cmp - now);
   }
   if (fblocks.empty()) {
     fblocks.resize(kFastBlocks);
@@ -1607,11 +1666,11 @@ void Ref_cpu::fast_run(uint32_t &finished_intervals) {
   const bool dx = (state.csr[csr_satp] & 0x80000000) && data_priv != RISCV_MODE_M;
   const bool u = privilege == RISCV_MODE_U;
   if (u) {
-    if (dx) fast_run_impl<true, true>(finished_intervals, budget);
-    else fast_run_impl<true, false>(finished_intervals, budget);
+    if (dx) fast_run_impl<true, true>(finished_intervals, budget, mip_eff);
+    else fast_run_impl<true, false>(finished_intervals, budget, mip_eff);
   } else {
-    if (dx) fast_run_impl<false, true>(finished_intervals, budget);
-    else fast_run_impl<false, false>(finished_intervals, budget);
+    if (dx) fast_run_impl<false, true>(finished_intervals, budget, mip_eff);
+    else fast_run_impl<false, false>(finished_intervals, budget, mip_eff);
   }
 }
 

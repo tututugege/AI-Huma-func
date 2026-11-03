@@ -288,7 +288,7 @@ public:
     uint8_t op = 0, rd = 0, rs1 = 0, rs2 = 0;
   };
   static constexpr uint32_t kMaxBlockOps = 32;
-  static constexpr uint32_t kFastBlocks = 1024;
+  static constexpr uint32_t kFastBlocks = 16384;
   struct FastBlock {
     uint64_t ctx = 0;  // (satp << 32) | (privilege << 30) | epoch; 0 = invalid
     uint32_t pc = 0, n = 0;  // n = instructions executed by a full run (the end pseudo-op is not counted)
@@ -297,7 +297,7 @@ public:
   std::vector<FastBlock> fblocks;
   uint32_t icache_epoch = 1;  // 30 bits
   void fast_run(uint32_t &finished_intervals);
-  template <bool U, bool DX> void fast_run_impl(uint32_t &finished_intervals, uint64_t budget);
+  template <bool U, bool DX> void fast_run_impl(uint32_t &finished_intervals, uint64_t budget, uint32_t mip_eff);
   void RISCV();
   void FORCE_INLINE RV32IM();
   __attribute__((noinline)) void RV32A();  // cold: keeps RISCV()'s frame small
