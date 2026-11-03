@@ -2020,7 +2020,7 @@ void Ref_cpu::RV32CSR() {
         state.csr[csr_sie] = state.csr[csr_mie] & sie_mask;
 
       } else if (csr_idx == csr_mip || csr_idx == csr_sip) {
-        uint32_t mip_mask = 0x00000bbbu; // Match DUT mip CSR write mask
+        uint32_t mip_mask = 0x00000b3bu; // DUT write mask 0xbbb minus MTIP: MTIP is derived from mtimecmp; a sticky copy (written back by csrs mip) caused a timer interrupt storm under OpenSBI
         uint32_t sip_mask =
             0x00000333; // SEIP(9), UEIP(8), STIP(5), UTIP(4), SSIP(1), USIP(0)
 
