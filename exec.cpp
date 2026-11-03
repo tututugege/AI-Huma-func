@@ -1777,6 +1777,18 @@ void Ref_cpu::RISCV() {
     return;
   }
 
+  // SBI system shutdown/reset requested by the supervisor (legacy SBI_SHUTDOWN, a7=8, or the SRST extension,
+  // a7=0x53525354 / a6=0): end the simulation here instead of letting OpenSBI spin in its wfi hang loop.
+  if (Instruction == INST_ECALL && privilege == RISCV_MODE_S &&
+      (state.gpr[17] == 8u || (state.gpr[17] == 0x53525354u && state.gpr[16] == 0u))) {
+    std::cout << "SBI " << (state.gpr[17] == 8u ? "shutdown" : "system reset") << " requested (a7=0x" << std::hex
+              << state.gpr[17] << " a0=0x" << state.gpr[10] << std::dec << "), exiting" << std::endl;
+    std::cout << "total_sim_time: " << sim_time << std::endl;
+    state.pc += 4;
+    sim_end = true;
+    return;
+  }
+
   // === 优化 1: 极速解码 ===
   // 使用 BITS 宏直接提取字段，完全替代 bool 数组操作
   uint32_t opcode = BITS(Instruction, 6, 0);
