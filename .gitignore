@@ -37,3 +37,4 @@ tmp/
 # Large Spike-related prebuilt libs
 lib/libriscv.so
 lib/libfesvr.a
+a.out.nospike
