@@ -296,8 +296,13 @@ public:
   };
   std::vector<FastBlock> fblocks;
   uint32_t icache_epoch = 1;  // 30 bits
-  void fast_run(uint32_t &finished_intervals);
-  template <bool U, bool DX> void fast_run_impl(uint32_t &finished_intervals, uint64_t budget, uint32_t mip_eff);
+  // cap: at most this many instructions (the caller keeps the last instruction before an event for RISCV()); stop_iv:
+  // stop right after a U-mode branch that completes an interval instead of handling the boundary; bbv: call
+  // bbv_commit() at every U-mode branch; trk: keep state.store_addr/data/strb as RISCV() would (checkpoint exactness)
+  void fast_run(uint32_t &finished_intervals, uint64_t cap = UINT64_MAX, bool stop_iv = false, bool bbv = false,
+                bool trk = false);
+  template <bool U, bool DX>
+  void fast_run_impl(uint32_t &finished_intervals, uint64_t budget, uint32_t mip_eff, bool stop_iv, bool bbv, bool trk);
   void RISCV();
   void FORCE_INLINE RV32IM();
   __attribute__((noinline)) void RV32A();  // cold: keeps RISCV()'s frame small

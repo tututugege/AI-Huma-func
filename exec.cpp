@@ -1295,7 +1295,8 @@ inline bool fast_ends_block(uint8_t op) { return fast_is_control(op) || op == F_
 // Run blocks until an instruction needs the general path, an interrupt could be taken, or the timer deadline is near.
 // U: the privilege is U (basic-block and interval bookkeeping); DX: loads and stores are translated.
 template <bool U, bool DX>
-void Ref_cpu::fast_run_impl(uint32_t &finished_intervals, uint64_t budget, uint32_t mip_eff) {
+void Ref_cpu::fast_run_impl(uint32_t &finished_intervals, uint64_t budget, uint32_t mip_eff, bool stop_iv, bool bbv,
+                            bool trk) {
   static const void *const tbl[F_NUM] = {
       &&L_SLOW, &&L_NOP, &&L_CONT, &&L_EXIT,
       &&L_LUI, &&L_AUIPC, &&L_JAL, &&L_JALR,
@@ -1471,9 +1472,16 @@ build : {
   do {                                                                                                               \
     if (U) {                                                                                                         \
       bbl += b->n;                                                                                                   \
+      if (__builtin_expect(bbv, 0)) {                                                                                \
+        current_bb_len = static_cast<uint32_t>(bbl);                                                                 \
+        bbv_commit();                                                                                                \
+      }                                                                                                              \
       interval_inst_count += bbl;                                                                                    \
       bbl = 0;                                                                                                       \
       if (interval_inst_count >= INTERVAL_SIZE) {                                                                    \
+        if (stop_iv) {                                                                                               \
+          goto out; /* the caller handles the interval boundary (pc is already the next pc) */                      \
+        }                                                                                                            \
         finished_intervals++;                                                                                        \
         interval_inst_count = 0;                                                                                     \
       }                                                                                                              \
@@ -1565,6 +1573,11 @@ L_EXIT:
     const uint32_t m = (SIZE_MASK) << (off * 8);                                                                     \
     const uint32_t wd = (x[op->rs2] & (SIZE_MASK)) << (off * 8);                                                     \
     uint32_t &word = mem[(p & 0x7FFFFFFFu) >> 2];                                                                    \
+    if (__builtin_expect(trk, 0)) {                                                                                  \
+      state.store_addr = p;                                                                                          \
+      state.store_data = wd;                                                                                         \
+      state.store_strb = ((SIZE_MASK) == 0xFFu ? 1u : ((SIZE_MASK) == 0xFFFFu ? 3u : 15u)) << (off * 8);              \
+    }                                                                                                                \
     const uint8_t f = pgf[p >> 12];                                                                                  \
     if (__builtin_expect(f != 0, 0)) {                                                                               \
       page_flag_hit(f);                                                                                              \
@@ -1718,7 +1731,7 @@ out:
   }
 }
 
-void Ref_cpu::fast_run(uint32_t &finished_intervals) {
+void Ref_cpu::fast_run(uint32_t &finished_intervals, uint64_t cap, bool stop_iv, bool bbv, bool trk) {
   if (sim_time >= MAX_SIM_TIME) {
     return;
   }
@@ -1745,6 +1758,10 @@ void Ref_cpu::fast_run(uint32_t &finished_intervals) {
       budget = std::min<uint64_t>(budget, g_ref_timer_cmp - now);
     }
   }
+  budget = std::min<uint64_t>(budget, cap);
+  if (budget == 0) {
+    return;
+  }
   if (fblocks.empty()) {
     fblocks.resize(kFastBlocks);
   }
@@ -1753,11 +1770,11 @@ void Ref_cpu::fast_run(uint32_t &finished_intervals) {
   const bool dx = (state.csr[csr_satp] & 0x80000000) && data_priv != RISCV_MODE_M;
   const bool u = privilege == RISCV_MODE_U;
   if (u) {
-    if (dx) fast_run_impl<true, true>(finished_intervals, budget, mip_eff);
-    else fast_run_impl<true, false>(finished_intervals, budget, mip_eff);
+    if (dx) fast_run_impl<true, true>(finished_intervals, budget, mip_eff, stop_iv, bbv, trk);
+    else fast_run_impl<true, false>(finished_intervals, budget, mip_eff, stop_iv, bbv, trk);
   } else {
-    if (dx) fast_run_impl<false, true>(finished_intervals, budget, mip_eff);
-    else fast_run_impl<false, false>(finished_intervals, budget, mip_eff);
+    if (dx) fast_run_impl<false, true>(finished_intervals, budget, mip_eff, stop_iv, bbv, trk);
+    else fast_run_impl<false, false>(finished_intervals, budget, mip_eff, stop_iv, bbv, trk);
   }
 }
 
@@ -1830,6 +1847,58 @@ void Ref_cpu::exec(const SimConfig &config) {
 
   uint64_t restored_inst_count = 0;
 
+  // Interval boundary (an interval of U-mode instructions just ended): mode-specific dump / checkpoint, then restart the count
+  auto interval_boundary = [&]() {
+    // 当前 Interval (finished_intervals) 刚刚结束
+    finished_intervals++;
+
+    // 即将开始的 Interval 编号
+    // 例如：finished_intervals 变成 1823，说明我们要开始跑 Interval 1823 了
+    uint32_t upcoming_interval_id = finished_intervals;
+
+    // --- 模式分支处理 ---
+
+    if (config.mode == SimMode::GEN_BBV) {
+      std::cout << "Dump BBV at interval boundary: " << upcoming_interval_id
+                << std::endl;
+      dump_bbv();
+    } else if (config.mode == SimMode::GEN_CHECKPOINT) {
+      // [Warmup 逻辑核心修改]
+      // 我们不检查 upcoming_interval_id 是否是目标，
+      // 而是检查 (upcoming_interval_id + 1) 是否是目标。
+      // 如果是，说明当前这个 Interval (upcoming_interval_id) 就是那个 Warmup
+      // 区间。 我们需要在进入 Warmup 区间之前保存 Checkpoint。
+
+      uint32_t target_id = upcoming_interval_id + 1; // Lookahead (向前看一个)
+
+      auto it = target_intervals.find(target_id);
+      if (it != target_intervals.end()) {
+        uint32_t sp_id = it->second;
+
+        // 文件名命名建议：明确标出这是 target 谁的 warmup
+        std::string ckpt_name = config.checkpoint_dir + "/ckpt_sp" +
+                                std::to_string(sp_id) + "_target" +
+                                std::to_string(target_id) +
+                                "_warmup1.gz"; // warmup1 代表预热长度为1
+
+        std::cout << "Creating Warmup Checkpoint for Target " << target_id
+                  << std::endl;
+        save_checkpoint(ckpt_name);
+
+        // 优化：如果最大的目标都已经生成过预热快照了，就可以退出了
+        // 注意：target_intervals 是有序 map，rbegin() 是最大的 key
+        if (!target_intervals.empty() &&
+            target_id >= target_intervals.rbegin()->first) {
+          std::cout << "All checkpoints generated. Simulation finished."
+                    << std::endl;
+          sim_end = true;
+        }
+      }
+    }
+
+    interval_inst_count = 0;
+  };
+
   // --- 主循环 ---
   // Plain run (no difftest, no instruction limit, no checkpoint/BBV mode): the generic loop below reduces to exactly
   // this, so skip its per-instruction mode and limit checks.
@@ -1870,6 +1939,37 @@ void Ref_cpu::exec(const SimConfig &config) {
     if (kLogProgressSimTime && sim_time % 100000000 == 0) {
       std::cout << "SimTime: " << sim_time
                 << " | Intervals: " << finished_intervals << std::endl;
+    }
+
+    // 0. Fast path (also for BBV / checkpoint / limited runs): run as many instructions as possible without events.
+    // The caps keep the last instruction before a special-checkpoint target or the instruction limit for RISCV(), so
+    // the machine state at those points is exactly what the general path leaves.
+    if (!g_no_fast && !config.difftest) {
+      uint64_t cap = UINT64_MAX;
+      if (config.mode == SimMode::GEN_SPECIAL_CHECKPOINT) {
+        const auto it = special_targets.upper_bound(sim_time);
+        if (it != special_targets.end()) {
+          cap = it->first - sim_time - 1;
+        }
+      }
+      if (config.max_insts > 0) {
+        const uint64_t cur = (config.mode == SimMode::RESTORE) ? restored_inst_count : sim_time;
+        cap = std::min<uint64_t>(cap, cur + 1 >= config.max_insts ? 0 : config.max_insts - cur - 1);
+      }
+      const uint64_t t0 = sim_time;
+      fast_run(finished_intervals, cap, /*stop_iv=*/true, config.mode == SimMode::GEN_BBV,
+               config.mode == SimMode::GEN_CHECKPOINT || config.mode == SimMode::GEN_SPECIAL_CHECKPOINT);
+      const uint64_t done = sim_time - t0;
+      if (config.mode == SimMode::RESTORE) {
+        restored_inst_count += done;
+      }
+      if (sim_end || sim_time >= MAX_SIM_TIME) {
+        break;
+      }
+      if (done > 0 && interval_inst_count >= INTERVAL_SIZE) {
+        interval_boundary();  // a U-mode branch completed the interval; no instruction left to run before it
+        continue;
+      }
     }
 
     // 1. 执行指令
@@ -1923,6 +2023,16 @@ void Ref_cpu::exec(const SimConfig &config) {
     }
 
     sim_time++;
+    if (__builtin_expect(g_digest_every != 0, 0) && sim_time % g_digest_every == 0)
+      print_state_digest(sim_time, state);
+    if (__builtin_expect(g_digest_block != 0, 0) && sim_time >= g_next_digest && !g_no_fast) {
+      print_state_digest(sim_time, state);
+      g_next_digest = sim_time + g_digest_block;
+    }
+    if (__builtin_expect(g_digest_list_pos < g_digest_list.size(), 0) && sim_time == g_digest_list[g_digest_list_pos]) {
+      print_state_digest(sim_time, state);
+      g_digest_list_pos++;
+    }
 
     // Special checkpoints use the absolute functional-model instruction count,
     // independent of U-mode SimPoint interval accounting.  At sim_time == N,
@@ -1975,55 +2085,7 @@ void Ref_cpu::exec(const SimConfig &config) {
 
     // 4. Interval 边界处理
     if (interval_inst_count >= INTERVAL_SIZE) {
-      // 当前 Interval (finished_intervals) 刚刚结束
-      finished_intervals++;
-
-      // 即将开始的 Interval 编号
-      // 例如：finished_intervals 变成 1823，说明我们要开始跑 Interval 1823 了
-      uint32_t upcoming_interval_id = finished_intervals;
-
-      // --- 模式分支处理 ---
-
-      if (config.mode == SimMode::GEN_BBV) {
-        std::cout << "Dump BBV at interval boundary: " << upcoming_interval_id
-                  << std::endl;
-        dump_bbv();
-      } else if (config.mode == SimMode::GEN_CHECKPOINT) {
-        // [Warmup 逻辑核心修改]
-        // 我们不检查 upcoming_interval_id 是否是目标，
-        // 而是检查 (upcoming_interval_id + 1) 是否是目标。
-        // 如果是，说明当前这个 Interval (upcoming_interval_id) 就是那个 Warmup
-        // 区间。 我们需要在进入 Warmup 区间之前保存 Checkpoint。
-
-        uint32_t target_id = upcoming_interval_id + 1; // Lookahead (向前看一个)
-
-        auto it = target_intervals.find(target_id);
-        if (it != target_intervals.end()) {
-          uint32_t sp_id = it->second;
-
-          // 文件名命名建议：明确标出这是 target 谁的 warmup
-          std::string ckpt_name = config.checkpoint_dir + "/ckpt_sp" +
-                                  std::to_string(sp_id) + "_target" +
-                                  std::to_string(target_id) +
-                                  "_warmup1.gz"; // warmup1 代表预热长度为1
-
-          std::cout << "Creating Warmup Checkpoint for Target " << target_id
-                    << std::endl;
-          save_checkpoint(ckpt_name);
-
-          // 优化：如果最大的目标都已经生成过预热快照了，就可以退出了
-          // 注意：target_intervals 是有序 map，rbegin() 是最大的 key
-          if (!target_intervals.empty() &&
-              target_id >= target_intervals.rbegin()->first) {
-            std::cout << "All checkpoints generated. Simulation finished."
-                      << std::endl;
-            sim_end = true;
-          }
-        }
-      }
-
-      // 重置区间指令计数
-      interval_inst_count = 0;
+      interval_boundary();
     }
   }
 
