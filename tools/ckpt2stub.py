@@ -118,27 +118,29 @@ def build(ck, warn):
     csr_prog += li(T0, x) + [csrw(CSR_NUM["mstatus"], T0)]
 
     # ---- reservation and registers ----
-    tail = []
+    # The timer is written last, after every register except x5/x6 (its temporaries) is restored: a DUT counts mtime in
+    # cycles, a reference in instructions, and the fewer instructions run after the timer write the smaller the
+    # difference. mtime must read `mtime` at the first instruction of the target: the value written is lower by the number
+    # of instructions that still run (the store itself included, mret included).
+    pre = []
     if ck["reserve_valid"]:
-        tail += li(T0, ck["reserve_addr"]) + [lr_w(0, T0)]
+        pre += li(T0, ck["reserve_addr"]) + [lr_w(0, T0)]
     for i in range(1, 32):
+        if i in (T0, T1):
+            continue
         v = ck["gpr"][i]
-        if v or i in (T0, T1):
-            tail += li(i, v)
-    tail += [MRET]
+        if v:
+            pre += li(i, v)
+    post = li(T0, ck["gpr"][T0]) + li(T1, ck["gpr"][T1]) + [MRET]
 
-    # The timer is written last among the devices; mtime must read `mtime` at the first instruction of the target, so
-    # the value written is lower by the number of instructions that still run (store itself included, mret included).
     def timer_prog(adj):
         v = (mtime - adj) & ((1 << 64) - 1)
         return (li(T0, TIMER_BASE) + li(T1, cmp_lo) + [sw(T1, T0, 8)] + li(T1, cmp_hi) + [sw(T1, T0, 12)] +
                 li(T1, v >> 32) + [sw(T1, T0, 4)] + li(T1, v & 0xFFFFFFFF) + [sw(T1, T0, 0)])
 
-    # the instructions after the last store of the timer program: everything in `rest`
-    rest = uart_prog + intc_prog + csr_prog + tail
-    # count: the lo store is the last instruction of timer_prog; after it `rest` runs, then the target starts
-    adj = len(rest) + 1
-    prog = timer_prog(adj) + rest
+    # the lo store is the last instruction of timer_prog; after it `post` runs, then the target starts
+    adj = len(post) + 1
+    prog = uart_prog + intc_prog + csr_prog + pre + timer_prog(adj) + post
     return prog, dict(mtime=mtime, cmp=cmp_lo | (cmp_hi << 32), adj=adj, pc=ck["pc"], priv=prio)
 
 
