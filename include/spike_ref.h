@@ -139,8 +139,11 @@ public:
       }
     }
 
-    sim->get_core(0)->get_state()->pc = 0x80000000;
     sim->get_core(0)->set_max_vaddr_bits(32);
+    // mstatus.SUM / MXR are writable only if the core had an MMU when its status CSRs were built (processor_t::has_mmu): reset it
+    // again now that sv32 is enabled, then set the start pc
+    sim->get_core(0)->reset();
+    sim->get_core(0)->get_state()->pc = 0x80000000;
 
     processor_t *p = sim->get_core(0);
   }
