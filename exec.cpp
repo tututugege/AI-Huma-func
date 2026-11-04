@@ -1795,7 +1795,7 @@ void Ref_cpu::exec(const SimConfig &config) {
   // Initialize Spike Reference Simulator if enabled
 #ifdef ENABLE_SPIKE
   if (config.difftest) {
-    spike_ref = std::make_unique<SpikeRef>("rv32imab_zfinx", 0x80000000, 0x80000000,
+    spike_ref = std::make_unique<SpikeRef>("rv32imab_zfinx_zbc_zbkb_zbkx", 0x80000000, 0x80000000,
                                            config.image_file.c_str());
   }
 #else
