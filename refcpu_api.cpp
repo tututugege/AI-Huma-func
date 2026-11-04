@@ -2,6 +2,9 @@
 
 #include "include/CSR.h"
 #include "include/ref.h"
+#ifdef ENABLE_SPIKE
+#include "include/spike_ref.h"   // Ref_cpu owns a unique_ptr<SpikeRef>: the type must be complete where it is destroyed
+#endif
 
 #include <algorithm>
 #include <cstdio>

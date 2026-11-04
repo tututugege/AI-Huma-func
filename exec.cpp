@@ -2801,6 +2801,9 @@ void Ref_cpu::RV32CSR() {
       csr_addr != number_satp && csr_addr != number_mhartid &&
       csr_addr != number_misa) {
     illegal_exception = true;
+#ifdef ENABLE_SPIKE
+    force_sync = true;   // Spike implements CSRs this model does not (mcycle, mhpmcounter*, menvcfg, ...): it must not execute the access; take our trap state instead
+#endif
     exception(Instruction);
     return;
   } else {

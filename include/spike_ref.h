@@ -68,7 +68,8 @@ public:
     cfg->mem_layout.push_back(mem_cfg_t(SDRAM_BASE, SDRAM_SIZE));
     cfg->mem_layout.push_back(mem_cfg_t(ram_base, ram_size));
     cfg->hartids.push_back(0);
-    cfg->start_pc = 0x80000000;
+    cfg->start_pc.set_global(0x80000000);
+    cfg->pmpregions = 0;   // the function model has no PMP: pmpcfg/pmpaddr must trap (illegal) like every other CSR it does not implement
 
     main_mem_ptr = new SpikeMem(ram_size);
     sdram_mem_ptr = new SpikeMem(SDRAM_SIZE);
@@ -115,7 +116,7 @@ public:
               << std::endl;
     try {
       sim = std::make_unique<sim_t>(
-          cfg.get(), false, mems, plugin_device_factories, args, dm_config,
+          cfg.get(), false, mems, plugin_device_factories, false, args, dm_config,
           nullptr, false, nullptr, false, nullptr, std::nullopt);
       std::cout << "[SpikeRef] sim_t created successfully (Isolated Memory)."
                 << std::endl;
@@ -142,8 +143,6 @@ public:
     sim->get_core(0)->set_max_vaddr_bits(32);
 
     processor_t *p = sim->get_core(0);
-    p->put_csr(0x3B0, 0xFFFFFFFF); // pmpaddr0
-    p->put_csr(0x3A0, 0x0F);       // pmpcfg0
   }
 
   ~SpikeRef() {

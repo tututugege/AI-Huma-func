@@ -38,3 +38,4 @@ tmp/
 lib/libriscv.so
 lib/libfesvr.a
 a.out.nospike
+build-spike/

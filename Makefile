@@ -11,8 +11,13 @@ SOFTFLOAT_LIB ?= ./lib/softfloat/softfloat.a
 
 LDFLAGS = -lz -Wl,-rpath,./lib
 ifeq ($(SPIKE),1)
+  # SPIKE_SRC: riscv-isa-sim checkout, SPIKE_BUILD: its (configured and built) build directory with libriscv.a, libfesvr.a, ...
+  ifeq ($(SPIKE_SRC)$(SPIKE_BUILD),)
+    $(error SPIKE=1 needs SPIKE_SRC=<riscv-isa-sim checkout> and SPIKE_BUILD=<its build dir>)
+  endif
   CXXFLAGS += -DENABLE_SPIKE
-  LDFLAGS += -L./lib -lriscv -lfesvr
+  CXXINCLUDE := -I./include -I./include/api -I$(SPIKE_BUILD) -I$(SPIKE_SRC) -I$(SPIKE_SRC)/riscv -I$(SPIKE_SRC)/fesvr -I$(SPIKE_SRC)/softfloat -I$(SPIKE_SRC)/fdt
+  LDFLAGS += -L$(SPIKE_BUILD) -lriscv -lfesvr -lsoftfloat -ldisasm -lfdt
 else
   ifeq ($(wildcard $(SOFTFLOAT_LIB)),)
     $(error Missing softfloat archive: $(SOFTFLOAT_LIB))
