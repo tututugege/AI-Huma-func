@@ -2,7 +2,7 @@
 
 本文介绍：
 1. SimPoint 的核心思想
-2. 如何用简单模拟器（https://github.com/tututugege/GenSimpoint）为 SPEC CPU2006 INT 基准生成 BBV、SimPoint、Checkpoint
+2. 如何用本仓库的简单模拟器为 SPEC CPU2006 INT 基准生成 BBV、SimPoint、Checkpoint
 
 ## 1. SimPoint 的原理
 
