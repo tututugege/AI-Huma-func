@@ -188,3 +188,13 @@ make -C GenSimpoint librefcpu.a
 - `exec.cpp`: 包含主要的指令执行逻辑以及硬件外设（如 UART/XPS INTC/OCSDC）的简易模拟。
 - `simpoint.cpp`: 负责 BBV 生成及 Checkpoint 的保存与恢复。
 - `spike_ref.h`: 处理与 Spike (`libriscv`) 的集成及状态对比。
+
+---
+
+## 文档与脚本位置
+
+- `docs/DIFFTEST.md`：Difftest 用法。
+- `docs/SIMPOINT_SPECINT2006.md`：SimPoint 原理与 SPECint2006 的 BBV/SimPoint 生成流程。
+- `docs/FRONTDOOR_RESTORE.md`：front-door 检查点恢复。
+- `scripts/run_bbv.sh`、`scripts/run_ckpt.sh`：BBV 与检查点批量脚本，**在仓库根目录运行**（脚本里的 `./a.out`、`./SimPoint/simpoint` 都是相对根目录的路径）。
+

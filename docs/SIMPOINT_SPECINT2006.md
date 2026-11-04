@@ -70,19 +70,19 @@ make -j$(nproc)
 ### 4.2 批量生成 BBV
 
 ```bash
-bash run_bbv.sh
+bash scripts/run_bbv.sh
 ```
 
 默认行为：
 - 输入目录：`mem/`
 - 输出 BBV：`bbv_log/<bench>.bbv`
 - 日志：`bbv_log/<bench>.log`
-- 并行度：`MAX_JOBS=12`（在 `run_bbv.sh` 中可改）
+- 并行度：`MAX_JOBS=12`（在 `scripts/run_bbv.sh` 中可改）
 
 ### 4.3 批量跑 SimPoint 并生成 checkpoint
 
 ```bash
-bash run_ckpt.sh
+bash scripts/run_ckpt.sh
 ```
 
 默认行为：
@@ -94,7 +94,7 @@ bash run_ckpt.sh
 - 产出 checkpoint：`ckpts/<bench>/`
 - 日志目录：`ckpt_log/`
 
-`run_ckpt.sh` 当前 SimPoint 参数：
+`scripts/run_ckpt.sh` 当前 SimPoint 参数：
 - `-maxK 30`
 - `-seedproj 0721`
 - `-seedkm 11037`
@@ -157,7 +157,7 @@ bash run_ckpt.sh
 ## 7. 常见问题
 
 1. `SimPoint tool not found`
-- 检查 `run_ckpt.sh` 的 `SIMPOINT_TOOL` 路径是否为 `./SimPoint/simpoint`。
+- 检查 `scripts/run_ckpt.sh` 的 `SIMPOINT_TOOL` 路径是否为 `./SimPoint/simpoint`。
 
 2. 只有 BBV，没有 checkpoint
 - 常见原因是 `.points` 未生成或为空。
@@ -177,7 +177,7 @@ bash run_ckpt.sh
 - 先选 2~3 个 benchmark 走通全流程，确认路径与格式无误，再全量并行，对于ref规模，429.mcf最少，约2900亿条指令，其余大部分都在1w-2w亿条指令量级，最多的是h264ref，五万亿。可以考虑使用test规模检查编译优化效果，最多的约900亿。目前简单模拟器速度约5kw指令/s。
 
 2. 控制并行度
-- `run_bbv.sh` 和 `run_ckpt.sh` 的 `MAX_JOBS` 建议根据机器内存调节，避免并发过高导致系统抖动。
+- `scripts/run_bbv.sh` 和 `scripts/run_ckpt.sh` 的 `MAX_JOBS` 建议根据机器内存调节，避免并发过高导致系统抖动。
 
 3. 固定参数保证可复现
 - `seedproj/seedkm` 固定有助于多次实验得到稳定 simpoint。

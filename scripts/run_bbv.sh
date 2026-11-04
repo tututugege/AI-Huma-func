@@ -1,4 +1,5 @@
 #!/bin/bash
+# Run from the repository root (paths below are relative to it): bash scripts/run_bbv.sh
 
 # === 配置区域 ===
 CMD="./a.out"

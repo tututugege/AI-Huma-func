@@ -1,4 +1,5 @@
 #!/bin/bash
+# Run from the repository root (paths below are relative to it): bash scripts/run_ckpt.sh
 
 # ================= 配置区域 =================
 
