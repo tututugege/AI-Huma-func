@@ -1,6 +1,6 @@
 # Difftest 技术文档
 
-本文档说明 `GenSimpoint` 当前支持的两类 Difftest 用法：
+本文档说明 `function-model` 当前支持的两类 Difftest 用法：
 
 - standalone 模式下基于 Spike 的 `--diff`
 - 作为上层主模拟器 backend 的 `librefcpu.a`
@@ -15,13 +15,13 @@
 - 入口：`main.cpp`
 - 运行方式：`./a.out --image your_image.bin --diff`
 - 依赖：需要 `SPIKE=1` 构建出的 `a.out`
-- 作用：让 `GenSimpoint` 自己作为 DUT，与 Spike 逐条比对
+- 作用：让 `function-model` 自己作为 DUT，与 Spike 逐条比对
 
 ### 1.2 静态库 RefCPU Difftest
 - 入口：`include/api/refcpu_api.h`
 - 产物：`librefcpu.a`
 - 依赖：不要求 Spike
-- 作用：让上层主模拟器把 `GenSimpoint` 当作参考模型链接进去
+- 作用：让上层主模拟器把 `function-model` 当作参考模型链接进去
 
 ---
 
@@ -30,7 +30,7 @@
 ### 2.1 基本流程
 standalone `--diff` 运行在 `Ref_cpu::exec()` 的主循环里，遵循：
 
-1. `GenSimpoint` 先执行一条指令
+1. `function-model` 先执行一条指令
 2. 普通 RAM 指令由 Spike 执行一条，并比较 PC、GPR、CSR
 3. MMIO/外设访问、`wfi` 等待和 DUT 中断切换不让 Spike 自行执行，直接同步 DUT post-state
 4. OCSDC DMA 写入 SDRAM/DDR 后，把对应物理地址范围同步到 Spike
@@ -71,7 +71,7 @@ make with_spike
 
 构建方式：
 ```bash
-make -C GenSimpoint librefcpu.a
+make -C function-model librefcpu.a
 ```
 
 ### 3.3 常用接口
@@ -133,7 +133,7 @@ make -C GenSimpoint librefcpu.a
 
 ## 6. 依赖与构建注意事项
 
-`GenSimpoint/Makefile` 现在为 `.o` 自动生成并包含 `.d` 依赖文件，因此：
+`function-model/Makefile` 现在为 `.o` 自动生成并包含 `.d` 依赖文件，因此：
 
 - 修改 `include/*.h` 或 `include/api/*.h` 后会自动触发相关目标重编
 - `make librefcpu.a` 不再依赖手动删 `.o`
@@ -141,20 +141,20 @@ make -C GenSimpoint librefcpu.a
 常用命令：
 ```bash
 # 构建 standalone
-make -C GenSimpoint
+make -C function-model
 
 # 构建静态库
-make -C GenSimpoint librefcpu.a
+make -C function-model librefcpu.a
 
 # 清理
-make -C GenSimpoint clean
+make -C function-model clean
 ```
 
 ---
 
 ## 7. 推荐使用方式
 
-### 7.1 调试 `GenSimpoint` 自身
+### 7.1 调试 `function-model` 自身
 使用 standalone：
 ```bash
 ./a.out --image your_image.bin
@@ -168,7 +168,7 @@ make -C GenSimpoint clean
 ### 7.2 作为主模拟器参考模型
 优先使用静态库：
 ```bash
-make -C GenSimpoint librefcpu.a
+make -C function-model librefcpu.a
 make -j4
 ```
 

@@ -29,7 +29,7 @@ make no_spike
 说明：
 - `a.out.nospike` 下如果传 `--diff`，会打印 warning 并自动禁用 difftest。
 - `a.out`（with_spike）才会真正执行 Spike difftest。
-- `make -C GenSimpoint librefcpu.a` 会生成给上层主模拟器使用的静态库，不依赖 Spike。
+- `make -C function-model librefcpu.a` 会生成给上层主模拟器使用的静态库，不依赖 Spike。
 
 ### 1.1 SoftFloat 说明（no_spike 模式）
 - `SPIKE=0` 时，默认链接仓库内的 `lib/softfloat/softfloat.a`。
@@ -176,7 +176,7 @@ Checkpoint 使用 `zlib gzip`（写模式 `wb1`，文件后缀通常为 `.gz`）
 - 产物：`librefcpu.a`
 - 典型构建：
 ```bash
-make -C GenSimpoint librefcpu.a
+make -C function-model librefcpu.a
 ```
 - 这条路径不依赖 Spike；主模拟器只链接静态库，不会触发 standalone `main.cpp`。
 - 作为库使用时，可通过 `refcpu_set_uart_print(ctx, false)` 保持静默。
