@@ -337,11 +337,17 @@ static inline uint32_t ref_effective_mip(uint32_t mip_reg, uint64_t now,
   return mip_reg;
 }
 
+// Interrupt CSRs per the privileged spec (no N extension): mie holds SSIE/MSIE/STIE/MTIE/SEIE/MEIE (0xaaa); the supervisor
+// views sie / sip show only the bits delegated by mideleg (mideleg itself holds SSI/STI/SEI = 0x222).
+constexpr uint32_t kMieBits = 0x00000aaau, kSBits = 0x00000222u;
+static inline uint32_t delegated_s_bits(const CPU_state &state) { return state.csr[csr_mideleg] & kSBits; }
+static inline void refresh_sie(CPU_state &state) { state.csr[csr_sie] = state.csr[csr_mie] & delegated_s_bits(state); }
+
 static inline void sync_timer_csrs(CPU_state &state, uint64_t now,
                                    bool synthesize_timer_interrupt) {
   state.csr[csr_sip] =
       ref_effective_mip(state.csr[csr_mip], now, synthesize_timer_interrupt) &
-      0x00000333u;
+      delegated_s_bits(state);
 }
 
 static inline uint64_t ref_timer_now(uint64_t now) {
@@ -451,7 +457,7 @@ uint32_t Ref_cpu::visible_mip() const {
 }
 
 uint32_t Ref_cpu::visible_sip() const {
-  return visible_mip() & 0x00000333u;
+  return visible_mip() & delegated_s_bits(state);
 }
 
 std::map<uint32_t, uint32_t> load_simpoints(const std::string &filename);
@@ -2474,14 +2480,14 @@ void Ref_cpu::evaluate_interrupts(uint32_t mip_reg) {
 bool Ref_cpu::take_forced_interrupt(uint32_t cause, uint8_t target_privilege,
                                     uint32_t pending_snapshot) {
   constexpr uint32_t kInterruptBit = 1u << 31;
-  constexpr uint32_t kPendingMask = 0x00000bbbu;
+  constexpr uint32_t kPendingMask = kMieBits;
   if ((cause & kInterruptBit) == 0) {
     return false;
   }
 
   state.csr[csr_mip] = (state.csr[csr_mip] & ~kPendingMask) |
                        (pending_snapshot & kPendingMask);
-  state.csr[csr_sip] = state.csr[csr_mip] & 0x00000333u;
+  state.csr[csr_sip] = state.csr[csr_mip] & delegated_s_bits(state);
   evaluate_interrupts(state.csr[csr_mip]);
 
   struct Candidate {
@@ -2822,7 +2828,7 @@ void Ref_cpu::RV32CSR() {
       observed_csr_value =
           ref_effective_mip(state.csr[csr_mip], sim_time,
                             device_effects_enable && interrupt_delivery_enable) &
-          0x00000333u;
+          delegated_s_bits(state);
     } else {
       observed_csr_value = state.csr[csr_idx];
     }
@@ -2842,30 +2848,21 @@ void Ref_cpu::RV32CSR() {
       }
 
       if (csr_idx == csr_mie || csr_idx == csr_sie) {
-        uint32_t mie_mask =
-            0x00000bbb; // Match DUT: all implemented M/S pending classes
-        uint32_t sie_mask =
-            0x00000333; // SEI(9), UEI(8), STI(5), UTI(4), SSI(1), USI(0)
-
         if (csr_idx == csr_sie) {
-          // sie: 0x333 (Include User-Level Interrupt bits)
-          state.csr[csr_mie] =
-              (state.csr[csr_mie] & ~sie_mask) | (csr_wdata & sie_mask);
+          // sie: only the bits delegated by mideleg are visible and writable
+          const uint32_t m = delegated_s_bits(state);
+          state.csr[csr_mie] = (state.csr[csr_mie] & ~m) | (csr_wdata & m);
         } else {
-          // mie: 0xbbb
-          state.csr[csr_mie] = csr_wdata & mie_mask;
+          state.csr[csr_mie] = csr_wdata & kMieBits;
         }
-        // sie 始终是 mie 的影子 (masked by 0x333)
-        state.csr[csr_sie] = state.csr[csr_mie] & sie_mask;
+        refresh_sie(state);
 
       } else if (csr_idx == csr_mip || csr_idx == csr_sip) {
-        uint32_t mip_mask = 0x00000b3bu; // DUT write mask 0xbbb minus MTIP: MTIP is derived from mtimecmp; a sticky copy (written back by csrs mip) caused a timer interrupt storm under OpenSBI
-        uint32_t sip_mask =
-            0x00000333; // SEIP(9), UEIP(8), STIP(5), UTIP(4), SSIP(1), USIP(0)
+        uint32_t mip_mask = 0x00000a2au; // DUT write mask 0xbbb minus MTIP: MTIP is derived from mtimecmp; a sticky copy (written back by csrs mip) caused a timer interrupt storm under OpenSBI
+        const uint32_t sip_mask = delegated_s_bits(state);   // supervisor view: delegated SEIP / STIP / SSIP
 
         if (csr_idx == csr_sip) {
-          const uint32_t writable =
-              (privilege == RISCV_MODE_M) ? mip_mask : static_cast<uint32_t>(MIP_SSIP);
+          const uint32_t writable = static_cast<uint32_t>(MIP_SSIP) & sip_mask;   // sip: only SSIP, and only if delegated
           state.csr[csr_mip] =
               (state.csr[csr_mip] & ~writable) | (csr_wdata & writable);
         } else {
@@ -2905,6 +2902,10 @@ void Ref_cpu::RV32CSR() {
         // 同步更新 sstatus 影子值
         state.csr[csr_sstatus] = state.csr[csr_mstatus] & sstatus_mask;
 
+      } else if (csr_idx == csr_mideleg) {
+        state.csr[csr_mideleg] = csr_wdata & kSBits;
+        refresh_sie(state);
+        state.csr[csr_sip] = visible_mip() & delegated_s_bits(state);
       } else {
         state.csr[csr_idx] = csr_wdata;
       }

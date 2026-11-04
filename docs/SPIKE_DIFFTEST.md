@@ -16,12 +16,15 @@ function-model 对不在白名单里的 CSR 陷入非法指令，Spike 实现这
 | 项目 | 结果 |
 |---|---|
 | Linux 启动（`/tmp/linux_check.bin`，镜像由 `linux/mkimage.sh` 生成） | 1.35 亿条指令一路到 `rv32 login:`，**无不一致** |
-| trace-model 的 gate + vm 程序（66 个，每个上限 300 万条） | 63 个一致 |
+| trace-model 的 gate + vm 程序（66 个，每个上限 300 万条） | 64 个一致，2 个是平台差异（见下） |
 
-## 已知差异（3 个程序）
+## 中断 CSR 按规范（2026-11-04 起）
 
-1. **`csr-alias-boundary`：`sie` 的语义。** function-model 的 `sie` 是 `mie & 0x333`，包含用户级中断位（8、4、0），也不按 `mideleg` 屏蔽；Spike（按规范）`sie = mie & mideleg`，且没有用户级中断位。这是从原参考核继承下来的设计选择，不是 Spike 的问题。要不要改成规范行为，会同时影响 trace-model 和 RTL 的 CSR 文件，需要决定。
-2. **`timer-interrupt-mask`：`mip.MTIP`。** function-model 由 `mtimecmp` 合成 `MTIP`，Spike 没有这个平台的定时器，读 `mip` 得到 0。平台差异，对比时应以 function-model 为准。
-3. **`software-interrupt-vectored`：`mip.MSIP`。** 同上，软件中断源在平台里，不在 Spike 里。
+`mie` 只有 SSIE/MSIE/STIE/MTIE/SEIE/MEIE（0xAAA），没有用户级中断位；`mideleg` 只有 SSI/STI/SEI（0x222）；`sie`/`sip` 只显示被 `mideleg` 委托的位，
+`sip` 只能写 SSIP（且要被委托）。trace-model 的 `Csr.cpp` 和 RTL 的 `csr_pkg.sv`/`csr_read.sv`/`csr_regfile.sv` 同步。
+此前 `sie` 是 `mie & 0x333`（含用户级位、不看 `mideleg`），`csr-alias-boundary` 因此和 Spike 不一致；改后一致，该测试的周期数 736 → 709。
 
-2 和 3 是平台差异（对 `mip` 的读取可以当作设备值同步），1 是 ISA 层的真实偏差。
+## 已知差异（2 个程序，都是平台差异）
+
+1. **`timer-interrupt-mask`：`mip.MTIP`。** function-model 由 `mtimecmp` 合成 `MTIP`，Spike 没有这个平台的定时器，读 `mip` 得到 0。对比时应以 function-model 为准。
+2. **`software-interrupt-vectored`：`mip.MSIP`。** 同上，软件中断源在平台里，不在 Spike 里。
