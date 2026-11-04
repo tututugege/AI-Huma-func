@@ -124,7 +124,9 @@ class SpikeRef;
 
 // ===================================================================
 //
-#define MAX_SIM_TIME 500000000000
+// instruction cap (all modes): none by default; REF_MAX_INSTS sets one (a safety stop for runaway runs)
+inline const uint64_t g_max_sim_time = std::getenv("REF_MAX_INSTS") ? std::strtoull(std::getenv("REF_MAX_INSTS"), nullptr, 0) : ~0ull;
+#define MAX_SIM_TIME g_max_sim_time
 
 // --- 1. 定义四种运行模式 ---
 enum class SimMode {
@@ -322,7 +324,12 @@ public:
   uint8_t fcsr_fflags = 0;
   uint8_t fcsr_frm = 0;
 
-  const uint64_t INTERVAL_SIZE = 100000000;
+  // BBV / checkpoint interval in user-mode instructions; REF_INTERVAL overrides the default 1e8 (bbv and ckpt runs must agree)
+  static uint64_t interval_from_env() {
+    const char *e = std::getenv("REF_INTERVAL");
+    return e ? std::strtoull(e, nullptr, 0) : 100000000ull;
+  }
+  const uint64_t INTERVAL_SIZE = interval_from_env();
   uint64_t interval_inst_count = 0;
 
   uint32_t current_bb_head_pc; // 当前基本块的入口 PC
