@@ -1,5 +1,7 @@
 # RISC-V Full-System Simulator
 
+> 在 AI-Huma 项目里，这个仓库是**架构行为的标准**：trace-model 由它提供执行“事实”，RTL 每提交一条指令都与它逐条对比；它也负责 SPEC 的 BBV / SimPoint / 检查点生成（`scripts/spec/`）。项目总览见总仓库 `README.md` 和 `docs/GUIDE.md`。
+
 这是一个轻量级、高性能的 RISC-V 32位全系统模拟器，支持 RV32IMAB + Zfinx 指令集，并集成了两类 Difftest 能力：
 
 - standalone 模式下基于 Spike 的 `--diff`
