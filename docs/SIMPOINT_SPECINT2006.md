@@ -45,7 +45,20 @@ SimPoint 的目标是：
 - 若 target 为 0，则生成：
   - `ckpt_sp<sp_id>_target0_nowarmup.gz`
 
-## 3. 环境准备（SPECint2006）
+## 3. 两套流程
+
+| | 现行流程（2026-11-04 起） | 上游原流程 |
+|---|---|---|
+| 入口 | `scripts/spec/`，说明见 [scripts/spec/README.md](../scripts/spec/README.md) | `scripts/run_bbv.sh`、`scripts/run_ckpt.sh`（下面第 3.1–7 节） |
+| 运行方式 | Linux 镜像（OpenSBI + 内核 + initramfs），SPEC **ref** 输入，输出与 SPEC 参考比对 | 裸机镜像 `mem/<bench>.bin` |
+| ISA | rv32imab（GCC 13.3，`-march=rv32ima_zicsr_zifencei_zba_zbb_zbs`） | 视镜像而定 |
+| SimPoint 参数 | `-maxK 100 -seedproj 0721 -seedkm 11037 -numInitSeeds 5 -iters 100 -fixedLength on`，区间 1000 万条 | `-maxK 30 ... -iters 1000` |
+| 数据位置 | `~/personal/AI-Huma-data/spec-rv32imab`（持久目录，不进仓库） | 仓库内 `bbv_log/`、`ckpts/` |
+| 使用者 | trace-model `scripts/spec/replay.sh quick|full` | — |
+
+trace-model 和 rtl 的 SPEC 数字都来自现行流程；下面保留上游流程的说明，供查阅。
+
+### 3.1 环境准备（上游流程）
 
 你需要先准备好 SPECint2006 的 RISC-V 可执行镜像（`.bin`），并确保：
 - 每个 benchmark 最终都有一个可被本模拟器直接加载的镜像文件。
@@ -57,7 +70,7 @@ SimPoint 的目标是：
 - `mem/456.hmmer.bin`
 - ...
 
-## 4. 一次性批量流程（推荐）
+## 4. 一次性批量流程（上游流程）
 
 ### 4.1 编译模拟器
 
@@ -101,7 +114,7 @@ bash scripts/run_ckpt.sh
 - `-numInitSeeds 5`
 - `-iters 1000`
 
-## 5. 单个 benchmark 手工流程（便于调试）
+## 5. 单个 benchmark 手工流程（上游流程，便于调试）
 
 以 `429.mcf.bin` 为例：
 

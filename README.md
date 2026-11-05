@@ -194,7 +194,8 @@ make -C function-model librefcpu.a
 ## 文档与脚本位置
 
 - `docs/DIFFTEST.md`：Difftest 用法。
-- `docs/SIMPOINT_SPECINT2006.md`：SimPoint 原理与 SPECint2006 的 BBV/SimPoint 生成流程。
+- `docs/SIMPOINT_SPECINT2006.md`：SimPoint 原理，以及现行流程和上游流程的对照。
+- `scripts/spec/README.md`：现行 SPECint2006 检查点流程（rv32imab、Linux 镜像、ref 输入），数据在 `~/personal/AI-Huma-data/spec-rv32imab`。
 - `docs/FRONTDOOR_RESTORE.md`：front-door 检查点恢复。
 - `scripts/run_bbv.sh`、`scripts/run_ckpt.sh`：BBV 与检查点批量脚本，**在仓库根目录运行**（脚本里的 `./a.out`、`./SimPoint/simpoint` 都是相对根目录的路径）。
 
