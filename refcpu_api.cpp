@@ -139,6 +139,20 @@ void refcpu_step(RefCpuContext *ctx, uint64_t steps) {
   }
 }
 
+namespace {
+// memcpy that writes only the 4 KiB pages that differ: copying a mostly-zero 2 GiB image into a fresh calloc'ed one does not
+// make the zero pages resident (same result as memcpy).
+void copy_changed_pages(void *dst, const void *src, size_t bytes) {
+  constexpr size_t kPage = 4096;
+  auto *d = static_cast<uint8_t *>(dst);
+  const auto *s = static_cast<const uint8_t *>(src);
+  for (size_t off = 0; off < bytes; off += kPage) {
+    const size_t n = bytes - off < kPage ? bytes - off : kPage;
+    if (std::memcmp(d + off, s + off, n) != 0) std::memcpy(d + off, s + off, n);
+  }
+}
+}  // namespace
+
 void refcpu_sync_ram_from_dut(RefCpuContext *ctx, const uint32_t *ram_src,
                               size_t size_bytes) {
   if (ctx == nullptr || ram_src == nullptr || ctx->cpu.memory == nullptr) {
@@ -146,7 +160,7 @@ void refcpu_sync_ram_from_dut(RefCpuContext *ctx, const uint32_t *ram_src,
   }
   const size_t limit = static_cast<size_t>(ctx->cpu.ram_size);
   const size_t bytes = std::min(size_bytes, limit);
-  std::memcpy(ctx->cpu.memory, ram_src, bytes);
+  copy_changed_pages(ctx->cpu.memory, ram_src, bytes);
   ctx->cpu.tlb_flush();
 }
 
@@ -158,7 +172,7 @@ void refcpu_sync_sdram_from_dut(RefCpuContext *ctx,
     return;
   }
   const size_t bytes = std::min(size_bytes, static_cast<size_t>(SDRAM_SIZE));
-  std::memcpy(ctx->cpu.sdram_memory, sdram_src, bytes);
+  copy_changed_pages(ctx->cpu.sdram_memory, sdram_src, bytes);
   ctx->cpu.tlb_flush();
 }
 
