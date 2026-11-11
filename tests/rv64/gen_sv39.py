@@ -67,6 +67,10 @@ for i, fl in enumerate(VARIANTS):
     A_(pte_leaf("s4", fl & 0xff, extra=hi) + "    la t4, l0b\n" + f"    sd t2, {i*8}(t4)")
     if fl == 0:
         A_(f"    la t4, l0b\n    sd zero, {i*8}(t4)")
+# kernel-style high mapping (Linux rv64: VA 0xffffffff80000000 through root[510] -> a level-1 table -> a 2 MiB leaf)
+A_("    la t4, l1k")
+A_(pte_ptr("t4") + "    li t4, 4080\n    add t4, s0, t4\n    sd t2, 0(t4)")
+A_(pte_leaf("s5", V|R|W|X|A|D) + "    la t4, l1k\n    sd t2, 0(t4)")
 A_("    li a1, 0x1122334455667788\n    li t5, 0x0123456789abcdef")
 # satp: bare first (no effect on M), then Sv39 with an ASID, then an unsupported mode (write ignored)
 A_("""    srli t2, s0, 12
@@ -131,6 +135,10 @@ for priv in (1, 0):
                 getva = "la t2, code_page" if va == "CODE" else f"li t2, {va}"
                 A_(f"    la s8, 3f\n    {getva}\n    csrw mepc, t2\n    li t2, {MPP_MASK}\n    csrc mstatus, t2\n    li t2, {priv << 11}\n    csrs mstatus, t2\n    mret\n3:\n    nop")
 fold("s9")
+# fetch through the kernel-style high mapping (2 MiB leaf at level 1)
+A_("    li t2, 0x73\n    sw t2, 0(s5)\n    fence.i")
+for priv in (1, 0):
+    A_(f"    la s8, 6f\n    li t2, 0xffffffff80000000\n    csrw mepc, t2\n    li t2, {MPP_MASK}\n    csrc mstatus, t2\n    li t2, {priv << 11}\n    csrs mstatus, t2\n    mret\n6:\n    nop")
 # satp: unsupported mode is ignored
 A_("""    li t2, 9
     slli t2, t2, 60
@@ -182,6 +190,7 @@ root:  .space 4096
 l1:    .space 4096
 l0:    .space 4096
 l0b:   .space 4096
+l1k:   .space 4096
 data_pages: .space %d
     .balign 0x200000
 mega:  .space 0x200000

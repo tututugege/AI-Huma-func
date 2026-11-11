@@ -2825,9 +2825,9 @@ void Ref_cpu::evaluate_interrupts(uint32_t mip_reg) {
       privilege < RISCV_MODE_M && s_irq_enable;
 }
 
-bool Ref_cpu::take_forced_interrupt(uint32_t cause, uint8_t target_privilege,
+bool Ref_cpu::take_forced_interrupt(xlen_t cause, uint8_t target_privilege,
                                     uint32_t pending_snapshot) {
-  constexpr uint32_t kInterruptBit = 1u << 31;
+  constexpr xlen_t kInterruptBit = kXlenMsb;   // the interrupt flag of mcause / scause (bit XLEN-1)
   constexpr uint32_t kPendingMask = kMieBits;
   if ((cause & kInterruptBit) == 0) {
     return false;
@@ -2852,7 +2852,7 @@ bool Ref_cpu::take_forced_interrupt(uint32_t cause, uint8_t target_privilege,
       {S_software_interrupt, RISCV_MODE_S, 1u},
   };
 
-  const uint32_t requested_code = cause & ~kInterruptBit;
+  const xlen_t requested_code = cause & ~kInterruptBit;
   const Candidate *selected = nullptr;
   for (const auto &candidate : candidates) {
     if (candidate.active) {

@@ -232,7 +232,7 @@ public:
 
   void init(uint32_t reset_pc, const char *image, uint32_t size);
   void evaluate_interrupts(uint32_t mip_reg);
-  bool take_forced_interrupt(uint32_t cause, uint8_t target_privilege,
+  bool take_forced_interrupt(xlen_t cause, uint8_t target_privilege,
                              uint32_t pending_snapshot);
   void load_flash_image(const std::string &path);
   void load_sdcard_image(const std::string &path);
