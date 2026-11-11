@@ -40,3 +40,4 @@ function-model 对不在白名单里的 CSR 陷入非法指令，Spike 实现这
 - 结果：rv64 下 cpu-tests（排除浮点、`load-store`、`string`、`bitmanip-boundary`）加上述两个定向测试，只剩两个已知的平台差异（`software-interrupt-vectored` 的 MSIP、`timer-interrupt-mask` 的 MTIP）；rv32 默认构建的对拍结果与改动前一致。
 - `bitmanip-boundary` 的汇编里写死了 rv32 的 `rev8` 编码（0x698），在 rv64 上是非法指令，需要为 rv64 另写；Linux 启动对拍、BBV/检查点、快速路径还没有 rv64 版本。
 - Linux（rv64，`linux/README.md` 的 rv64 镜像）从复位一路启动到登录提示，Spike 逐条对比无不一致（修复 sstatus 写掩码之后；此前 UXL 位被内核写 sstatus 清掉，Spike 保留）。直接启动约 9 分钟里大部分是登录提示后的空转，对拍到登录提示只需几分钟。
+- rv64 快速路径（2026-11-11）：基本块缓存改成 XLEN 通用版，rv64 增加 `lwu/ld/sd` 和 `*W` 类指令；rv64 的 FastBlock 另存 satp（上下文字放不下）。验证方法是与 `REF_NO_FAST=1` 比较状态摘要（`REF_STATE_DIGEST_BLOCK` / `REF_DIGEST_LIST`）：rv64 Linux 启动到登录提示的 88 个摘要、`rv64-isa`、`rv64-sv39` 逐个相同；rv32 的 67 个程序输出、Linux 20 个摘要与改动前相同，速度也没有变化（100M 条指令 8.3 秒对 8.5 秒）。rv64 Linux 启动到登录提示约 0.5 秒，不开快速路径约 1.9 秒。快速路径对拍（Spike）不经过，因为 `--diff` 走通用循环。

@@ -1140,6 +1140,209 @@ void Ref_cpu::checkpoint_mmio_sync_devices() {
   refresh_external_interrupt();
 }
 
+// ---- XLEN-generic integer helpers (rv32: 32-bit values, rv64: 64-bit values) ----
+static inline xlen_t sext32(uint32_t v) { return static_cast<xlen_t>(static_cast<sxlen_t>(static_cast<int32_t>(v))); }
+static inline xlen_t xlen_rol(xlen_t v, unsigned s) { s &= kShamtMask; return s ? (v << s) | (v >> (XLEN - s)) : v; }
+static inline xlen_t xlen_ror(xlen_t v, unsigned s) { s &= kShamtMask; return s ? (v >> s) | (v << (XLEN - s)) : v; }
+static inline xlen_t xlen_clz(xlen_t v) { return v == 0 ? XLEN : (XLEN == 64 ? __builtin_clzll(v) : __builtin_clz(static_cast<uint32_t>(v))); }
+static inline xlen_t xlen_ctz(xlen_t v) { return v == 0 ? XLEN : (XLEN == 64 ? __builtin_ctzll(v) : __builtin_ctz(static_cast<uint32_t>(v))); }
+static inline xlen_t xlen_cpop(xlen_t v) { return XLEN == 64 ? __builtin_popcountll(v) : __builtin_popcount(static_cast<uint32_t>(v)); }
+static inline xlen_t xlen_rev8(xlen_t v) { return XLEN == 64 ? __builtin_bswap64(v) : __builtin_bswap32(static_cast<uint32_t>(v)); }
+static inline xlen_t xlen_orcb(xlen_t v) {
+  xlen_t r = 0;
+  for (unsigned i = 0; i < XLEN; i += 8) if ((v >> i) & 0xFF) r |= xlen_t(0xFF) << i;
+  return r;
+}
+static inline xlen_t mul_hi_ss(xlen_t a, xlen_t b) {
+#if XLEN == 64
+  return static_cast<xlen_t>((static_cast<__int128>(static_cast<int64_t>(a)) * static_cast<int64_t>(b)) >> 64);
+#else
+  return static_cast<uint32_t>((static_cast<int64_t>(static_cast<int32_t>(a)) * static_cast<int64_t>(static_cast<int32_t>(b))) >> 32);
+#endif
+}
+static inline xlen_t mul_hi_su(xlen_t a, xlen_t b) {
+#if XLEN == 64
+  return static_cast<xlen_t>((static_cast<__int128>(static_cast<int64_t>(a)) * static_cast<__int128>(static_cast<unsigned __int128>(b))) >> 64);
+#else
+  return static_cast<uint32_t>((static_cast<int64_t>(static_cast<int32_t>(a)) * static_cast<int64_t>(static_cast<uint64_t>(b))) >> 32);
+#endif
+}
+static inline xlen_t mul_hi_uu(xlen_t a, xlen_t b) {
+#if XLEN == 64
+  return static_cast<xlen_t>((static_cast<unsigned __int128>(a) * b) >> 64);
+#else
+  return static_cast<uint32_t>((static_cast<uint64_t>(a) * static_cast<uint64_t>(b)) >> 32);
+#endif
+}
+static inline xlen_t xlen_div(sxlen_t a, sxlen_t b) {
+  if (b == 0) return static_cast<xlen_t>(-1);
+  if (a == static_cast<sxlen_t>(kXlenMsb) && b == -1) return static_cast<xlen_t>(a);
+  return static_cast<xlen_t>(a / b);
+}
+static inline xlen_t xlen_rem(sxlen_t a, sxlen_t b) {
+  if (b == 0) return static_cast<xlen_t>(a);
+  if (a == static_cast<sxlen_t>(kXlenMsb) && b == -1) return 0;
+  return static_cast<xlen_t>(a % b);
+}
+static inline xlen_t xlen_divu(xlen_t a, xlen_t b) { return b == 0 ? ~xlen_t(0) : a / b; }
+static inline xlen_t xlen_remu(xlen_t a, xlen_t b) { return b == 0 ? a : a % b; }
+// 32-bit (*W) flavours on rv64: operate on the low 32 bits, results are sign-extended.
+static inline xlen_t w_div(int32_t a, int32_t b) {
+  if (b == 0) return sext32(~0u);
+  if (a == INT32_MIN && b == -1) return sext32(static_cast<uint32_t>(a));
+  return sext32(static_cast<uint32_t>(a / b));
+}
+static inline xlen_t w_rem(int32_t a, int32_t b) {
+  if (b == 0) return sext32(static_cast<uint32_t>(a));
+  if (a == INT32_MIN && b == -1) return 0;
+  return sext32(static_cast<uint32_t>(a % b));
+}
+static inline xlen_t w_divu(uint32_t a, uint32_t b) { return sext32(b == 0 ? ~0u : a / b); }
+static inline xlen_t w_remu(uint32_t a, uint32_t b) { return sext32(b == 0 ? a : a % b); }
+static inline uint32_t w_rol(uint32_t v, unsigned s) { s &= 31; return s ? (v << s) | (v >> (32 - s)) : v; }
+static inline uint32_t w_ror(uint32_t v, unsigned s) { s &= 31; return s ? (v >> s) | (v << (32 - s)) : v; }
+static inline xlen_t xlen_clmul(xlen_t a, xlen_t b) {
+  xlen_t out = 0;
+  for (unsigned i = 0; i < XLEN; i++) if ((b >> i) & 1) out ^= (a << i);
+  return out;
+}
+static inline xlen_t xlen_clmulr(xlen_t a, xlen_t b) {
+  xlen_t out = 0;
+  for (unsigned i = 0; i < XLEN; i++) if ((b >> i) & 1) out ^= (a >> (XLEN - 1 - i));
+  return out;
+}
+static inline xlen_t xlen_clmulh(xlen_t a, xlen_t b) {
+  xlen_t out = 0;
+  for (unsigned i = 1; i < XLEN; i++) if ((b >> i) & 1) out ^= (a >> (XLEN - i));
+  return out;
+}
+
+void Ref_cpu::RV32A() {
+  // pc + 4
+  xlen_t next_pc = state.pc + 4;
+  uint32_t funct5 = BITS(Instruction, 31, 27);
+  uint32_t funct3 = BITS(Instruction, 14, 12);
+  uint32_t reg_d_index = BITS(Instruction, 11, 7);
+  uint32_t reg_a_index = BITS(Instruction, 19, 15);
+  uint32_t reg_b_index = BITS(Instruction, 24, 20);
+
+  const xlen_t reg_rdata1 = state.gpr[reg_a_index];
+  const xlen_t reg_rdata2 = state.gpr[reg_b_index];
+
+#if XLEN == 64
+  const bool dword = funct3 == 3;
+  if (funct3 != 2 && funct3 != 3) {
+    illegal_exception = true;
+    return;
+  }
+#else
+  const bool dword = false;
+  (void)funct3;
+#endif
+  const uint32_t amo_size = dword ? 8 : 4;
+
+  xlen_t v_addr = reg_rdata1;
+  uint32_t p_addr = static_cast<uint32_t>(v_addr);
+
+  if (v_addr % amo_size != 0) {
+    std::cerr << "Misaligned AMO Access! addr: 0x" << std::hex << v_addr << std::endl;
+    exit(-1);
+  }
+
+  const xlen_t amo_mstatus = state.csr[csr_mstatus];
+  const uint32_t amo_eff_priv =
+      (amo_mstatus & MSTATUS_MPRV) ? GET_MPP(amo_mstatus) : privilege;
+  if (satp_enabled(state.csr[csr_satp]) && amo_eff_priv != RISCV_MODE_M) {
+    bool page_fault_1 = !va2pa(p_addr, v_addr, 1);
+    bool page_fault_2 = !va2pa(p_addr, v_addr, 2);
+
+    if (page_fault_1 || page_fault_2) {
+      if (funct5 == 2) {
+        if (page_fault_1) {
+          page_fault_load = true;
+        }
+      } else if (funct5 == 3) {
+        if (page_fault_2) {
+          page_fault_store = true;
+        }
+      } else {
+        page_fault_store = true;
+      }
+    }
+
+    if (page_fault_load || page_fault_store) {
+      exception(v_addr);
+      return;
+    }
+  } else {
+    p_addr = bare_pa(v_addr);
+  }
+  if (!is_ram_range(p_addr, amo_size)) {
+    is_io = true;
+  }
+  check_mem_range_or_log("amo", p_addr, amo_size);
+
+  if (funct5 != 2) {
+    state.store = true;
+    state.store_addr = p_addr;
+    state.store_strb = dword ? 0xFF : 0b1111;
+  }
+  // old memory value, as the register image (sign-extended for .w) and as raw bits
+  xlen_t old_val;
+  if (dword) {
+    old_val = (static_cast<xlen_t>(load_word(p_addr + 4)) << 32) | load_word(p_addr);
+  } else {
+    old_val = sext32(load_word(p_addr));
+  }
+  const xlen_t operand = dword ? reg_rdata2 : sext32(static_cast<uint32_t>(reg_rdata2));
+  // signed / unsigned comparison on the memory width
+  const sxlen_t s_old = static_cast<sxlen_t>(old_val), s_op = static_cast<sxlen_t>(operand);
+  const xlen_t u_old = dword ? old_val : (old_val & 0xFFFFFFFFu), u_op = dword ? operand : (operand & 0xFFFFFFFFu);
+  auto set_store = [&](xlen_t v) { state.store_data = dword ? v : (v & 0xFFFFFFFFu); };
+
+  switch (funct5) {
+  case 0: state.gpr[reg_d_index] = old_val; set_store(old_val + operand); break;   // amoadd
+  case 1: state.gpr[reg_d_index] = old_val; set_store(operand); break;             // amoswap
+  case 2: {                                                                        // lr
+    state.gpr[reg_d_index] = old_val;
+    state.reserve_valid = true;
+    state.reserve_addr = p_addr;
+    break;
+  }
+  case 3: { // sc
+    if (state.reserve_valid && state.reserve_addr == p_addr) {
+      set_store(operand);
+      state.gpr[reg_d_index] = 0; // Success
+    } else {
+      state.gpr[reg_d_index] = 1; // Fail
+      state.store = false;        // Don't perform the write
+    }
+    state.reserve_valid = false; // Regardless of success, invalidate reservation
+    break;
+  }
+  case 4: state.gpr[reg_d_index] = old_val; set_store(old_val ^ operand); break;   // amoxor
+  case 8: state.gpr[reg_d_index] = old_val; set_store(old_val | operand); break;   // amoor
+  case 12: state.gpr[reg_d_index] = old_val; set_store(old_val & operand); break;  // amoand
+  case 16: state.gpr[reg_d_index] = old_val; set_store(s_old > s_op ? operand : old_val); break;  // amomin
+  case 20: state.gpr[reg_d_index] = old_val; set_store(s_old > s_op ? old_val : operand); break;  // amomax
+  case 24: state.gpr[reg_d_index] = old_val; set_store(u_old < u_op ? old_val : operand); break;  // amominu
+  case 28: state.gpr[reg_d_index] = old_val; set_store(u_old > u_op ? old_val : operand); break;  // amomaxu
+  default: {
+    illegal_exception = true;
+    break;
+  }
+  }
+
+  if (illegal_exception) {
+    state.store = false;
+    return;
+  }
+  if (state.store) {
+    store_data();
+  }
+  state.pc = next_pc;
+}
+
 // ---------------------------------------------------------------------------------------------------------------
 // Fast path for plain runs (see ref.h): a basic-block cache with threaded dispatch for the common integer
 // instructions.  A block is a run of consecutive fast instructions inside one page, ending at a jump/branch, before an
@@ -1163,12 +1366,14 @@ enum FastOp : uint8_t {
   F_SLOW = 0, F_NOP, F_CONT, F_EXIT,
   F_LUI, F_AUIPC, F_JAL, F_JALR,
   F_BEQ, F_BNE, F_BLT, F_BGE, F_BLTU, F_BGEU,
-  F_LB, F_LH, F_LW, F_LBU, F_LHU,
-  F_SB, F_SH, F_SW,
+  F_LB, F_LH, F_LW, F_LBU, F_LHU, F_LWU, F_LD,
+  F_SB, F_SH, F_SW, F_SD,
   F_CSR,
   F_ADDI, F_SLTI, F_SLTIU, F_XORI, F_ORI, F_ANDI, F_SLLI, F_SRLI, F_SRAI,
   F_ADD, F_SUB, F_SLL, F_SLT, F_SLTU, F_XOR, F_SRL, F_SRA, F_OR, F_AND,
   F_MUL, F_MULH, F_MULHSU, F_MULHU, F_DIV, F_DIVU, F_REM, F_REMU,
+  // rv64 only (never produced by the rv32 decode)
+  F_ADDIW, F_SLLIW, F_SRLIW, F_SRAIW, F_ADDW, F_SUBW, F_SLLW, F_SRLW, F_SRAW, F_MULW, F_DIVW, F_DIVUW, F_REMW, F_REMUW,
   // fused pairs (produced only by the fusion pass, never by decode): the first slot runs both instructions
 #define X(a, b) F_##a##_##b,
   FUSE_LIST_NC(X) FUSE_LIST_C(X)
@@ -1242,7 +1447,7 @@ const bool g_digest_full = std::getenv("REF_STATE_DIGEST_FULL") != nullptr;
 
 void print_state_digest(uint64_t t, const CPU_state &st, uint8_t priv = 0) {
   uint64_t h = 1469598103934665603ull;
-  auto mix = [&h](uint32_t v) { h = (h ^ v) * 1099511628211ull; };
+  auto mix = [&h](uint64_t v) { h = (h ^ v) * 1099511628211ull; };
   mix(st.pc);
   for (int i = 1; i < 32; i++) mix(st.gpr[i]);
   if (g_digest_full) {
@@ -1259,13 +1464,13 @@ void print_state_digest(uint64_t t, const CPU_state &st, uint8_t priv = 0) {
 
 // Classify an instruction word.  Only exact base-ISA / M encodings are fast; everything else (Zba/Zbb/Zbc/Zbs,
 // CSR, AMO, FP, system, unknown funct3/funct7 combinations) is F_SLOW and goes through RISCV().
-#if XLEN == 32
 void fast_decode(uint32_t in, Ref_cpu::FastInsn &e) {
   e.rd = BITS(in, 11, 7);
   e.rs1 = BITS(in, 19, 15);
   e.rs2 = BITS(in, 24, 20);
   e.imm = 0;
   const uint32_t opc = BITS(in, 6, 0), f3 = BITS(in, 14, 12), f7 = BITS(in, 31, 25);
+  const uint32_t f7s = (XLEN == 64) ? (f7 & ~1u) : f7;   // shift immediates: rv64 has a 6-bit shamt
   uint8_t op = F_SLOW;
   switch (opc) {
   case number_0_opcode_lui: op = F_LUI; e.imm = immU(in); break;
@@ -1291,6 +1496,10 @@ void fast_decode(uint32_t in, Ref_cpu::FastInsn &e) {
     case 2: op = F_LW; break;
     case 4: op = F_LBU; break;
     case 5: op = F_LHU; break;
+#if XLEN == 64
+    case 6: op = F_LWU; break;
+    case 3: op = F_LD; break;
+#endif
     }
     break;
   case number_6_opcode_sb:
@@ -1299,6 +1508,9 @@ void fast_decode(uint32_t in, Ref_cpu::FastInsn &e) {
     case 0: op = F_SB; break;
     case 1: op = F_SH; break;
     case 2: op = F_SW; break;
+#if XLEN == 64
+    case 3: op = F_SD; break;
+#endif
     }
     break;
   case number_7_opcode_addi:
@@ -1310,10 +1522,10 @@ void fast_decode(uint32_t in, Ref_cpu::FastInsn &e) {
     case 4: op = F_XORI; break;
     case 6: op = F_ORI; break;
     case 7: op = F_ANDI; break;
-    case 1: if (f7 == 0) { op = F_SLLI; e.imm &= 0x1F; } break;
+    case 1: if (f7s == 0) { op = F_SLLI; e.imm &= kShamtMask; } break;
     case 5:
-      if (f7 == 0) { op = F_SRLI; e.imm &= 0x1F; }
-      else if (f7 == 0x20) { op = F_SRAI; e.imm &= 0x1F; }
+      if (f7s == 0) { op = F_SRLI; e.imm &= kShamtMask; }
+      else if (f7s == 0x20) { op = F_SRAI; e.imm &= kShamtMask; }
       break;
     }
     break;
@@ -1329,13 +1541,44 @@ void fast_decode(uint32_t in, Ref_cpu::FastInsn &e) {
       else if (f3 == 5) op = F_SRA;
     }
     break;
+#if XLEN == 64
+  case 0b0011011:  // OP-IMM-32
+    e.imm = immI(in);
+    switch (f3) {
+    case 0: op = F_ADDIW; break;
+    case 1: if (f7 == 0) { op = F_SLLIW; e.imm &= 0x1F; } break;
+    case 5:
+      if (f7 == 0) { op = F_SRLIW; e.imm &= 0x1F; }
+      else if (f7 == 0x20) { op = F_SRAIW; e.imm &= 0x1F; }
+      break;
+    }
+    break;
+  case 0b0111011:  // OP-32
+    if (f7 == 1) {
+      switch (f3) {
+      case 0: op = F_MULW; break;
+      case 4: op = F_DIVW; break;
+      case 5: op = F_DIVUW; break;
+      case 6: op = F_REMW; break;
+      case 7: op = F_REMUW; break;
+      }
+    } else if (f7 == 0) {
+      if (f3 == 0) op = F_ADDW;
+      else if (f3 == 1) op = F_SLLW;
+      else if (f3 == 5) op = F_SRLW;
+    } else if (f7 == 0x20) {
+      if (f3 == 0) op = F_SUBW;
+      else if (f3 == 5) op = F_SRAW;
+    }
+    break;
+#endif
   case number_9_opcode_fence: op = F_NOP; break;
   case number_10_opcode_ecall:
     if (f3 != 0 && f3 != 4) { op = F_CSR; e.imm = in; }  // executed by RV32CSR(); funct3 0 (ecall, mret, wfi, ...) is slow
     break;
   }
   // an instruction without side effects that writes x0 does nothing
-  if (e.rd == 0 && (op == F_LUI || op == F_AUIPC || op >= F_ADDI)) {
+  if (e.rd == 0 && (op == F_LUI || op == F_AUIPC || (op >= F_ADDI && op != F_SD))) {
     op = F_NOP;
   }
   e.op = op;
@@ -1344,12 +1587,10 @@ void fast_decode(uint32_t in, Ref_cpu::FastInsn &e) {
 inline bool fast_is_control(uint8_t op) { return op >= F_JAL && op <= F_BGEU; }
 // F_CSR also ends a block: afterwards the fast-path assumptions are re-checked
 inline bool fast_ends_block(uint8_t op) { return fast_is_control(op) || op == F_CSR; }
-#endif  // XLEN == 32
 }  // namespace
 
 // Run blocks until an instruction needs the general path, an interrupt could be taken, or the timer deadline is near.
 // U: the privilege is U (basic-block and interval bookkeeping); DX: loads and stores are translated.
-#if XLEN == 32
 template <bool U, bool DX>
 void Ref_cpu::fast_run_impl(uint32_t &finished_intervals, uint64_t budget, uint32_t mip_eff, bool stop_iv, bool bbv,
                             bool trk) {
@@ -1357,24 +1598,27 @@ void Ref_cpu::fast_run_impl(uint32_t &finished_intervals, uint64_t budget, uint3
       &&L_SLOW, &&L_NOP, &&L_CONT, &&L_EXIT,
       &&L_LUI, &&L_AUIPC, &&L_JAL, &&L_JALR,
       &&L_BEQ, &&L_BNE, &&L_BLT, &&L_BGE, &&L_BLTU, &&L_BGEU,
-      &&L_LB, &&L_LH, &&L_LW, &&L_LBU, &&L_LHU,
-      &&L_SB, &&L_SH, &&L_SW,
+      &&L_LB, &&L_LH, &&L_LW, &&L_LBU, &&L_LHU, &&L_LWU, &&L_LD,
+      &&L_SB, &&L_SH, &&L_SW, &&L_SD,
       &&L_CSR,
       &&L_ADDI, &&L_SLTI, &&L_SLTIU, &&L_XORI, &&L_ORI, &&L_ANDI, &&L_SLLI, &&L_SRLI, &&L_SRAI,
       &&L_ADD, &&L_SUB, &&L_SLL, &&L_SLT, &&L_SLTU, &&L_XOR, &&L_SRL, &&L_SRA, &&L_OR, &&L_AND,
       &&L_MUL, &&L_MULH, &&L_MULHSU, &&L_MULHU, &&L_DIV, &&L_DIVU, &&L_REM, &&L_REMU,
+      &&L_ADDIW, &&L_SLLIW, &&L_SRLIW, &&L_SRAIW, &&L_ADDW, &&L_SUBW, &&L_SLLW, &&L_SRLW, &&L_SRAW, &&L_MULW, &&L_DIVW,
+      &&L_DIVUW, &&L_REMW, &&L_REMUW,
 #define X(a, b) &&L_F_##a##_##b,
       FUSE_LIST_NC(X) FUSE_LIST_C(X)
 #undef X
   };
 
-  uint32_t *const x = state.gpr;
+  xlen_t *const x = state.gpr;
   uint32_t *const mem = memory;
   uint8_t *const pgf = pt_page_flag.data();
-  const uint32_t satp = state.csr[csr_satp];
+  const xlen_t satp = state.csr[csr_satp];
   const uint32_t priv = privilege;
   const bool fetch_translate = satp_enabled(satp) && priv != RISCV_MODE_M;
-  const uint64_t ctx_base = (static_cast<uint64_t>(satp) << 32) | (static_cast<uint64_t>(priv) << 30);
+  // rv32: satp fits in the context word; rv64: FastBlock::satp is compared separately
+  const uint64_t ctx_base = (XLEN == 32 ? (static_cast<uint64_t>(satp) << 32) : 0) | (static_cast<uint64_t>(priv) << 30);
   const uint32_t maxlen = g_digest_every ? 1u : kMaxBlockOps;
   FastBlock *const blocks = fblocks.data();
 
@@ -1392,7 +1636,7 @@ void Ref_cpu::fast_run_impl(uint32_t &finished_intervals, uint64_t budget, uint3
   const uint32_t tctx_common = (data_priv0 << 2) | ((mst0 & MSTATUS_MXR) ? 16u : 0u) | ((mst0 & MSTATUS_SUM) ? 32u : 0u);
   const uint32_t tctx_ld = 1u | tctx_common, tctx_st = 2u | tctx_common;
   constexpr uint32_t kTlbMask = Ref_cpu::kTlbSize - 1;
-  uint32_t pc = state.pc;
+  xlen_t pc = state.pc;
   uint32_t ep = icache_epoch;         // epoch the current ctx was built with
   uint64_t ctx = ctx_base | ep;
   uint64_t bbl = current_bb_len;      // U mode: instructions in the current basic block (written back at exit)
@@ -1400,9 +1644,12 @@ void Ref_cpu::fast_run_impl(uint32_t &finished_intervals, uint64_t budget, uint3
 
   FastBlock *b = nullptr;
   const FastInsn *op = nullptr;
-  uint32_t bpc = 0, ipc = 0, v = 0, p = 0, n = 0, ex = 0;
+  xlen_t bpc = 0, ipc = 0, v = 0;
+  uint32_t p = 0, n = 0, ex = 0;
   const FastInsn *ip = nullptr;
-  uint32_t q = 0, cpc = 0, cnt = 0;
+  uint32_t q = 0;
+  xlen_t cpc = 0;
+  uint32_t cnt = 0;
 
 dispatch_block:
   if (__builtin_expect(g_digest_block != 0, 0)) {
@@ -1425,7 +1672,7 @@ dispatch_block:
     goto out;  // misaligned pc: the general path fetches the aligned word
   }
   b = &blocks[(pc >> 2) & (kFastBlocks - 1)];
-  if (__builtin_expect(b->pc != pc || b->ctx != ctx, 0)) {
+  if (__builtin_expect(b->pc != pc || b->ctx != ctx || (XLEN == 64 && b->satp != satp), 0)) {
     goto build;
   }
 run_block:
@@ -1446,10 +1693,14 @@ run_block:
 
 build : {
   // decode a new block starting at pc
-  p = pc;
-  if (fetch_translate && !va2pa(p, pc, 0)) {
-    if (g_fast_stats) g_fs.stop[3]++;
-    goto out;  // instruction page fault: RISCV() raises it
+  p = static_cast<uint32_t>(pc);
+  if (fetch_translate) {
+    if (!va2pa(p, pc, 0)) {
+      if (g_fast_stats) g_fs.stop[3]++;
+      goto out;  // instruction page fault: RISCV() raises it
+    }
+  } else if (XLEN == 64 && (pc >> 32) != 0) {
+    goto out;  // outside the 32-bit physical space: RISCV() reports it
   }
   if ((int32_t)p >= 0) {
     if (g_fast_stats) g_fs.stop[3]++;
@@ -1502,6 +1753,7 @@ build : {
   }
   b->pc = pc;
   b->ctx = ctx;
+  b->satp = satp;
   b->n = n;
   mark_code_page(p);
   if (g_fast_stats) g_fs.blocks++;
@@ -1512,7 +1764,7 @@ build : {
 }
 
 #define NEXT() do { ++op; goto *op->h; } while (0)
-#define PC_OF(o) (bpc + (uint32_t)(((o) - b->ops) << 2))
+#define PC_OF(o) (bpc + (xlen_t)(((o) - b->ops) << 2))
 // leaving the block before executing 'op': give back the budget of the instructions not executed
 #define BAIL()                                                                                                       \
   do {                                                                                                               \
@@ -1570,7 +1822,7 @@ L_EXIT:
   END_CONTROL();
 #define B_JALR                                                                                                       \
   ipc = PC_OF(op);                                                                                                   \
-  v = (x[op->rs1] + op->imm) & 0xFFFFFFFCu;                                                                          \
+  v = (x[op->rs1] + op->imm) & ~xlen_t(3);                                                                           \
   x[op->rd] = ipc + 4;                                                                                               \
   x[0] = 0;                                                                                                          \
   pc = v;                                                                                                            \
@@ -1581,15 +1833,15 @@ L_EXIT:
   END_CONTROL();
 #define B_BEQ B_BRANCH(x[op->rs1] == x[op->rs2])
 #define B_BNE B_BRANCH(x[op->rs1] != x[op->rs2])
-#define B_BLT B_BRANCH((int32_t)x[op->rs1] < (int32_t)x[op->rs2])
-#define B_BGE B_BRANCH((int32_t)x[op->rs1] >= (int32_t)x[op->rs2])
+#define B_BLT B_BRANCH((sxlen_t)x[op->rs1] < (sxlen_t)x[op->rs2])
+#define B_BGE B_BRANCH((sxlen_t)x[op->rs1] >= (sxlen_t)x[op->rs2])
 #define B_BLTU B_BRANCH(x[op->rs1] < x[op->rs2])
 #define B_BGEU B_BRANCH(x[op->rs1] >= x[op->rs2])
 
 // data address translation: inline TLB probe, va2pa() (page walk) on a miss; a fault leaves the instruction to RISCV()
 #define FAST_XLATE(TYPE, TCTX)                                                                                       \
   if (DX) {                                                                                                          \
-    const TlbEntry &te = tlb[((v >> 12) ^ ((TYPE) << 7)) & kTlbMask];                                                \
+    const TlbEntry &te = tlb[(static_cast<uint32_t>(v >> 12) ^ ((TYPE) << 7)) & kTlbMask];                           \
     if (__builtin_expect(te.epoch == tlb_epoch && te.vpn == (v >> 12) && te.satp == satp && te.ctx == (TCTX), 1)) { \
       p = (te.frame << 12) | (v & 0xFFFu);                                                                           \
     } else if (!va2pa(p, v, (TYPE))) {                                                                               \
@@ -1601,7 +1853,8 @@ L_EXIT:
 #define B_LOAD(ALIGN_MASK, EXPR)                                                                                     \
   v = x[op->rs1] + op->imm;                                                                                          \
   if (v & (ALIGN_MASK)) BAIL();                                                                                      \
-  p = v;                                                                                                             \
+  if (!DX && XLEN == 64 && (v >> 32) != 0) BAIL();                                                                   \
+  p = static_cast<uint32_t>(v);                                                                                      \
   FAST_XLATE(1u, tctx_ld)                                                                                            \
   if ((int32_t)p >= 0) BAIL();                                                                                       \
   {                                                                                                                  \
@@ -1609,18 +1862,29 @@ L_EXIT:
     x[op->rd] = (EXPR);                                                                                              \
   }                                                                                                                  \
   x[0] = 0;
-#define B_LB B_LOAD(0u, (uint32_t)(int32_t)(int8_t)(w & 0xFF))
+#define B_LB B_LOAD(0u, (xlen_t)(sxlen_t)(int8_t)(w & 0xFF))
 #define B_LBU B_LOAD(0u, w & 0xFF)
-#define B_LH B_LOAD(1u, (uint32_t)(int32_t)(int16_t)(w & 0xFFFF))
+#define B_LH B_LOAD(1u, (xlen_t)(sxlen_t)(int16_t)(w & 0xFFFF))
 #define B_LHU B_LOAD(1u, w & 0xFFFF)
-#define B_LW B_LOAD(3u, w)
+#define B_LW B_LOAD(3u, (xlen_t)(sxlen_t)(int32_t)w)
+#define B_LWU B_LOAD(3u, (xlen_t)w)
+#define B_LD                                                                                                         \
+  v = x[op->rs1] + op->imm;                                                                                          \
+  if (v & 7u) BAIL();                                                                                                \
+  if (!DX && (v >> 32) != 0) BAIL();                                                                                 \
+  p = static_cast<uint32_t>(v);                                                                                      \
+  FAST_XLATE(1u, tctx_ld)                                                                                            \
+  if ((int32_t)p >= 0) BAIL();                                                                                       \
+  x[op->rd] = static_cast<xlen_t>(mem[(p & 0x7FFFFFFFu) >> 2]) | (static_cast<xlen_t>(mem[((p & 0x7FFFFFFFu) >> 2) + 1]) << 32); \
+  x[0] = 0;
 
 // stores: same fallbacks; a store into a page that holds page tables or decoded code flushes the caches, after which
 // the rest of the block is abandoned (the next instruction is fetched again)
 #define B_STORE(ALIGN_MASK, SIZE_MASK)                                                                               \
   v = x[op->rs1] + op->imm;                                                                                          \
   if (v & (ALIGN_MASK)) BAIL();                                                                                      \
-  p = v;                                                                                                             \
+  if (!DX && XLEN == 64 && (v >> 32) != 0) BAIL();                                                                   \
+  p = static_cast<uint32_t>(v);                                                                                      \
   FAST_XLATE(2u, tctx_st)                                                                                            \
   if ((int32_t)p >= 0) BAIL();                                                                                       \
   {                                                                                                                  \
@@ -1651,42 +1915,82 @@ L_EXIT:
 #define B_SB B_STORE(0u, 0xFFu)
 #define B_SH B_STORE(1u, 0xFFFFu)
 #define B_SW B_STORE(3u, 0xFFFFFFFFu)
+// sd: aligned, so both words are in the same page
+#define B_SD                                                                                                         \
+  v = x[op->rs1] + op->imm;                                                                                          \
+  if (v & 7u) BAIL();                                                                                                \
+  if (!DX && (v >> 32) != 0) BAIL();                                                                                 \
+  p = static_cast<uint32_t>(v);                                                                                      \
+  FAST_XLATE(2u, tctx_st)                                                                                            \
+  if ((int32_t)p >= 0) BAIL();                                                                                       \
+  {                                                                                                                  \
+    if (state.reserve_valid && state.reserve_addr == p) state.reserve_valid = false;                                 \
+    uint32_t &w0 = mem[(p & 0x7FFFFFFFu) >> 2];                                                                      \
+    uint32_t &w1 = mem[((p & 0x7FFFFFFFu) >> 2) + 1];                                                                \
+    const xlen_t sv = x[op->rs2];                                                                                    \
+    if (__builtin_expect(trk, 0)) {                                                                                  \
+      state.store_addr = p;                                                                                          \
+      state.store_data = sv;                                                                                         \
+      state.store_strb = 0xFFu;                                                                                      \
+    }                                                                                                                \
+    const uint8_t f = pgf[p >> 12];                                                                                  \
+    w0 = static_cast<uint32_t>(sv);                                                                                  \
+    w1 = static_cast<uint32_t>(sv >> 32);                                                                            \
+    if (__builtin_expect(f != 0, 0)) {                                                                               \
+      page_flag_hit(f);                                                                                              \
+      ex = (uint32_t)(op - b->ops) + 1;                                                                              \
+      left += b->n - ex;                                                                                             \
+      if (U) bbl += ex;                                                                                              \
+      pc = bpc + (ex << 2);                                                                                          \
+      ep = icache_epoch;                                                                                             \
+      ctx = ctx_base | ep;                                                                                           \
+      goto dispatch_block;                                                                                           \
+    }                                                                                                                \
+  }
 
 #define B_ADDI x[op->rd] = x[op->rs1] + op->imm;
-#define B_SLTI x[op->rd] = (int32_t)x[op->rs1] < (int32_t)op->imm ? 1 : 0;
+#define B_SLTI x[op->rd] = (sxlen_t)x[op->rs1] < (sxlen_t)op->imm ? 1 : 0;
 #define B_SLTIU x[op->rd] = x[op->rs1] < op->imm ? 1 : 0;
 #define B_XORI x[op->rd] = x[op->rs1] ^ op->imm;
 #define B_ORI x[op->rd] = x[op->rs1] | op->imm;
 #define B_ANDI x[op->rd] = x[op->rs1] & op->imm;
 #define B_SLLI x[op->rd] = x[op->rs1] << op->imm;
 #define B_SRLI x[op->rd] = x[op->rs1] >> op->imm;
-#define B_SRAI x[op->rd] = (uint32_t)((int32_t)x[op->rs1] >> op->imm);
+#define B_SRAI x[op->rd] = (xlen_t)((sxlen_t)x[op->rs1] >> op->imm);
 #define B_ADD x[op->rd] = x[op->rs1] + x[op->rs2];
 #define B_SUB x[op->rd] = x[op->rs1] - x[op->rs2];
-#define B_SLL x[op->rd] = x[op->rs1] << (x[op->rs2] & 0x1F);
-#define B_SLT x[op->rd] = (int32_t)x[op->rs1] < (int32_t)x[op->rs2] ? 1 : 0;
+#define B_SLL x[op->rd] = x[op->rs1] << (x[op->rs2] & kShamtMask);
+#define B_SLT x[op->rd] = (sxlen_t)x[op->rs1] < (sxlen_t)x[op->rs2] ? 1 : 0;
 #define B_SLTU x[op->rd] = x[op->rs1] < x[op->rs2] ? 1 : 0;
 #define B_XOR x[op->rd] = x[op->rs1] ^ x[op->rs2];
-#define B_SRL x[op->rd] = x[op->rs1] >> (x[op->rs2] & 0x1F);
-#define B_SRA x[op->rd] = (uint32_t)((int32_t)x[op->rs1] >> (x[op->rs2] & 0x1F));
+#define B_SRL x[op->rd] = x[op->rs1] >> (x[op->rs2] & kShamtMask);
+#define B_SRA x[op->rd] = (xlen_t)((sxlen_t)x[op->rs1] >> (x[op->rs2] & kShamtMask));
 #define B_OR x[op->rd] = x[op->rs1] | x[op->rs2];
 #define B_AND x[op->rd] = x[op->rs1] & x[op->rs2];
 #define B_MUL x[op->rd] = x[op->rs1] * x[op->rs2];
-#define B_MULH x[op->rd] = (uint32_t)(((int64_t)(int32_t)x[op->rs1] * (int64_t)(int32_t)x[op->rs2]) >> 32);
-#define B_MULHSU x[op->rd] = (uint32_t)(((int64_t)(int32_t)x[op->rs1] * (int64_t)(uint32_t)x[op->rs2]) >> 32);
-#define B_MULHU x[op->rd] = (uint32_t)(((uint64_t)x[op->rs1] * (uint64_t)x[op->rs2]) >> 32);
-#define B_DIV                                                                                                        \
-  {                                                                                                                  \
-    const int32_t a = (int32_t)x[op->rs1], d = (int32_t)x[op->rs2];                                                  \
-    x[op->rd] = d == 0 ? 0xFFFFFFFFu : (a == INT32_MIN && d == -1 ? (uint32_t)INT32_MIN : (uint32_t)(a / d));        \
-  }
-#define B_DIVU x[op->rd] = x[op->rs2] == 0 ? 0xFFFFFFFFu : x[op->rs1] / x[op->rs2];
-#define B_REM                                                                                                        \
-  {                                                                                                                  \
-    const int32_t a = (int32_t)x[op->rs1], d = (int32_t)x[op->rs2];                                                  \
-    x[op->rd] = d == 0 ? (uint32_t)a : (a == INT32_MIN && d == -1 ? 0u : (uint32_t)(a % d));                         \
-  }
-#define B_REMU x[op->rd] = x[op->rs2] == 0 ? x[op->rs1] : x[op->rs1] % x[op->rs2];
+#define B_MULH x[op->rd] = mul_hi_ss(x[op->rs1], x[op->rs2]);
+#define B_MULHSU x[op->rd] = mul_hi_su(x[op->rs1], x[op->rs2]);
+#define B_MULHU x[op->rd] = mul_hi_uu(x[op->rs1], x[op->rs2]);
+#define B_DIV x[op->rd] = xlen_div((sxlen_t)x[op->rs1], (sxlen_t)x[op->rs2]);
+#define B_DIVU x[op->rd] = xlen_divu(x[op->rs1], x[op->rs2]);
+#define B_REM x[op->rd] = xlen_rem((sxlen_t)x[op->rs1], (sxlen_t)x[op->rs2]);
+#define B_REMU x[op->rd] = xlen_remu(x[op->rs1], x[op->rs2]);
+#if XLEN == 64
+#define B_ADDIW x[op->rd] = sext32((uint32_t)(x[op->rs1] + op->imm));
+#define B_SLLIW x[op->rd] = sext32((uint32_t)x[op->rs1] << op->imm);
+#define B_SRLIW x[op->rd] = sext32((uint32_t)x[op->rs1] >> op->imm);
+#define B_SRAIW x[op->rd] = sext32((uint32_t)((int32_t)(uint32_t)x[op->rs1] >> op->imm));
+#define B_ADDW x[op->rd] = sext32((uint32_t)(x[op->rs1] + x[op->rs2]));
+#define B_SUBW x[op->rd] = sext32((uint32_t)(x[op->rs1] - x[op->rs2]));
+#define B_SLLW x[op->rd] = sext32((uint32_t)x[op->rs1] << (x[op->rs2] & 31));
+#define B_SRLW x[op->rd] = sext32((uint32_t)x[op->rs1] >> (x[op->rs2] & 31));
+#define B_SRAW x[op->rd] = sext32((uint32_t)((int32_t)(uint32_t)x[op->rs1] >> (x[op->rs2] & 31)));
+#define B_MULW x[op->rd] = sext32((uint32_t)x[op->rs1] * (uint32_t)x[op->rs2]);
+#define B_DIVW x[op->rd] = w_div((int32_t)(uint32_t)x[op->rs1], (int32_t)(uint32_t)x[op->rs2]);
+#define B_DIVUW x[op->rd] = w_divu((uint32_t)x[op->rs1], (uint32_t)x[op->rs2]);
+#define B_REMW x[op->rd] = w_rem((int32_t)(uint32_t)x[op->rs1], (int32_t)(uint32_t)x[op->rs2]);
+#define B_REMUW x[op->rd] = w_remu((uint32_t)x[op->rs1], (uint32_t)x[op->rs2]);
+#endif
 
 // CSR instruction: run the general implementation for it (same code RISCV() would call), then continue in the fast path
 // only if nothing the fast path assumes has changed.
@@ -1709,7 +2013,7 @@ L_CSR: {
   sim_time = st0 + (budget0 - left);
   if (U) bbl += b->n;
   {
-    const uint32_t mst = state.csr[csr_mstatus];
+    const xlen_t mst = state.csr[csr_mstatus];
     bool ok = !is_exception && !illegal_exception && state.pc == ipc + 4 && privilege == priv &&
               state.csr[csr_satp] == satp && state.csr[csr_mie] == mie0 && state.csr[csr_mip] == mip0 &&
               ((mst & kMstatusDataMask) == (mst0 & kMstatusDataMask));
@@ -1734,6 +2038,13 @@ L_CSR: {
 #define HC(NAME) L_##NAME: B_##NAME
 H(LUI) H(AUIPC) HC(JAL) HC(JALR) HC(BEQ) HC(BNE) HC(BLT) HC(BGE) HC(BLTU) HC(BGEU)
 H(LB) H(LH) H(LW) H(LBU) H(LHU) H(SB) H(SH) H(SW)
+#if XLEN == 64
+H(LWU) H(LD) H(SD)
+H(ADDIW) H(SLLIW) H(SRLIW) H(SRAIW) H(ADDW) H(SUBW) H(SLLW) H(SRLW) H(SRAW) H(MULW) H(DIVW) H(DIVUW) H(REMW) H(REMUW)
+#else
+L_LWU: L_LD: L_SD: L_ADDIW: L_SLLIW: L_SRLIW: L_SRAIW: L_ADDW: L_SUBW: L_SLLW: L_SRLW: L_SRAW: L_MULW: L_DIVW: L_DIVUW:
+L_REMW: L_REMUW: goto out;   // never produced by the rv32 decode
+#endif
 H(ADDI) H(SLTI) H(SLTIU) H(XORI) H(ORI) H(ANDI) H(SLLI) H(SRLI) H(SRAI)
 H(ADD) H(SUB) H(SLL) H(SLT) H(SLTU) H(XOR) H(SRL) H(SRA) H(OR) H(AND)
 H(MUL) H(MULH) H(MULHSU) H(MULHU) H(DIV) H(DIVU) H(REM) H(REMU)
@@ -1787,11 +2098,6 @@ out:
   }
 }
 
-#else  // XLEN == 64: no fast path yet (every instruction goes through RISCV())
-void Ref_cpu::fast_run(uint32_t &, uint64_t, bool, bool, bool) {}
-#endif
-
-#if XLEN == 32
 void Ref_cpu::fast_run(uint32_t &finished_intervals, uint64_t cap, bool stop_iv, bool bbv, bool trk) {
   if (sim_time >= MAX_SIM_TIME) {
     return;
@@ -1838,8 +2144,6 @@ void Ref_cpu::fast_run(uint32_t &finished_intervals, uint64_t cap, bool stop_iv,
     else fast_run_impl<false, false>(finished_intervals, budget, mip_eff, stop_iv, bbv, trk);
   }
 }
-
-#endif  // XLEN == 32 (fast path)
 
 void Ref_cpu::exec(const SimConfig &config) {
   // Initialize Spike Reference Simulator if enabled
@@ -3159,209 +3463,6 @@ void Ref_cpu::RV32Zfinx() {
 }
 
 #endif  // XLEN == 32 (Zfinx)
-
-// ---- XLEN-generic integer helpers (rv32: 32-bit values, rv64: 64-bit values) ----
-static inline xlen_t sext32(uint32_t v) { return static_cast<xlen_t>(static_cast<sxlen_t>(static_cast<int32_t>(v))); }
-static inline xlen_t xlen_rol(xlen_t v, unsigned s) { s &= kShamtMask; return s ? (v << s) | (v >> (XLEN - s)) : v; }
-static inline xlen_t xlen_ror(xlen_t v, unsigned s) { s &= kShamtMask; return s ? (v >> s) | (v << (XLEN - s)) : v; }
-static inline xlen_t xlen_clz(xlen_t v) { return v == 0 ? XLEN : (XLEN == 64 ? __builtin_clzll(v) : __builtin_clz(static_cast<uint32_t>(v))); }
-static inline xlen_t xlen_ctz(xlen_t v) { return v == 0 ? XLEN : (XLEN == 64 ? __builtin_ctzll(v) : __builtin_ctz(static_cast<uint32_t>(v))); }
-static inline xlen_t xlen_cpop(xlen_t v) { return XLEN == 64 ? __builtin_popcountll(v) : __builtin_popcount(static_cast<uint32_t>(v)); }
-static inline xlen_t xlen_rev8(xlen_t v) { return XLEN == 64 ? __builtin_bswap64(v) : __builtin_bswap32(static_cast<uint32_t>(v)); }
-static inline xlen_t xlen_orcb(xlen_t v) {
-  xlen_t r = 0;
-  for (unsigned i = 0; i < XLEN; i += 8) if ((v >> i) & 0xFF) r |= xlen_t(0xFF) << i;
-  return r;
-}
-static inline xlen_t mul_hi_ss(xlen_t a, xlen_t b) {
-#if XLEN == 64
-  return static_cast<xlen_t>((static_cast<__int128>(static_cast<int64_t>(a)) * static_cast<int64_t>(b)) >> 64);
-#else
-  return static_cast<uint32_t>((static_cast<int64_t>(static_cast<int32_t>(a)) * static_cast<int64_t>(static_cast<int32_t>(b))) >> 32);
-#endif
-}
-static inline xlen_t mul_hi_su(xlen_t a, xlen_t b) {
-#if XLEN == 64
-  return static_cast<xlen_t>((static_cast<__int128>(static_cast<int64_t>(a)) * static_cast<__int128>(static_cast<unsigned __int128>(b))) >> 64);
-#else
-  return static_cast<uint32_t>((static_cast<int64_t>(static_cast<int32_t>(a)) * static_cast<int64_t>(static_cast<uint64_t>(b))) >> 32);
-#endif
-}
-static inline xlen_t mul_hi_uu(xlen_t a, xlen_t b) {
-#if XLEN == 64
-  return static_cast<xlen_t>((static_cast<unsigned __int128>(a) * b) >> 64);
-#else
-  return static_cast<uint32_t>((static_cast<uint64_t>(a) * static_cast<uint64_t>(b)) >> 32);
-#endif
-}
-static inline xlen_t xlen_div(sxlen_t a, sxlen_t b) {
-  if (b == 0) return static_cast<xlen_t>(-1);
-  if (a == static_cast<sxlen_t>(kXlenMsb) && b == -1) return static_cast<xlen_t>(a);
-  return static_cast<xlen_t>(a / b);
-}
-static inline xlen_t xlen_rem(sxlen_t a, sxlen_t b) {
-  if (b == 0) return static_cast<xlen_t>(a);
-  if (a == static_cast<sxlen_t>(kXlenMsb) && b == -1) return 0;
-  return static_cast<xlen_t>(a % b);
-}
-static inline xlen_t xlen_divu(xlen_t a, xlen_t b) { return b == 0 ? ~xlen_t(0) : a / b; }
-static inline xlen_t xlen_remu(xlen_t a, xlen_t b) { return b == 0 ? a : a % b; }
-// 32-bit (*W) flavours on rv64: operate on the low 32 bits, results are sign-extended.
-static inline xlen_t w_div(int32_t a, int32_t b) {
-  if (b == 0) return sext32(~0u);
-  if (a == INT32_MIN && b == -1) return sext32(static_cast<uint32_t>(a));
-  return sext32(static_cast<uint32_t>(a / b));
-}
-static inline xlen_t w_rem(int32_t a, int32_t b) {
-  if (b == 0) return sext32(static_cast<uint32_t>(a));
-  if (a == INT32_MIN && b == -1) return 0;
-  return sext32(static_cast<uint32_t>(a % b));
-}
-static inline xlen_t w_divu(uint32_t a, uint32_t b) { return sext32(b == 0 ? ~0u : a / b); }
-static inline xlen_t w_remu(uint32_t a, uint32_t b) { return sext32(b == 0 ? a : a % b); }
-static inline uint32_t w_rol(uint32_t v, unsigned s) { s &= 31; return s ? (v << s) | (v >> (32 - s)) : v; }
-static inline uint32_t w_ror(uint32_t v, unsigned s) { s &= 31; return s ? (v >> s) | (v << (32 - s)) : v; }
-static inline xlen_t xlen_clmul(xlen_t a, xlen_t b) {
-  xlen_t out = 0;
-  for (unsigned i = 0; i < XLEN; i++) if ((b >> i) & 1) out ^= (a << i);
-  return out;
-}
-static inline xlen_t xlen_clmulr(xlen_t a, xlen_t b) {
-  xlen_t out = 0;
-  for (unsigned i = 0; i < XLEN; i++) if ((b >> i) & 1) out ^= (a >> (XLEN - 1 - i));
-  return out;
-}
-static inline xlen_t xlen_clmulh(xlen_t a, xlen_t b) {
-  xlen_t out = 0;
-  for (unsigned i = 1; i < XLEN; i++) if ((b >> i) & 1) out ^= (a >> (XLEN - i));
-  return out;
-}
-
-void Ref_cpu::RV32A() {
-  // pc + 4
-  xlen_t next_pc = state.pc + 4;
-  uint32_t funct5 = BITS(Instruction, 31, 27);
-  uint32_t funct3 = BITS(Instruction, 14, 12);
-  uint32_t reg_d_index = BITS(Instruction, 11, 7);
-  uint32_t reg_a_index = BITS(Instruction, 19, 15);
-  uint32_t reg_b_index = BITS(Instruction, 24, 20);
-
-  const xlen_t reg_rdata1 = state.gpr[reg_a_index];
-  const xlen_t reg_rdata2 = state.gpr[reg_b_index];
-
-#if XLEN == 64
-  const bool dword = funct3 == 3;
-  if (funct3 != 2 && funct3 != 3) {
-    illegal_exception = true;
-    return;
-  }
-#else
-  const bool dword = false;
-  (void)funct3;
-#endif
-  const uint32_t amo_size = dword ? 8 : 4;
-
-  xlen_t v_addr = reg_rdata1;
-  uint32_t p_addr = static_cast<uint32_t>(v_addr);
-
-  if (v_addr % amo_size != 0) {
-    std::cerr << "Misaligned AMO Access! addr: 0x" << std::hex << v_addr << std::endl;
-    exit(-1);
-  }
-
-  const xlen_t amo_mstatus = state.csr[csr_mstatus];
-  const uint32_t amo_eff_priv =
-      (amo_mstatus & MSTATUS_MPRV) ? GET_MPP(amo_mstatus) : privilege;
-  if (satp_enabled(state.csr[csr_satp]) && amo_eff_priv != RISCV_MODE_M) {
-    bool page_fault_1 = !va2pa(p_addr, v_addr, 1);
-    bool page_fault_2 = !va2pa(p_addr, v_addr, 2);
-
-    if (page_fault_1 || page_fault_2) {
-      if (funct5 == 2) {
-        if (page_fault_1) {
-          page_fault_load = true;
-        }
-      } else if (funct5 == 3) {
-        if (page_fault_2) {
-          page_fault_store = true;
-        }
-      } else {
-        page_fault_store = true;
-      }
-    }
-
-    if (page_fault_load || page_fault_store) {
-      exception(v_addr);
-      return;
-    }
-  } else {
-    p_addr = bare_pa(v_addr);
-  }
-  if (!is_ram_range(p_addr, amo_size)) {
-    is_io = true;
-  }
-  check_mem_range_or_log("amo", p_addr, amo_size);
-
-  if (funct5 != 2) {
-    state.store = true;
-    state.store_addr = p_addr;
-    state.store_strb = dword ? 0xFF : 0b1111;
-  }
-  // old memory value, as the register image (sign-extended for .w) and as raw bits
-  xlen_t old_val;
-  if (dword) {
-    old_val = (static_cast<xlen_t>(load_word(p_addr + 4)) << 32) | load_word(p_addr);
-  } else {
-    old_val = sext32(load_word(p_addr));
-  }
-  const xlen_t operand = dword ? reg_rdata2 : sext32(static_cast<uint32_t>(reg_rdata2));
-  // signed / unsigned comparison on the memory width
-  const sxlen_t s_old = static_cast<sxlen_t>(old_val), s_op = static_cast<sxlen_t>(operand);
-  const xlen_t u_old = dword ? old_val : (old_val & 0xFFFFFFFFu), u_op = dword ? operand : (operand & 0xFFFFFFFFu);
-  auto set_store = [&](xlen_t v) { state.store_data = dword ? v : (v & 0xFFFFFFFFu); };
-
-  switch (funct5) {
-  case 0: state.gpr[reg_d_index] = old_val; set_store(old_val + operand); break;   // amoadd
-  case 1: state.gpr[reg_d_index] = old_val; set_store(operand); break;             // amoswap
-  case 2: {                                                                        // lr
-    state.gpr[reg_d_index] = old_val;
-    state.reserve_valid = true;
-    state.reserve_addr = p_addr;
-    break;
-  }
-  case 3: { // sc
-    if (state.reserve_valid && state.reserve_addr == p_addr) {
-      set_store(operand);
-      state.gpr[reg_d_index] = 0; // Success
-    } else {
-      state.gpr[reg_d_index] = 1; // Fail
-      state.store = false;        // Don't perform the write
-    }
-    state.reserve_valid = false; // Regardless of success, invalidate reservation
-    break;
-  }
-  case 4: state.gpr[reg_d_index] = old_val; set_store(old_val ^ operand); break;   // amoxor
-  case 8: state.gpr[reg_d_index] = old_val; set_store(old_val | operand); break;   // amoor
-  case 12: state.gpr[reg_d_index] = old_val; set_store(old_val & operand); break;  // amoand
-  case 16: state.gpr[reg_d_index] = old_val; set_store(s_old > s_op ? operand : old_val); break;  // amomin
-  case 20: state.gpr[reg_d_index] = old_val; set_store(s_old > s_op ? old_val : operand); break;  // amomax
-  case 24: state.gpr[reg_d_index] = old_val; set_store(u_old < u_op ? old_val : operand); break;  // amominu
-  case 28: state.gpr[reg_d_index] = old_val; set_store(u_old > u_op ? old_val : operand); break;  // amomaxu
-  default: {
-    illegal_exception = true;
-    break;
-  }
-  }
-
-  if (illegal_exception) {
-    state.store = false;
-    return;
-  }
-  if (state.store) {
-    store_data();
-  }
-  state.pc = next_pc;
-}
 
 void Ref_cpu::RV32IM() {
   // pc + 4

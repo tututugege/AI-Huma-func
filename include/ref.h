@@ -291,14 +291,14 @@ public:
   // translation or the code memory may have changed.
   struct FastInsn {
     const void *h = nullptr;  // handler (label address)
-    uint32_t imm = 0;
+    xlen_t imm = 0;
     uint8_t op = 0, rd = 0, rs1 = 0, rs2 = 0;
   };
   static constexpr uint32_t kMaxBlockOps = 32;
   static constexpr uint32_t kFastBlocks = 16384;
   struct FastBlock {
     uint64_t ctx = 0;  // (satp << 32) | (privilege << 30) | epoch; 0 = invalid
-    xlen_t pc = 0; uint32_t n = 0;  // n = instructions executed by a full run (the end pseudo-op is not counted)
+    xlen_t pc = 0, satp = 0; uint32_t n = 0;  // (rv64: satp does not fit the ctx word) n = instructions executed by a full run (the end pseudo-op is not counted)
     FastInsn ops[kMaxBlockOps + 1];
   };
   std::vector<FastBlock> fblocks;
@@ -340,7 +340,7 @@ public:
   uint32_t current_bb_len;
 
   // PC 到 SimPoint ID 的映射 (PC -> ID)
-  std::unordered_map<uint32_t, uint32_t> global_pc_to_id;
+  std::unordered_map<xlen_t, uint32_t> global_pc_to_id;
   uint32_t next_bb_id = 1; // ID 从 1 开始分配
   std::vector<uint64_t> bbv_counts;
   std::ofstream bbv_file;
