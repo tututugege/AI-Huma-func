@@ -1,0 +1,63 @@
+# Applied on top of `make ARCH=riscv tinyconfig` (Linux 5.15.x)
+
+# --- ISA / platform: rv64ima, Sv39 MMU, UP ---
+# CONFIG_ARCH_RV32I is not set
+CONFIG_ARCH_RV64I=y
+CONFIG_64BIT=y
+CONFIG_MMU=y
+# CONFIG_RISCV_ISA_C is not set
+# CONFIG_FPU is not set
+# CONFIG_SMP is not set
+# CONFIG_RELOCATABLE is not set
+CONFIG_RISCV_SBI=y
+CONFIG_SOC_VIRT=y
+
+# --- core kernel (glibc + busybox need these) ---
+CONFIG_PRINTK=y
+CONFIG_BUG=y
+CONFIG_BASE_FULL=y
+CONFIG_MULTIUSER=y
+CONFIG_FUTEX=y
+CONFIG_EPOLL=y
+CONFIG_POSIX_TIMERS=y
+CONFIG_FILE_LOCKING=y
+CONFIG_ADVISE_SYSCALLS=y
+CONFIG_SHMEM=y
+CONFIG_SLUB=y
+# CONFIG_SLOB is not set
+CONFIG_BINFMT_ELF=y
+CONFIG_BINFMT_SCRIPT=y
+
+# --- boot: external initramfs + devicetree ---
+CONFIG_OF=y
+CONFIG_BLK_DEV_INITRD=y
+CONFIG_DEVTMPFS=y
+CONFIG_DEVTMPFS_MOUNT=y
+CONFIG_TMPFS=y
+CONFIG_PROC_FS=y
+CONFIG_SYSFS=y
+
+# --- the only driver: ns16550 console ---
+CONFIG_TTY=y
+CONFIG_SERIAL_8250=y
+CONFIG_SERIAL_8250_CONSOLE=y
+CONFIG_SERIAL_8250_NR_UARTS=1
+CONFIG_SERIAL_8250_RUNTIME_UARTS=1
+CONFIG_SERIAL_OF_PLATFORM=y
+CONFIG_SERIAL_EARLYCON=y
+
+# --- EFI default-y selects RISCV_ISA_C; we have no UEFI ---
+# CONFIG_EFI is not set
+
+# --- STRICT_KERNEL_RWX pads each segment to 4MB (Image 21MB); not needed ---
+# CONFIG_STRICT_KERNEL_RWX is not set
+# CONFIG_STRICT_MODULE_RWX is not set
+
+# --- initrd is an uncompressed cpio ---
+# CONFIG_RD_GZIP is not set
+# CONFIG_RD_BZIP2 is not set
+# CONFIG_RD_LZMA is not set
+# CONFIG_RD_XZ is not set
+# CONFIG_RD_LZO is not set
+# CONFIG_RD_LZ4 is not set
+# CONFIG_RD_ZSTD is not set
