@@ -28,3 +28,14 @@ function-model 对不在白名单里的 CSR 陷入非法指令，Spike 实现这
 
 1. **`timer-interrupt-mask`：`mip.MTIP`。** function-model 由 `mtimecmp` 合成 `MTIP`，Spike 没有这个平台的定时器，读 `mip` 得到 0。对比时应以 function-model 为准。
 2. **`software-interrupt-vectored`：`mip.MSIP`。** 同上，软件中断源在平台里，不在 Spike 里。
+
+## RV64（2026-11-11，`exp/rv64`）
+
+`XLEN=64 bash scripts/build_spike.sh` 构建 rv64 的 Spike 对拍版本（Spike 的 ISA 为 `rv64imab_zbc_zbkb_zbkx`，Sv39，无 PMP）。
+`tests/rv64/run.sh <工作目录>` 一次完成：构建、生成并编译定向测试、用 `--diff` 逐条对比。
+
+- `tests/rv64/gen_isa.py`：约 33 万条指令的 rv64imab 定向测试（所有 R/I 型运算、W 类、Zba/Zbb/Zbs/Zbc/Zbkb、乘除边界、`ld/sd/lwu`、`amo*.d`、`lr/sc.d`、分支），每条指令之后由 Spike 逐条比对全部寄存器和 CSR。
+- `tests/rv64/gen_sv39.py`：Sv39 定向测试：16 种叶子 PTE（权限、A/D、保留位、U 位、W-only）、2 MiB 和 1 GiB 超页（对齐和不对齐）、非规范地址及其别名、MPRV + S/U 数据特权 × SUM × MXR、经 `mret` 进入 S/U 的取指，陷入后继续。
+- 测试有效性用变异检查：在模型的页表遍历里分别去掉 SUM、A、D、X 取指、保留位、规范地址、W-only、超页对齐、MXR、U 位检查，九个变异全部被 Spike 对拍抓到。
+- 结果：rv64 下 cpu-tests（排除浮点、`load-store`、`string`、`bitmanip-boundary`）加上述两个定向测试，只剩两个已知的平台差异（`software-interrupt-vectored` 的 MSIP、`timer-interrupt-mask` 的 MTIP）；rv32 默认构建的对拍结果与改动前一致。
+- `bitmanip-boundary` 的汇编里写死了 rv32 的 `rev8` 编码（0x698），在 rv64 上是非法指令，需要为 rv64 另写；Linux 启动对拍、BBV/检查点、快速路径还没有 rv64 版本。

@@ -6,6 +6,8 @@ LIBHDR = $(wildcard include/*.h) $(wildcard include/api/*.h)
 CXXINCLUDE = -I./include -I./include/api -I./lib/include/
 CXXFLAGS = -O3 -march=native -funroll-loops -mtune=native -std=c++2a
 CXXFLAGS += -MMD -MP
+XLEN ?= 32
+CXXFLAGS += -DXLEN=$(XLEN)
 SPIKE ?= 0
 SOFTFLOAT_LIB ?= ./lib/softfloat/softfloat.a
 

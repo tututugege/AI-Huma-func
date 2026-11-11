@@ -1,5 +1,6 @@
 #pragma once
 #include "RISCV.h"
+#include "xlen.h"
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
@@ -164,12 +165,12 @@ struct SimConfig {
 };
 
 typedef struct CPU_state {
-  uint32_t gpr[32];
-  uint32_t csr[21];
-  uint32_t pc;
+  xlen_t gpr[32];
+  xlen_t csr[21];
+  xlen_t pc;
 
-  uint32_t store_addr;
-  uint32_t store_data;
+  uint32_t store_addr;  // physical address (the SoC's physical space is below 4 GiB)
+  xlen_t store_data;
   uint32_t store_strb;
   bool store;
   bool reserve_valid;
@@ -179,7 +180,7 @@ typedef struct CPU_state {
 struct ReadOverride {
   bool valid = false;
   uint32_t address = 0;
-  uint32_t value = 0;
+  xlen_t value = 0;
 };
 
 class Ref_cpu {
@@ -249,12 +250,12 @@ public:
   void checkpoint_mmio_write_backing(uint32_t word_addr, uint32_t data);
   void checkpoint_mmio_sync_devices();
   void exec(const SimConfig &config);
-  bool va2pa(uint32_t &p_addr, uint32_t v_addr, uint32_t type);
-  bool va2pa_walk(uint32_t &p_addr, uint32_t v_addr, uint32_t type);
+  bool va2pa(uint32_t &p_addr, xlen_t v_addr, uint32_t type);
+  bool va2pa_walk(uint32_t &p_addr, xlen_t v_addr, uint32_t type);
   // Software TLB over va2pa_walk.  The walk is a pure function of (satp, mstatus MXR/SUM/MPRV/MPP, privilege,
   // v_addr, type, page-table memory), so a cached result stays exact as long as no page-table word changed: every
   // physical page a walk read is marked, any store into a marked page (and any bulk write to memory) flushes the TLB.
-  struct TlbEntry { uint32_t epoch, vpn, satp, frame, ctx; };
+  struct TlbEntry { uint32_t epoch; uint64_t vpn; xlen_t satp; uint32_t frame, ctx; };
   static constexpr uint32_t kTlbSize = 1024;
   TlbEntry tlb[kTlbSize] = {};
   uint32_t tlb_epoch = 1;
@@ -297,7 +298,7 @@ public:
   static constexpr uint32_t kFastBlocks = 16384;
   struct FastBlock {
     uint64_t ctx = 0;  // (satp << 32) | (privilege << 30) | epoch; 0 = invalid
-    uint32_t pc = 0, n = 0;  // n = instructions executed by a full run (the end pseudo-op is not counted)
+    xlen_t pc = 0; uint32_t n = 0;  // n = instructions executed by a full run (the end pseudo-op is not counted)
     FastInsn ops[kMaxBlockOps + 1];
   };
   std::vector<FastBlock> fblocks;
@@ -310,12 +311,15 @@ public:
   template <bool U, bool DX>
   void fast_run_impl(uint32_t &finished_intervals, uint64_t budget, uint32_t mip_eff, bool stop_iv, bool bbv, bool trk);
   void RISCV();
-  void FORCE_INLINE RV32IM();
+  void FORCE_INLINE RV32IM();  // RV32IM, and RV64IM + Zba/Zbb/Zbs when XLEN=64
   __attribute__((noinline)) void RV32A();  // cold: keeps RISCV()'s frame small
   __attribute__((noinline)) void RV32CSR();  // cold: keeps RISCV()'s frame small
-  __attribute__((noinline)) void RV32Zfinx();  // cold: keeps RISCV()'s frame small
-  void exception(uint32_t trap_val);
+#if XLEN == 32
+  __attribute__((noinline)) void RV32Zfinx();  // cold: keeps RISCV()'s frame small (rv32 only; rv64 has no Zfinx)
+#endif
+  void exception(xlen_t trap_val);
   void store_data();
+  void store_data_word();  // one aligned-word write (store_strb <= 4 bytes)
   uint32_t load_word(uint32_t addr) const;
   void store_word(uint32_t addr, uint32_t data);
   uint32_t visible_mip() const;
@@ -332,7 +336,7 @@ public:
   const uint64_t INTERVAL_SIZE = interval_from_env();
   uint64_t interval_inst_count = 0;
 
-  uint32_t current_bb_head_pc; // 当前基本块的入口 PC
+  xlen_t current_bb_head_pc; // 当前基本块的入口 PC
   uint32_t current_bb_len;
 
   // PC 到 SimPoint ID 的映射 (PC -> ID)

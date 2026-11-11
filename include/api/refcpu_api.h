@@ -3,15 +3,25 @@
 #include <cstddef>
 #include <cstdint>
 
+// Register width of the model this header is used with: build with -DXLEN=64 for rv64 (default 32, rv32).
+#ifndef XLEN
+#define XLEN 32
+#endif
+#if XLEN == 64
+typedef uint64_t refcpu_xlen_t;
+#else
+typedef uint32_t refcpu_xlen_t;
+#endif
+
 struct RefCpuContext;
 
 struct RefCpuState {
-  uint32_t gpr[32];
-  uint32_t csr[21];
-  uint32_t pc;
+  refcpu_xlen_t gpr[32];
+  refcpu_xlen_t csr[21];
+  refcpu_xlen_t pc;
 
   uint32_t store_addr;
-  uint32_t store_data;
+  refcpu_xlen_t store_data;
   uint32_t store_strb;
   bool store;
   uint32_t instruction;
@@ -19,7 +29,7 @@ struct RefCpuState {
   bool page_fault_load;
   bool page_fault_store;
   uint32_t inst_idx;
-  uint32_t commit_pc;
+  refcpu_xlen_t commit_pc;
   bool reserve_valid;
   uint32_t reserve_addr;
   uint8_t privilege;
@@ -69,13 +79,13 @@ void refcpu_set_ref_only(RefCpuContext *ctx, bool enable);
 void refcpu_set_device_effects(RefCpuContext *ctx, bool enable);
 void refcpu_set_interrupt_delivery(RefCpuContext *ctx, bool enable);
 void refcpu_set_next_csr_read(RefCpuContext *ctx, uint32_t csr_addr,
-                              uint32_t value);
-bool refcpu_take_forced_interrupt(RefCpuContext *ctx, uint32_t cause,
+                              refcpu_xlen_t value);
+bool refcpu_take_forced_interrupt(RefCpuContext *ctx, refcpu_xlen_t cause,
                                   uint8_t target_privilege,
                                   uint32_t pending_snapshot);
 void refcpu_set_sim_end(RefCpuContext *ctx, bool value);
 void refcpu_set_sim_time(RefCpuContext *ctx, uint64_t sim_time);
 
 bool refcpu_probe_pc_translation(RefCpuContext *ctx);
-bool refcpu_translate_data(RefCpuContext *ctx, uint32_t v_addr, uint32_t type,
+bool refcpu_translate_data(RefCpuContext *ctx, refcpu_xlen_t v_addr, uint32_t type,
                            uint32_t *p_addr);

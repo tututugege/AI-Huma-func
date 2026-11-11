@@ -32,8 +32,10 @@ public:
   static constexpr uint32_t kAsyncPendingMask =
       MIP_MTIP | MIP_MEIP | MIP_SEIP;
 
-  static reg_t canonical_rv32(uint32_t value) {
-    return static_cast<reg_t>(static_cast<int64_t>(static_cast<int32_t>(value)));
+  // Spike keeps rv32 registers sign-extended to 64 bits; rv64 values are taken as they are.
+  static reg_t canonical_rv32(xlen_t value) {
+    if (XLEN == 64) return static_cast<reg_t>(value);
+    return static_cast<reg_t>(static_cast<int64_t>(static_cast<int32_t>(static_cast<uint32_t>(value))));
   }
 
   std::unique_ptr<sim_t> sim;
@@ -84,8 +86,13 @@ public:
         0x00000297, // 0x1000: auipc t0,0
         0x02828613, // 0x1004: addi a2,t0,40
         0xf1402573, // 0x1008: csrrs a0,mhartid,zero
+#if XLEN == 64
+        0x0202b583, // 0x100c: ld a1,32(t0)
+        0x0182b283, // 0x1010: ld t0,24(t0)
+#else
         0x0202a583, // 0x100c: lw a1,32(t0)
         0x0182a283, // 0x1010: lw t0,24(t0)
+#endif
         0x00028067, // 0x1014: jr              t0
         0x80000000, // 0x1018:
         0x00000000, // 0x101c: padding
@@ -139,7 +146,7 @@ public:
       }
     }
 
-    sim->get_core(0)->set_max_vaddr_bits(32);
+    sim->get_core(0)->set_max_vaddr_bits(XLEN == 64 ? 39 : 32);   // Sv39 / Sv32 only
     // mstatus.SUM / MXR are writable only if the core had an MMU when its status CSRs were built (processor_t::has_mmu): reset it
     // again now that sv32 is enabled, then set the start pc
     sim->get_core(0)->reset();
@@ -221,12 +228,12 @@ public:
     processor_t *p = sim->get_core(0);
     state_t *s = p->get_state();
 
-    bool pc_mismatch = (uint32_t)s->pc != (uint32_t)dut_state.pc;
+    bool pc_mismatch = (xlen_t)s->pc != (xlen_t)dut_state.pc;
     bool reg_mismatch = false;
     bool mismatches[32] = {false};
 
     for (int i = 0; i < 32; ++i) {
-      if ((uint32_t)s->XPR[i] != (uint32_t)dut_state.gpr[i]) {
+      if ((xlen_t)s->XPR[i] != (xlen_t)dut_state.gpr[i]) {
         reg_mismatch = true;
         mismatches[i] = true;
       }
@@ -239,11 +246,11 @@ public:
         0x143, 0x100, 0x104, 0x144, 0x180, 0xf14, 0x301};
     bool csr_mismatch = false;
     bool csr_mismatches[21] = {false};
-    uint32_t ref_csr_vals[21];
-    uint32_t dut_csr_vals[21];
+    xlen_t ref_csr_vals[21];
+    xlen_t dut_csr_vals[21];
 
     for (int i = 0; i < 21; ++i) {
-      ref_csr_vals[i] = (uint32_t)p->get_csr(implemented_csr_addrs[i]);
+      ref_csr_vals[i] = (xlen_t)p->get_csr(implemented_csr_addrs[i]);
       dut_csr_vals[i] = dut_state.csr[i];
     }
     ref_csr_vals[4] &= ~kAsyncPendingMask;
@@ -264,18 +271,18 @@ public:
       // Fetch instructions for context
       uint32_t ref_insn = 0;
       uint32_t dut_insn = 0;
-      uint32_t ref_pc_val = (uint32_t)s->pc;
-      uint32_t dut_pc_val = (uint32_t)dut_state.pc;
+      xlen_t ref_pc_val = (xlen_t)s->pc;
+      xlen_t dut_pc_val = (xlen_t)dut_state.pc;
 
-      auto fetch_insn = [&](uint32_t pc) {
+      auto fetch_insn = [&](xlen_t pc) {
         uint32_t val = 0;
         try {
           // Use Spike's MMU to fetch instruction, handling virtual addresses
           val = p->get_mmu()->load_insn(pc).insn.bits();
         } catch (...) {
           // Fallback to physical load if MMU fetch fails
-          uint32_t phys_pc = pc;
-          if (pc >= 0xc0000000)
+          uint64_t phys_pc = pc;
+          if (pc >= 0xc0000000 && pc < 0x100000000ull)
             phys_pc = pc - 0xc0000000 + 0x80000000;
           if (phys_pc >= 0x80000000 &&
               (phys_pc - 0x80000000 + 4) <= main_mem_ptr->size()) {
@@ -316,14 +323,14 @@ public:
       }
 
       // Print critical CSRs for exception debugging
-      uint32_t mcause = p->get_csr(0x342);
-      uint32_t mepc = p->get_csr(0x341);
-      uint32_t scause = p->get_csr(0x142);
-      uint32_t sepc = p->get_csr(0x141);
-      uint32_t mstatus = p->get_csr(0x300);
-      uint32_t satp = p->get_csr(0x180);
-      uint32_t medeleg = p->get_csr(0x302);
-      uint32_t mideleg = p->get_csr(0x303);
+      xlen_t mcause = p->get_csr(0x342);
+      xlen_t mepc = p->get_csr(0x341);
+      xlen_t scause = p->get_csr(0x142);
+      xlen_t sepc = p->get_csr(0x141);
+      xlen_t mstatus = p->get_csr(0x300);
+      xlen_t satp = p->get_csr(0x180);
+      xlen_t medeleg = p->get_csr(0x302);
+      xlen_t mideleg = p->get_csr(0x303);
       reg_t pmpcfg0 = p->get_csr(0x3A0);
       reg_t pmpaddr0 = p->get_csr(0x3B0);
       uint8_t ref_priv = p->get_state()->prv;
@@ -387,7 +394,7 @@ public:
         }
 
         if (has_vaddr) {
-          if (satp & 0x80000000) {
+          if (XLEN == 32 && (satp & 0x80000000)) {   // debug dump walks Sv32 only
             uint32_t root_ppn = satp & 0x3FFFFF;
             uint32_t vpn1 = (v_addr >> 22) & 0x3FF;
             uint32_t vpn0 = (v_addr >> 12) & 0x3FF;
@@ -458,8 +465,8 @@ public:
                 << std::endl;
 
       for (int i = 0; i < 32; ++i) {
-        uint32_t ref_val = (uint32_t)s->XPR[i];
-        uint32_t dut_val = (uint32_t)dut_state.gpr[i];
+        xlen_t ref_val = (xlen_t)s->XPR[i];
+        xlen_t dut_val = (xlen_t)dut_state.gpr[i];
 
         if (mismatches[i]) {
           std::cout << "\033[1;31m"; // Red for mismatch

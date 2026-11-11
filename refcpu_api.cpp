@@ -251,14 +251,14 @@ void refcpu_set_interrupt_delivery(RefCpuContext *ctx, bool enable) {
 }
 
 void refcpu_set_next_csr_read(RefCpuContext *ctx, uint32_t csr_addr,
-                              uint32_t value) {
+                              refcpu_xlen_t value) {
   if (ctx == nullptr) {
     return;
   }
   ctx->cpu.external_csr_read = {true, csr_addr, value};
 }
 
-bool refcpu_take_forced_interrupt(RefCpuContext *ctx, uint32_t cause,
+bool refcpu_take_forced_interrupt(RefCpuContext *ctx, refcpu_xlen_t cause,
                                   uint8_t target_privilege,
                                   uint32_t pending_snapshot) {
   return ctx != nullptr && ctx->cpu.take_forced_interrupt(
@@ -283,7 +283,7 @@ bool refcpu_probe_pc_translation(RefCpuContext *ctx) {
   if (ctx == nullptr) {
     return false;
   }
-  if ((ctx->cpu.state.csr[csr_satp] & 0x80000000u) == 0 ||
+  if (!satp_enabled(ctx->cpu.state.csr[csr_satp]) ||
       ctx->cpu.privilege == RISCV_MODE_M) {
     return true;
   }
@@ -293,7 +293,7 @@ bool refcpu_probe_pc_translation(RefCpuContext *ctx) {
 
 // Data-side translation probe (no side effects): same decision as the load/store paths
 // in exec.cpp (and the fetch path for type 0). type: 0 = fetch, 1 = load, 2 = store. Returns false on a page fault.
-bool refcpu_translate_data(RefCpuContext *ctx, uint32_t v_addr, uint32_t type,
+bool refcpu_translate_data(RefCpuContext *ctx, refcpu_xlen_t v_addr, uint32_t type,
                            uint32_t *p_addr) {
   uint32_t p = v_addr;
   bool ok = true;
@@ -302,7 +302,7 @@ bool refcpu_translate_data(RefCpuContext *ctx, uint32_t v_addr, uint32_t type,
     const uint32_t eff_priv = (type != 0 && (mstatus & MSTATUS_MPRV))
                                   ? GET_MPP(mstatus)
                                   : ctx->cpu.privilege;
-    if ((ctx->cpu.state.csr[csr_satp] & 0x80000000u) && eff_priv != RISCV_MODE_M) {
+    if (satp_enabled(ctx->cpu.state.csr[csr_satp]) && eff_priv != RISCV_MODE_M) {
       ok = ctx->cpu.va2pa(p, v_addr, type);
     }
   }

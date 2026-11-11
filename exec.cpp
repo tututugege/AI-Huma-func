@@ -358,6 +358,24 @@ static inline void ref_write_timer_value(uint64_t value, uint64_t now) {
   g_ref_timer_offset = value - now;
 }
 
+// Physical address of an untranslated (bare / M-mode) access: this SoC's physical space is below 4 GiB.
+static inline uint32_t bare_pa(xlen_t a) {
+  if (XLEN == 64 && (a >> 32) != 0) {
+    std::cerr << "[RefCPU] untranslated address outside the 32-bit physical space: 0x" << std::hex << a << std::dec << std::endl;
+    exit(-1);
+  }
+  return static_cast<uint32_t>(a);
+}
+
+// The timer registers read the live counters instead of the stored word.
+static inline uint32_t timer_word_override(uint32_t p_addr, uint32_t data, uint64_t now) {
+  if (p_addr == TIMER_BASE) return static_cast<uint32_t>(ref_timer_now(now));
+  if (p_addr == (TIMER_BASE + 4u)) return static_cast<uint32_t>(ref_timer_now(now) >> 32);
+  if (p_addr == (TIMER_BASE + 8u)) return static_cast<uint32_t>(g_ref_timer_cmp);
+  if (p_addr == (TIMER_BASE + 12u)) return static_cast<uint32_t>(g_ref_timer_cmp >> 32);
+  return data;
+}
+
 static inline uint32_t from_f32(float32_t f) { return f.v; }
 
 static inline bool is_nan32(uint32_t v) {
@@ -553,10 +571,20 @@ void Ref_cpu::init(uint32_t reset_pc, const char *image, uint32_t size) {
 
   store_word(0x10000004, 0x00006000); // 和进入 OpenSBI 相关
   if (image != nullptr) {
+#if XLEN == 64
+    // boot ROM: a0 = mhartid, a1 = 0x83e00000, jump to 0x80000000 (lui would sign-extend into the upper 32 bits)
+    store_word(0x0, 0xf1402573);   // csrr a0, mhartid
+    store_word(0x4, 0x41f00593);   // li   a1, 0x41f
+    store_word(0x8, 0x01559593);   // slli a1, a1, 21
+    store_word(0xc, 0x00100293);   // li   t0, 1
+    store_word(0x10, 0x01f29293);  // slli t0, t0, 31
+    store_word(0x14, 0x00028067);  // jr   t0
+#else
     store_word(0x0, 0xf1402573);
     store_word(0x4, 0x83e005b7);
     store_word(0x8, 0x800002b7);
     store_word(0xc, 0x00028067);
+#endif
   }
 
   for (int i = 0; i < 32; i++) {
@@ -565,7 +593,13 @@ void Ref_cpu::init(uint32_t reset_pc, const char *image, uint32_t size) {
   for (int i = 0; i < 21; i++) {
     state.csr[i] = 0;
   }
+#if XLEN == 64
+  state.csr[csr_misa] = (xlen_t(2) << 62) | 0x141103;   // MXL = 2, A B I M S U
+#else
   state.csr[csr_misa] = 0x40141103;
+#endif
+  state.csr[csr_mstatus] = kMstatusReset;
+  state.csr[csr_sstatus] = kMstatusReset & kSstatusMask;
   privilege = 0b11;
 
   state.store = false;
@@ -1225,6 +1259,7 @@ void print_state_digest(uint64_t t, const CPU_state &st, uint8_t priv = 0) {
 
 // Classify an instruction word.  Only exact base-ISA / M encodings are fast; everything else (Zba/Zbb/Zbc/Zbs,
 // CSR, AMO, FP, system, unknown funct3/funct7 combinations) is F_SLOW and goes through RISCV().
+#if XLEN == 32
 void fast_decode(uint32_t in, Ref_cpu::FastInsn &e) {
   e.rd = BITS(in, 11, 7);
   e.rs1 = BITS(in, 19, 15);
@@ -1309,10 +1344,12 @@ void fast_decode(uint32_t in, Ref_cpu::FastInsn &e) {
 inline bool fast_is_control(uint8_t op) { return op >= F_JAL && op <= F_BGEU; }
 // F_CSR also ends a block: afterwards the fast-path assumptions are re-checked
 inline bool fast_ends_block(uint8_t op) { return fast_is_control(op) || op == F_CSR; }
+#endif  // XLEN == 32
 }  // namespace
 
 // Run blocks until an instruction needs the general path, an interrupt could be taken, or the timer deadline is near.
 // U: the privilege is U (basic-block and interval bookkeeping); DX: loads and stores are translated.
+#if XLEN == 32
 template <bool U, bool DX>
 void Ref_cpu::fast_run_impl(uint32_t &finished_intervals, uint64_t budget, uint32_t mip_eff, bool stop_iv, bool bbv,
                             bool trk) {
@@ -1336,7 +1373,7 @@ void Ref_cpu::fast_run_impl(uint32_t &finished_intervals, uint64_t budget, uint3
   uint8_t *const pgf = pt_page_flag.data();
   const uint32_t satp = state.csr[csr_satp];
   const uint32_t priv = privilege;
-  const bool fetch_translate = (satp & 0x80000000) && priv != RISCV_MODE_M;
+  const bool fetch_translate = satp_enabled(satp) && priv != RISCV_MODE_M;
   const uint64_t ctx_base = (static_cast<uint64_t>(satp) << 32) | (static_cast<uint64_t>(priv) << 30);
   const uint32_t maxlen = g_digest_every ? 1u : kMaxBlockOps;
   FastBlock *const blocks = fblocks.data();
@@ -1750,6 +1787,11 @@ out:
   }
 }
 
+#else  // XLEN == 64: no fast path yet (every instruction goes through RISCV())
+void Ref_cpu::fast_run(uint32_t &, uint64_t, bool, bool, bool) {}
+#endif
+
+#if XLEN == 32
 void Ref_cpu::fast_run(uint32_t &finished_intervals, uint64_t cap, bool stop_iv, bool bbv, bool trk) {
   if (sim_time >= MAX_SIM_TIME) {
     return;
@@ -1786,7 +1828,7 @@ void Ref_cpu::fast_run(uint32_t &finished_intervals, uint64_t cap, bool stop_iv,
   }
   const uint32_t mstatus = state.csr[csr_mstatus];
   const uint32_t data_priv = (mstatus & MSTATUS_MPRV) ? GET_MPP(mstatus) : privilege;
-  const bool dx = (state.csr[csr_satp] & 0x80000000) && data_priv != RISCV_MODE_M;
+  const bool dx = satp_enabled(state.csr[csr_satp]) && data_priv != RISCV_MODE_M;
   const bool u = privilege == RISCV_MODE_U;
   if (u) {
     if (dx) fast_run_impl<true, true>(finished_intervals, budget, mip_eff, stop_iv, bbv, trk);
@@ -1797,11 +1839,13 @@ void Ref_cpu::fast_run(uint32_t &finished_intervals, uint64_t cap, bool stop_iv,
   }
 }
 
+#endif  // XLEN == 32 (fast path)
+
 void Ref_cpu::exec(const SimConfig &config) {
   // Initialize Spike Reference Simulator if enabled
 #ifdef ENABLE_SPIKE
   if (config.difftest) {
-    spike_ref = std::make_unique<SpikeRef>("rv32imab_zfinx_zbc_zbkb_zbkx", 0x80000000, 0x80000000,
+    spike_ref = std::make_unique<SpikeRef>(XLEN == 64 ? "rv64imab_zbc_zbkb_zbkx" : "rv32imab_zfinx_zbc_zbkb_zbkx", 0x80000000, 0x80000000,
                                            config.image_file.c_str());
   }
 #else
@@ -2141,20 +2185,20 @@ void Ref_cpu::exec(const SimConfig &config) {
   }
 }
 
-void Ref_cpu::exception(uint32_t trap_val) {
+void Ref_cpu::exception(xlen_t trap_val) {
   is_exception = true;
-  uint32_t next_pc = state.pc + 4;
+  xlen_t next_pc = state.pc + 4;
 
   // 重新获取当前状态（因为exec可能没传进来最新的）
   bool ecall = (Instruction == INST_ECALL);
   bool mret = (Instruction == INST_MRET);
   bool sret = (Instruction == INST_SRET);
 
-  uint32_t mstatus = state.csr[csr_mstatus];
-  uint32_t sstatus = state.csr[csr_sstatus];
-  uint32_t medeleg = state.csr[csr_medeleg];
-  uint32_t mtvec = state.csr[csr_mtvec];
-  uint32_t stvec = state.csr[csr_stvec];
+  xlen_t mstatus = state.csr[csr_mstatus];
+  xlen_t sstatus = state.csr[csr_sstatus];
+  xlen_t medeleg = state.csr[csr_medeleg];
+  xlen_t mtvec = state.csr[csr_mtvec];
+  xlen_t stvec = state.csr[csr_stvec];
 
   // 再次计算 Trap 原因 (与 RISCV() 中逻辑一致，但这里是为了确定是用 MTrap 还是
   // STrap 处理)
@@ -2218,13 +2262,13 @@ void Ref_cpu::exception(uint32_t trap_val) {
   }
   if (MTrap) {
     state.csr[csr_mepc] = state.pc;
-    uint32_t cause = 0;
+    xlen_t cause = 0;
 
     // 计算 MCause
     bool is_interrupt =
         M_software_interrupt || M_timer_interrupt || M_external_interrupt;
     if (is_interrupt)
-      cause |= (1u << 31);
+      cause |= kXlenMsb;
 
     uint32_t exception_code = 0;
     if (M_software_interrupt)
@@ -2262,11 +2306,11 @@ void Ref_cpu::exception(uint32_t trap_val) {
     }
 
     // 向量中断跳转
-    if ((mtvec & 1) && (cause & (1u << 31))) {
-      next_pc = (mtvec & 0xfffffffc) + 4 * (cause & 0x7fffffff);
+    if ((mtvec & 1) && (cause & kXlenMsb)) {
+      next_pc = (mtvec & ~xlen_t(3)) + 4 * (cause & ~kXlenMsb);
     } else {
       next_pc =
-          mtvec & 0xfffffffc; // 这里的MASK可能需要根据Spec确认，通常是清除低2位
+          mtvec & ~xlen_t(3); // 这里的MASK可能需要根据Spec确认，通常是清除低2位
     }
 
     // 更新 mstatus
@@ -2283,19 +2327,19 @@ void Ref_cpu::exception(uint32_t trap_val) {
     // 同步 sstatus (sstatus 是 mstatus 的影子)
     state.csr[csr_mstatus] = mstatus;
     state.csr[csr_sstatus] =
-        mstatus & 0x800DE133; // sstatus is the supervisor-visible view of mstatus
+        mstatus & kSstatusMask; // sstatus is the supervisor-visible view of mstatus
 
     privilege = 3; // Machine Mode
     state.csr[csr_mtval] = trap_val;
 
   } else if (STrap) {
     state.csr[csr_sepc] = state.pc;
-    uint32_t cause = 0;
+    xlen_t cause = 0;
 
     bool is_interrupt =
         S_software_interrupt || S_timer_interrupt || S_external_interrupt;
     if (is_interrupt)
-      cause |= (1u << 31);
+      cause |= kXlenMsb;
 
     uint32_t exception_code = 0;
     if (S_external_interrupt || (ecall && privilege == 1 && medeleg_S_ecall))
@@ -2335,10 +2379,10 @@ void Ref_cpu::exception(uint32_t trap_val) {
                 << std::endl;
     }
 
-    if ((stvec & 1) && (cause & (1u << 31))) {
-      next_pc = (stvec & 0xfffffffc) + 4 * (cause & 0x7fffffff);
+    if ((stvec & 1) && (cause & kXlenMsb)) {
+      next_pc = (stvec & ~xlen_t(3)) + 4 * (cause & ~kXlenMsb);
     } else {
-      next_pc = stvec & 0xfffffffc;
+      next_pc = stvec & ~xlen_t(3);
     }
 
     // 更新 sstatus
@@ -2361,7 +2405,7 @@ void Ref_cpu::exception(uint32_t trap_val) {
     state.csr[csr_sstatus] = sstatus;
     // 更新 mstatus 中对应的位 (SPIE, SIE, SPP 在 mstatus 中也有对应位置)
     // 简单做法：读出改完的 sstatus，把对应位刷回 mstatus
-    uint32_t mask = 0x800DE133;
+    const xlen_t mask = kSstatusMask;
     state.csr[csr_mstatus] =
         (state.csr[csr_mstatus] & ~mask) | (sstatus & mask);
 
@@ -2385,7 +2429,7 @@ void Ref_cpu::exception(uint32_t trap_val) {
 
     state.csr[csr_mstatus] = mstatus;
     // 同步 sstatus
-    state.csr[csr_sstatus] = mstatus & 0x800DE133;
+    state.csr[csr_sstatus] = mstatus & kSstatusMask;
 
     next_pc = state.csr[csr_mepc];
     if (kLogVerboseReturns &&
@@ -2415,7 +2459,7 @@ void Ref_cpu::exception(uint32_t trap_val) {
 
     state.csr[csr_sstatus] = sstatus;
     // 同步回 mstatus
-    uint32_t mask = 0x800DE133;
+    const xlen_t mask = kSstatusMask;
     state.csr[csr_mstatus] =
         (state.csr[csr_mstatus] & ~mask) | (sstatus & mask);
 
@@ -2548,15 +2592,17 @@ void Ref_cpu::RISCV() {
   is_io = false;
   force_sync = false;
 
-  uint32_t p_addr = state.pc;
+  uint32_t p_addr = static_cast<uint32_t>(state.pc);
 
-  if ((state.csr[csr_satp] & 0x80000000) && privilege != RISCV_MODE_M) {
+  if (satp_enabled(state.csr[csr_satp]) && privilege != RISCV_MODE_M) {
     page_fault_inst = !va2pa(p_addr, state.pc, 0);
 
     if (page_fault_inst) {
       exception(state.pc);
       return;
     }
+  } else {
+    p_addr = bare_pa(state.pc);
   }
   if (__builtin_expect(is_ddr_range(p_addr, 4), 1)) {
     Instruction = memory[(p_addr - kRamBase) >> 2];  // same word load_word() returns for DDR
@@ -2591,7 +2637,7 @@ void Ref_cpu::RISCV() {
   }
 
   if (Instruction == INST_EBREAK) {
-    uint32_t exit_code = state.gpr[10]; // a0
+    xlen_t exit_code = state.gpr[10]; // a0
     if (kLogUserTrapSummary && privilege == RISCV_MODE_U) {
       std::cerr << "[RefCPU][U-EBREAK] pc=0x" << std::hex << state.pc
                 << " a0=0x" << exit_code << " sp=0x" << state.gpr[2]
@@ -2699,6 +2745,7 @@ void Ref_cpu::RISCV() {
       exception(Instruction);
       return;
     }
+#if XLEN == 32
   } else if (opcode == number_12_opcode_float ||
              opcode == number_13_opcode_fmadd ||
              opcode == number_14_opcode_fmsub ||
@@ -2709,6 +2756,7 @@ void Ref_cpu::RISCV() {
       exception(Instruction);
       return;
     }
+#endif
   } else {
     RV32IM();
     if (illegal_exception) {
@@ -2721,7 +2769,7 @@ void Ref_cpu::RISCV() {
 
 void Ref_cpu::RV32CSR() {
   // pc + 4
-  uint32_t next_pc = state.pc + 4;
+  xlen_t next_pc = state.pc + 4;
 
   // 使用宏直接提取，无需 copy_indice
   uint32_t rd = BITS(Instruction, 11, 7);
@@ -2730,12 +2778,12 @@ void Ref_cpu::RV32CSR() {
   uint32_t csr_addr = BITS(Instruction, 31, 20);
   uint32_t funct3 = BITS(Instruction, 14, 12);
 
-  uint32_t reg_rdata1 = state.gpr[rs1];
+  xlen_t reg_rdata1 = state.gpr[rs1];
 
   bool we = funct3 == 1 || rs1 != 0;
   bool re = funct3 != 1 || rd != 0;
   uint32_t wcmd = funct3 & 0b11;
-  uint32_t csr_wdata = 0, wdata;
+  xlen_t csr_wdata = 0, wdata;
 
   if (funct3 & 0b100) {
     wdata = rs1;
@@ -2743,7 +2791,7 @@ void Ref_cpu::RV32CSR() {
     wdata = reg_rdata1;
   }
 
-  auto apply_csr_op = [&](uint32_t old_val, uint32_t operand) -> uint32_t {
+  auto apply_csr_op = [&](xlen_t old_val, xlen_t operand) -> xlen_t {
     if (wcmd == CSR_W) {
       return operand;
     }
@@ -2765,6 +2813,7 @@ void Ref_cpu::RV32CSR() {
     return;
   }
 
+#if XLEN == 32
   if (csr_addr == number_fflags || csr_addr == number_frm ||
       csr_addr == number_fcsr) {
     uint32_t old_val = 0;
@@ -2795,6 +2844,8 @@ void Ref_cpu::RV32CSR() {
     return;
   }
 
+#endif
+
   if (csr_addr != number_mtvec && csr_addr != number_mepc &&
       csr_addr != number_mcause && csr_addr != number_mie &&
       csr_addr != number_mip && csr_addr != number_mtval &&
@@ -2817,7 +2868,7 @@ void Ref_cpu::RV32CSR() {
     int csr_idx = cvt_number_to_csr(csr_addr);
     const bool use_external_csr_read =
         external_csr_read.valid && external_csr_read.address == csr_addr;
-    uint32_t observed_csr_value = 0;
+    xlen_t observed_csr_value = 0;
     if (use_external_csr_read) {
       observed_csr_value = external_csr_read.value;
     } else if (csr_addr == number_mip) {
@@ -2838,7 +2889,7 @@ void Ref_cpu::RV32CSR() {
     }
 
     if (we) {
-      uint32_t old_val = observed_csr_value;
+      xlen_t old_val = observed_csr_value;
       if (wcmd == CSR_W) {
         csr_wdata = wdata;
       } else if (wcmd == CSR_S) {
@@ -2850,7 +2901,7 @@ void Ref_cpu::RV32CSR() {
       if (csr_idx == csr_mie || csr_idx == csr_sie) {
         if (csr_idx == csr_sie) {
           // sie: only the bits delegated by mideleg are visible and writable
-          const uint32_t m = delegated_s_bits(state);
+          const xlen_t m = delegated_s_bits(state);
           state.csr[csr_mie] = (state.csr[csr_mie] & ~m) | (csr_wdata & m);
         } else {
           state.csr[csr_mie] = csr_wdata & kMieBits;
@@ -2858,11 +2909,11 @@ void Ref_cpu::RV32CSR() {
         refresh_sie(state);
 
       } else if (csr_idx == csr_mip || csr_idx == csr_sip) {
-        uint32_t mip_mask = 0x00000a2au; // DUT write mask 0xbbb minus MTIP: MTIP is derived from mtimecmp; a sticky copy (written back by csrs mip) caused a timer interrupt storm under OpenSBI
-        const uint32_t sip_mask = delegated_s_bits(state);   // supervisor view: delegated SEIP / STIP / SSIP
+        xlen_t mip_mask = 0x00000a2au; // DUT write mask 0xbbb minus MTIP: MTIP is derived from mtimecmp; a sticky copy (written back by csrs mip) caused a timer interrupt storm under OpenSBI
+        const xlen_t sip_mask = delegated_s_bits(state);   // supervisor view: delegated SEIP / STIP / SSIP
 
         if (csr_idx == csr_sip) {
-          const uint32_t writable = static_cast<uint32_t>(MIP_SSIP) & sip_mask;   // sip: only SSIP, and only if delegated
+          const xlen_t writable = static_cast<uint32_t>(MIP_SSIP) & sip_mask;   // sip: only SSIP, and only if delegated
           state.csr[csr_mip] =
               (state.csr[csr_mip] & ~writable) | (csr_wdata & writable);
         } else {
@@ -2887,8 +2938,8 @@ void Ref_cpu::RV32CSR() {
         }
 
       } else if (csr_idx == csr_mstatus || csr_idx == csr_sstatus) {
-        uint32_t mstatus_mask = 0x807FF9BB; // ~0x7f800644
-        uint32_t sstatus_mask = 0x800DE133;
+        const xlen_t mstatus_mask = kMstatusWmask;
+        const xlen_t sstatus_mask = kSstatusMask;
 
         if (csr_idx == csr_sstatus) {
           // sstatus 写入：仅修改 mstatus 中属于 sstatus 掩码范围内的位
@@ -2906,6 +2957,8 @@ void Ref_cpu::RV32CSR() {
         state.csr[csr_mideleg] = csr_wdata & kSBits;
         refresh_sie(state);
         state.csr[csr_sip] = visible_mip() & delegated_s_bits(state);
+      } else if (csr_idx == csr_satp && XLEN == 64 && (csr_wdata >> 60) != 0 && (csr_wdata >> 60) != 8) {
+        // unsupported translation mode: the write has no effect (Sv48/Sv57 are not implemented)
       } else {
         state.csr[csr_idx] = csr_wdata;
       }
@@ -2918,6 +2971,7 @@ void Ref_cpu::RV32CSR() {
   state.pc = next_pc;
 }
 
+#if XLEN == 32
 void Ref_cpu::RV32Zfinx() {
   uint32_t next_pc = state.pc + 4;
 
@@ -3104,31 +3158,121 @@ void Ref_cpu::RV32Zfinx() {
   state.pc = next_pc;
 }
 
+#endif  // XLEN == 32 (Zfinx)
+
+// ---- XLEN-generic integer helpers (rv32: 32-bit values, rv64: 64-bit values) ----
+static inline xlen_t sext32(uint32_t v) { return static_cast<xlen_t>(static_cast<sxlen_t>(static_cast<int32_t>(v))); }
+static inline xlen_t xlen_rol(xlen_t v, unsigned s) { s &= kShamtMask; return s ? (v << s) | (v >> (XLEN - s)) : v; }
+static inline xlen_t xlen_ror(xlen_t v, unsigned s) { s &= kShamtMask; return s ? (v >> s) | (v << (XLEN - s)) : v; }
+static inline xlen_t xlen_clz(xlen_t v) { return v == 0 ? XLEN : (XLEN == 64 ? __builtin_clzll(v) : __builtin_clz(static_cast<uint32_t>(v))); }
+static inline xlen_t xlen_ctz(xlen_t v) { return v == 0 ? XLEN : (XLEN == 64 ? __builtin_ctzll(v) : __builtin_ctz(static_cast<uint32_t>(v))); }
+static inline xlen_t xlen_cpop(xlen_t v) { return XLEN == 64 ? __builtin_popcountll(v) : __builtin_popcount(static_cast<uint32_t>(v)); }
+static inline xlen_t xlen_rev8(xlen_t v) { return XLEN == 64 ? __builtin_bswap64(v) : __builtin_bswap32(static_cast<uint32_t>(v)); }
+static inline xlen_t xlen_orcb(xlen_t v) {
+  xlen_t r = 0;
+  for (unsigned i = 0; i < XLEN; i += 8) if ((v >> i) & 0xFF) r |= xlen_t(0xFF) << i;
+  return r;
+}
+static inline xlen_t mul_hi_ss(xlen_t a, xlen_t b) {
+#if XLEN == 64
+  return static_cast<xlen_t>((static_cast<__int128>(static_cast<int64_t>(a)) * static_cast<int64_t>(b)) >> 64);
+#else
+  return static_cast<uint32_t>((static_cast<int64_t>(static_cast<int32_t>(a)) * static_cast<int64_t>(static_cast<int32_t>(b))) >> 32);
+#endif
+}
+static inline xlen_t mul_hi_su(xlen_t a, xlen_t b) {
+#if XLEN == 64
+  return static_cast<xlen_t>((static_cast<__int128>(static_cast<int64_t>(a)) * static_cast<__int128>(static_cast<unsigned __int128>(b))) >> 64);
+#else
+  return static_cast<uint32_t>((static_cast<int64_t>(static_cast<int32_t>(a)) * static_cast<int64_t>(static_cast<uint64_t>(b))) >> 32);
+#endif
+}
+static inline xlen_t mul_hi_uu(xlen_t a, xlen_t b) {
+#if XLEN == 64
+  return static_cast<xlen_t>((static_cast<unsigned __int128>(a) * b) >> 64);
+#else
+  return static_cast<uint32_t>((static_cast<uint64_t>(a) * static_cast<uint64_t>(b)) >> 32);
+#endif
+}
+static inline xlen_t xlen_div(sxlen_t a, sxlen_t b) {
+  if (b == 0) return static_cast<xlen_t>(-1);
+  if (a == static_cast<sxlen_t>(kXlenMsb) && b == -1) return static_cast<xlen_t>(a);
+  return static_cast<xlen_t>(a / b);
+}
+static inline xlen_t xlen_rem(sxlen_t a, sxlen_t b) {
+  if (b == 0) return static_cast<xlen_t>(a);
+  if (a == static_cast<sxlen_t>(kXlenMsb) && b == -1) return 0;
+  return static_cast<xlen_t>(a % b);
+}
+static inline xlen_t xlen_divu(xlen_t a, xlen_t b) { return b == 0 ? ~xlen_t(0) : a / b; }
+static inline xlen_t xlen_remu(xlen_t a, xlen_t b) { return b == 0 ? a : a % b; }
+// 32-bit (*W) flavours on rv64: operate on the low 32 bits, results are sign-extended.
+static inline xlen_t w_div(int32_t a, int32_t b) {
+  if (b == 0) return sext32(~0u);
+  if (a == INT32_MIN && b == -1) return sext32(static_cast<uint32_t>(a));
+  return sext32(static_cast<uint32_t>(a / b));
+}
+static inline xlen_t w_rem(int32_t a, int32_t b) {
+  if (b == 0) return sext32(static_cast<uint32_t>(a));
+  if (a == INT32_MIN && b == -1) return 0;
+  return sext32(static_cast<uint32_t>(a % b));
+}
+static inline xlen_t w_divu(uint32_t a, uint32_t b) { return sext32(b == 0 ? ~0u : a / b); }
+static inline xlen_t w_remu(uint32_t a, uint32_t b) { return sext32(b == 0 ? a : a % b); }
+static inline uint32_t w_rol(uint32_t v, unsigned s) { s &= 31; return s ? (v << s) | (v >> (32 - s)) : v; }
+static inline uint32_t w_ror(uint32_t v, unsigned s) { s &= 31; return s ? (v >> s) | (v << (32 - s)) : v; }
+static inline xlen_t xlen_clmul(xlen_t a, xlen_t b) {
+  xlen_t out = 0;
+  for (unsigned i = 0; i < XLEN; i++) if ((b >> i) & 1) out ^= (a << i);
+  return out;
+}
+static inline xlen_t xlen_clmulr(xlen_t a, xlen_t b) {
+  xlen_t out = 0;
+  for (unsigned i = 0; i < XLEN; i++) if ((b >> i) & 1) out ^= (a >> (XLEN - 1 - i));
+  return out;
+}
+static inline xlen_t xlen_clmulh(xlen_t a, xlen_t b) {
+  xlen_t out = 0;
+  for (unsigned i = 1; i < XLEN; i++) if ((b >> i) & 1) out ^= (a >> (XLEN - i));
+  return out;
+}
+
 void Ref_cpu::RV32A() {
   // pc + 4
-  uint32_t next_pc = state.pc + 4;
+  xlen_t next_pc = state.pc + 4;
   uint32_t funct5 = BITS(Instruction, 31, 27);
+  uint32_t funct3 = BITS(Instruction, 14, 12);
   uint32_t reg_d_index = BITS(Instruction, 11, 7);
   uint32_t reg_a_index = BITS(Instruction, 19, 15);
   uint32_t reg_b_index = BITS(Instruction, 24, 20);
 
-  uint32_t reg_rdata1 = state.gpr[reg_a_index];
-  uint32_t reg_rdata2 = state.gpr[reg_b_index];
+  const xlen_t reg_rdata1 = state.gpr[reg_a_index];
+  const xlen_t reg_rdata2 = state.gpr[reg_b_index];
 
-  uint32_t v_addr = reg_rdata1;
-  uint32_t p_addr = v_addr;
+#if XLEN == 64
+  const bool dword = funct3 == 3;
+  if (funct3 != 2 && funct3 != 3) {
+    illegal_exception = true;
+    return;
+  }
+#else
+  const bool dword = false;
+  (void)funct3;
+#endif
+  const uint32_t amo_size = dword ? 8 : 4;
 
-  if (p_addr % 4 != 0) {
-    std::cerr << "Misaligned AMO Access! addr: 0x" << std::hex << v_addr
-              << std::endl;
+  xlen_t v_addr = reg_rdata1;
+  uint32_t p_addr = static_cast<uint32_t>(v_addr);
+
+  if (v_addr % amo_size != 0) {
+    std::cerr << "Misaligned AMO Access! addr: 0x" << std::hex << v_addr << std::endl;
     exit(-1);
   }
 
-  const uint32_t amo_mstatus = state.csr[csr_mstatus];
+  const xlen_t amo_mstatus = state.csr[csr_mstatus];
   const uint32_t amo_eff_priv =
       (amo_mstatus & MSTATUS_MPRV) ? GET_MPP(amo_mstatus) : privilege;
-  if ((state.csr[csr_satp] & 0x80000000) &&
-      amo_eff_priv != RISCV_MODE_M) {
+  if (satp_enabled(state.csr[csr_satp]) && amo_eff_priv != RISCV_MODE_M) {
     bool page_fault_1 = !va2pa(p_addr, v_addr, 1);
     bool page_fault_2 = !va2pa(p_addr, v_addr, 2);
 
@@ -3150,87 +3294,59 @@ void Ref_cpu::RV32A() {
       exception(v_addr);
       return;
     }
+  } else {
+    p_addr = bare_pa(v_addr);
   }
-  if (!is_ram_range(p_addr, 4)) {
+  if (!is_ram_range(p_addr, amo_size)) {
     is_io = true;
   }
-  check_mem_range_or_log("amo", p_addr, 4);
+  check_mem_range_or_log("amo", p_addr, amo_size);
 
   if (funct5 != 2) {
     state.store = true;
     state.store_addr = p_addr;
-    state.store_strb = 0b1111;
+    state.store_strb = dword ? 0xFF : 0b1111;
   }
-  uint32_t old_word = load_word(p_addr);
+  // old memory value, as the register image (sign-extended for .w) and as raw bits
+  xlen_t old_val;
+  if (dword) {
+    old_val = (static_cast<xlen_t>(load_word(p_addr + 4)) << 32) | load_word(p_addr);
+  } else {
+    old_val = sext32(load_word(p_addr));
+  }
+  const xlen_t operand = dword ? reg_rdata2 : sext32(static_cast<uint32_t>(reg_rdata2));
+  // signed / unsigned comparison on the memory width
+  const sxlen_t s_old = static_cast<sxlen_t>(old_val), s_op = static_cast<sxlen_t>(operand);
+  const xlen_t u_old = dword ? old_val : (old_val & 0xFFFFFFFFu), u_op = dword ? operand : (operand & 0xFFFFFFFFu);
+  auto set_store = [&](xlen_t v) { state.store_data = dword ? v : (v & 0xFFFFFFFFu); };
 
   switch (funct5) {
-  case 0: { // amoadd.w
-    state.gpr[reg_d_index] = old_word;
-    state.store_data = old_word + reg_rdata2;
-    break;
-  }
-  case 1: { // amoswap.w
-    state.gpr[reg_d_index] = old_word;
-    state.store_data = reg_rdata2;
-    break;
-  }
-  case 2: { // lr.w
-    state.gpr[reg_d_index] = old_word;
+  case 0: state.gpr[reg_d_index] = old_val; set_store(old_val + operand); break;   // amoadd
+  case 1: state.gpr[reg_d_index] = old_val; set_store(operand); break;             // amoswap
+  case 2: {                                                                        // lr
+    state.gpr[reg_d_index] = old_val;
     state.reserve_valid = true;
     state.reserve_addr = p_addr;
     break;
   }
-  case 3: { // sc.w
+  case 3: { // sc
     if (state.reserve_valid && state.reserve_addr == p_addr) {
-      state.store_data = reg_rdata2;
+      set_store(operand);
       state.gpr[reg_d_index] = 0; // Success
     } else {
       state.gpr[reg_d_index] = 1; // Fail
       state.store = false;        // Don't perform the write
     }
-    state.reserve_valid =
-        false; // Regardless of success, invalidate reservation
+    state.reserve_valid = false; // Regardless of success, invalidate reservation
     break;
   }
-  case 4: { // amoxor.w
-    state.gpr[reg_d_index] = old_word;
-    state.store_data = old_word ^ reg_rdata2;
-    break;
-  }
-  case 8: { // amoor.w
-    state.gpr[reg_d_index] = old_word;
-    state.store_data = old_word | reg_rdata2;
-    break;
-  }
-  case 12: { // amoand.w
-    state.gpr[reg_d_index] = old_word;
-    state.store_data = old_word & reg_rdata2;
-    break;
-  }
-  case 16: { // amomin.w
-    state.gpr[reg_d_index] = old_word;
-    state.store_data =
-        ((int32_t)old_word > (int32_t)reg_rdata2) ? reg_rdata2 : old_word;
-    break;
-  }
-  case 20: { // amomax.w
-    state.gpr[reg_d_index] = old_word;
-    state.store_data =
-        ((int32_t)old_word > (int32_t)reg_rdata2) ? old_word : reg_rdata2;
-    break;
-  }
-  case 24: { // amominu.w
-    state.gpr[reg_d_index] = old_word;
-    state.store_data =
-        ((uint32_t)old_word < (uint32_t)reg_rdata2) ? old_word : reg_rdata2;
-    break;
-  }
-  case 28: { // amomaxu.w
-    state.gpr[reg_d_index] = old_word;
-    state.store_data =
-        ((uint32_t)old_word > (uint32_t)reg_rdata2) ? old_word : reg_rdata2;
-    break;
-  }
+  case 4: state.gpr[reg_d_index] = old_val; set_store(old_val ^ operand); break;   // amoxor
+  case 8: state.gpr[reg_d_index] = old_val; set_store(old_val | operand); break;   // amoor
+  case 12: state.gpr[reg_d_index] = old_val; set_store(old_val & operand); break;  // amoand
+  case 16: state.gpr[reg_d_index] = old_val; set_store(s_old > s_op ? operand : old_val); break;  // amomin
+  case 20: state.gpr[reg_d_index] = old_val; set_store(s_old > s_op ? old_val : operand); break;  // amomax
+  case 24: state.gpr[reg_d_index] = old_val; set_store(u_old < u_op ? old_val : operand); break;  // amominu
+  case 28: state.gpr[reg_d_index] = old_val; set_store(u_old > u_op ? old_val : operand); break;  // amomaxu
   default: {
     illegal_exception = true;
     break;
@@ -3249,109 +3365,93 @@ void Ref_cpu::RV32A() {
 
 void Ref_cpu::RV32IM() {
   // pc + 4
-  uint32_t next_pc = state.pc + 4;
+  xlen_t next_pc = state.pc + 4;
   uint32_t opcode = BITS(Instruction, 6, 0);
   uint32_t funct3 = BITS(Instruction, 14, 12);
   uint32_t funct7 = BITS(Instruction, 31, 25);
   uint32_t reg_d_index = BITS(Instruction, 11, 7);
   uint32_t reg_a_index = BITS(Instruction, 19, 15);
   uint32_t reg_b_index = BITS(Instruction, 24, 20);
+  // shift-immediate encodings: rv64 has a 6-bit shamt, so bit 25 belongs to it and only funct7[6:1] selects the operation
+  const uint32_t funct7s = (XLEN == 64) ? (funct7 & ~1u) : funct7;
 
-  uint32_t reg_rdata1 = state.gpr[reg_a_index];
-  uint32_t reg_rdata2 = state.gpr[reg_b_index];
+  const xlen_t reg_rdata1 = state.gpr[reg_a_index];
+  const xlen_t reg_rdata2 = state.gpr[reg_b_index];
+  const sxlen_t s_rdata1 = static_cast<sxlen_t>(reg_rdata1);
+  const sxlen_t s_rdata2 = static_cast<sxlen_t>(reg_rdata2);
+  bool handled = false;   // OP / OP-IMM: set when an encoding selects an implemented operation
+  auto wr = [&](xlen_t v) { state.gpr[reg_d_index] = v; handled = true; };
 
   switch (opcode) {
   case number_0_opcode_lui: { // lui
-    state.gpr[reg_d_index] = immU(Instruction);
+    state.gpr[reg_d_index] = static_cast<xlen_t>(immU(Instruction));
     break;
   }
   case number_1_opcode_auipc: { // auipc
-    bool bit_temp[32];
-    state.gpr[reg_d_index] = immU(Instruction) + state.pc;
+    state.gpr[reg_d_index] = static_cast<xlen_t>(immU(Instruction)) + state.pc;
     break;
   }
   case number_2_opcode_jal: { // jal
     is_br = true;
     br_taken = true;
-    next_pc = state.pc + immJ(Instruction);
+    next_pc = state.pc + static_cast<xlen_t>(immJ(Instruction));
     state.gpr[reg_d_index] = state.pc + 4;
     break;
   }
   case number_3_opcode_jalr: { // jalr
     is_br = true;
     br_taken = true;
-    bool bit_temp[32];
-    next_pc = (reg_rdata1 + immI(Instruction)) & 0xFFFFFFFC;
+    next_pc = (reg_rdata1 + static_cast<xlen_t>(immI(Instruction))) & ~xlen_t(3);
     state.gpr[reg_d_index] = state.pc + 4;
     break;
   }
   case number_4_opcode_beq: { // beq, bne, blt, bge, bltu, bgeu
     is_br = true;
+    bool taken = false;
     switch (funct3) {
-    case 0: { // beq
-      if (reg_rdata1 == reg_rdata2) {
-        br_taken = true;
-        next_pc = (state.pc + immB(Instruction));
-      }
-      break;
+    case 0: taken = reg_rdata1 == reg_rdata2; break;
+    case 1: taken = reg_rdata1 != reg_rdata2; break;
+    case 4: taken = s_rdata1 < s_rdata2; break;
+    case 5: taken = s_rdata1 >= s_rdata2; break;
+    case 6: taken = reg_rdata1 < reg_rdata2; break;
+    case 7: taken = reg_rdata1 >= reg_rdata2; break;
+    default: break;
     }
-    case 1: { // bne
-      if (reg_rdata1 != reg_rdata2) {
-        br_taken = true;
-        next_pc = (state.pc + immB(Instruction));
-      }
-      break;
-    }
-    case 4: { // blt
-      if ((int32_t)reg_rdata1 < (int32_t)reg_rdata2) {
-        br_taken = true;
-        next_pc = (state.pc + immB(Instruction));
-      }
-      break;
-    }
-    case 5: { // bge
-      if ((int32_t)reg_rdata1 >= (int32_t)reg_rdata2) {
-        br_taken = true;
-        next_pc = (state.pc + immB(Instruction));
-      }
-      break;
-    }
-    case 6: { // bltu
-      if ((uint32_t)reg_rdata1 < (uint32_t)reg_rdata2) {
-        br_taken = true;
-        next_pc = (state.pc + immB(Instruction));
-      }
-      break;
-    }
-    case 7: { // bgeu
-      if ((uint32_t)reg_rdata1 >= (uint32_t)reg_rdata2) {
-        br_taken = true;
-        next_pc = (state.pc + immB(Instruction));
-      }
-      break;
-    }
+    if (taken) {
+      br_taken = true;
+      next_pc = state.pc + static_cast<xlen_t>(immB(Instruction));
     }
     break;
   }
-  case number_5_opcode_lb: { // lb, lh, lw, lbu, lhu
-    uint32_t v_addr = reg_rdata1 + immI(Instruction);
-    uint32_t p_addr = v_addr;
-
-    uint32_t size = funct3 & 0b11;
-    uint32_t access_size = (size == 0b00) ? 1 : ((size == 0b01) ? 2 : 4);
-    if ((size == 0b01 && (v_addr % 2 != 0)) ||
-        (size == 0b10 && (v_addr % 4 != 0))) {
-      std::cerr << "Misaligned Load! addr: 0x" << std::hex << v_addr
-                << std::endl;
+  case number_5_opcode_lb: { // lb, lh, lw, lbu, lhu (rv64: ld, lwu)
+    xlen_t v_addr = reg_rdata1 + static_cast<xlen_t>(immI(Instruction));
+    uint32_t p_addr = static_cast<uint32_t>(v_addr);
+    uint32_t access_size;
+    bool is_unsigned = (funct3 & 0b100) != 0;
+#if XLEN == 64
+    switch (funct3) {
+    case 0: case 4: access_size = 1; break;
+    case 1: case 5: access_size = 2; break;
+    case 2: case 6: access_size = 4; break;
+    case 3: access_size = 8; break;
+    default: illegal_exception = true; return;
+    }
+#else
+    const uint32_t size = funct3 & 0b11;
+    access_size = (size == 0b00) ? 1 : ((size == 0b01) ? 2 : 4);
+#endif
+    if (v_addr % access_size != 0) {
+      std::cerr << "Misaligned Load! addr: 0x" << std::hex << v_addr << std::endl;
       exit(-1);
     }
 
-    const uint32_t load_mstatus = state.csr[csr_mstatus];
+    const xlen_t load_mstatus = state.csr[csr_mstatus];
     const uint32_t load_eff_priv =
         (load_mstatus & MSTATUS_MPRV) ? GET_MPP(load_mstatus) : privilege;
-    if ((state.csr[csr_satp] & 0x80000000) &&
-        load_eff_priv != RISCV_MODE_M) {
+    if (satp_enabled(state.csr[csr_satp]) && load_eff_priv != RISCV_MODE_M) {
       page_fault_load = !va2pa(p_addr, v_addr, 1);
+    } else {
+      p_addr = bare_pa(v_addr);
     }
 
     if (!is_ram_range(p_addr, access_size)) {
@@ -3361,75 +3461,73 @@ void Ref_cpu::RV32IM() {
     if (page_fault_load) {
       exception(v_addr);
       return;
-
-    } else {
-      check_mem_range_or_log("load", p_addr, access_size);
-      uint32_t data = load_word(p_addr);
-      const uint32_t raw_word = data;
-      uint32_t offset = p_addr & 0b11;
-      uint32_t size = funct3 & 0b11;
-      uint32_t sign = 0, mask;
-      data = data >> (offset * 8);
-      if (size == 0) {
-        mask = 0xFF;
-        if (data & 0x80)
-          sign = 0xFFFFFF00;
-      } else if (size == 0b01) {
-        mask = 0xFFFF;
-        if (data & 0x8000)
-          sign = 0xFFFF0000;
-      } else {
-        mask = 0xFFFFFFFF;
-      }
-
-      data = data & mask;
-
-      // 有符号数
-      if (!(funct3 & 0b100)) {
-        data = data | sign;
-      }
-
-      if (p_addr >= UART_BASE && p_addr < (UART_BASE + UART_MMIO_SIZE)) {
-        trace_uart_load(sim_time, state.pc, p_addr, static_cast<uint8_t>(funct3),
-                        raw_word, data);
-      }
-
-      if (device_effects_enable && p_addr == TIMER_BASE) {
-        data = static_cast<uint32_t>(ref_timer_now(sim_time));
-      }
-      if (device_effects_enable && p_addr == (TIMER_BASE + 4u)) {
-        data = static_cast<uint32_t>(ref_timer_now(sim_time) >> 32);
-      }
-      if (device_effects_enable && p_addr == (TIMER_BASE + 8u)) {
-        data = static_cast<uint32_t>(g_ref_timer_cmp);
-      }
-      if (device_effects_enable && p_addr == (TIMER_BASE + 12u)) {
-        data = static_cast<uint32_t>(g_ref_timer_cmp >> 32);
-      }
-
-      state.gpr[reg_d_index] = data;
     }
+    check_mem_range_or_log("load", p_addr, access_size);
+    xlen_t data;
+    if (access_size == 8) {
+      uint32_t lo = load_word(p_addr), hi = load_word(p_addr + 4);
+      if (device_effects_enable) {
+        lo = timer_word_override(p_addr, lo, sim_time);
+        hi = timer_word_override(p_addr + 4, hi, sim_time);
+      }
+      data = (static_cast<xlen_t>(hi) << 32) | lo;
+    } else {
+      uint32_t word = load_word(p_addr);
+      const uint32_t raw_word = word;
+      word >>= (p_addr & 0b11) * 8;
+      uint32_t mask = access_size == 1 ? 0xFFu : (access_size == 2 ? 0xFFFFu : 0xFFFFFFFFu);
+      word &= mask;
+      if (is_unsigned) {
+        data = word;   // lbu, lhu, lwu
+      } else if (access_size == 1) {
+        data = static_cast<xlen_t>(static_cast<sxlen_t>(static_cast<int8_t>(word)));
+      } else if (access_size == 2) {
+        data = static_cast<xlen_t>(static_cast<sxlen_t>(static_cast<int16_t>(word)));
+      } else {
+        data = sext32(word);   // lw
+      }
+      if (p_addr >= UART_BASE && p_addr < (UART_BASE + UART_MMIO_SIZE)) {
+        trace_uart_load(sim_time, state.pc, p_addr, static_cast<uint8_t>(funct3), raw_word,
+                        static_cast<uint32_t>(data));
+      }
+      if (device_effects_enable) {
+        const uint32_t ov = timer_word_override(p_addr, static_cast<uint32_t>(data), sim_time);
+        if (ov != static_cast<uint32_t>(data)) data = is_unsigned ? static_cast<xlen_t>(ov) : sext32(ov);
+      }
+    }
+    state.gpr[reg_d_index] = data;
     break;
   }
-  case number_6_opcode_sb: { // sb, sh, sw
-
-    uint32_t v_addr = reg_rdata1 + immS(Instruction);
-    uint32_t p_addr = v_addr;
-    uint32_t access_size = (funct3 == 0b00) ? 1 : ((funct3 == 0b01) ? 2 : 4);
-
-    if ((funct3 == 0b01 && (v_addr % 2 != 0)) ||
-        (funct3 == 0b10 && (v_addr % 4 != 0))) {
-      std::cerr << "Misaligned Store! addr: 0x" << std::hex << v_addr
-                << std::endl;
+  case number_6_opcode_sb: { // sb, sh, sw (rv64: sd)
+    xlen_t v_addr = reg_rdata1 + static_cast<xlen_t>(immS(Instruction));
+    uint32_t p_addr = static_cast<uint32_t>(v_addr);
+    uint32_t access_size;
+    switch (funct3) {
+    case 0: access_size = 1; break;
+    case 1: access_size = 2; break;
+    case 2: access_size = 4; break;
+#if XLEN == 64
+    case 3: access_size = 8; break;
+#endif
+    default:
+#if XLEN == 64
+      illegal_exception = true; return;
+#else
+      access_size = 4; break;
+#endif
+    }
+    if (v_addr % access_size != 0) {
+      std::cerr << "Misaligned Store! addr: 0x" << std::hex << v_addr << std::endl;
       exit(-1);
     }
 
-    const uint32_t store_mstatus = state.csr[csr_mstatus];
+    const xlen_t store_mstatus = state.csr[csr_mstatus];
     const uint32_t store_eff_priv =
         (store_mstatus & MSTATUS_MPRV) ? GET_MPP(store_mstatus) : privilege;
-    if ((state.csr[csr_satp] & 0x80000000) &&
-        store_eff_priv != RISCV_MODE_M) {
+    if (satp_enabled(state.csr[csr_satp]) && store_eff_priv != RISCV_MODE_M) {
       page_fault_store = !va2pa(p_addr, v_addr, 2);
+    } else {
+      p_addr = bare_pa(v_addr);
     }
 
     if (!is_ram_range(p_addr, access_size)) {
@@ -3439,330 +3537,236 @@ void Ref_cpu::RV32IM() {
     if (page_fault_store) {
       exception(v_addr);
       return;
-    } else {
-      check_mem_range_or_log("store", p_addr, access_size);
-
-      state.store = true;
-      state.store_addr = p_addr;
-      state.store_data = reg_rdata2;
-      if (funct3 == 0b00) {
-        state.store_strb = 0b1;
-        state.store_data &= 0xFF;
-      } else if (funct3 == 0b01) {
-        state.store_strb = 0b11;
-        state.store_data &= 0xFFFF;
-      } else {
-        state.store_strb = 0b1111;
-      }
-
-      store_data();
     }
+    check_mem_range_or_log("store", p_addr, access_size);
 
+    state.store = true;
+    state.store_addr = p_addr;
+    state.store_data = reg_rdata2;
+    if (access_size == 1) {
+      state.store_strb = 0b1;
+      state.store_data &= 0xFF;
+    } else if (access_size == 2) {
+      state.store_strb = 0b11;
+      state.store_data &= 0xFFFF;
+    } else if (access_size == 4) {
+      state.store_strb = 0b1111;
+      state.store_data &= 0xFFFFFFFFu;
+    } else {
+      state.store_strb = 0xFF;
+    }
+    store_data();
     break;
   }
-  case number_7_opcode_addi: { // addi, slti, sltiu, xori, ori, andi, slli,
-                               // srli, srai, and Zbb/Zbs Immediates
-    uint32_t imm = immI(Instruction);
-    uint32_t shamt = imm & 0x1F;
+  case number_7_opcode_addi: { // OP-IMM: addi, slti, sltiu, xori, ori, andi, slli, srli, srai, Zbb/Zbs immediates
+    const xlen_t imm = static_cast<xlen_t>(immI(Instruction));
+    const uint32_t shamt = (XLEN == 64) ? BITS(Instruction, 25, 20) : BITS(Instruction, 24, 20);
     switch (funct3) {
-    case 0: { // addi
-      state.gpr[reg_d_index] = reg_rdata1 + imm;
-      break;
-    }
-    case 2: { // slti
-      state.gpr[reg_d_index] = (int32_t)reg_rdata1 < (int32_t)imm ? 1 : 0;
-      break;
-    }
-    case 3: { // sltiu
-      state.gpr[reg_d_index] = (uint32_t)reg_rdata1 < (uint32_t)imm ? 1 : 0;
-      break;
-    }
-    case 4: { // xori
-      state.gpr[reg_d_index] = reg_rdata1 ^ imm;
-      break;
-    }
-    case 6: { // ori
-      state.gpr[reg_d_index] = reg_rdata1 | imm;
-      break;
-    }
-    case 7: { // andi
-      state.gpr[reg_d_index] = reg_rdata1 & imm;
-      break;
-    }
-    case 1: {            // slli, bseti, bclri, binvi, clz, ctz, pcnt, sext
-      if (funct7 == 0) { // slli
-        state.gpr[reg_d_index] = reg_rdata1 << shamt;
-      } else if (funct7 == 0x30) { // Zbb Unary (clz, ctz, pcnt, sext)
-        // For OP-IMM-Unary, rs2 field (shamt) is the differentiator
-        // reg_b_index is extracted from bits 24:20 which IS the shamt field
-        // position So checking reg_b_index is correct.
-        uint32_t sub_op = reg_b_index;
-        if (sub_op == 0) { // clz
-          state.gpr[reg_d_index] =
-              (reg_rdata1 == 0) ? 32 : __builtin_clz(reg_rdata1);
-        } else if (sub_op == 1) { // ctz
-          state.gpr[reg_d_index] =
-              (reg_rdata1 == 0) ? 32 : __builtin_ctz(reg_rdata1);
-        } else if (sub_op == 2) { // pcnt
-          state.gpr[reg_d_index] = __builtin_popcount(reg_rdata1);
-        } else if (sub_op == 4) { // sext.b
-          int32_t byte_val = (int32_t)((int8_t)(reg_rdata1 & 0xFF));
-          state.gpr[reg_d_index] = (uint32_t)byte_val;
-        } else if (sub_op == 5) { // sext.h
-          int32_t half_val = (int32_t)((int16_t)(reg_rdata1 & 0xFFFF));
-          state.gpr[reg_d_index] = (uint32_t)half_val;
-        }
-      } else if (funct7 == 0x14) { // bseti (Zbs)
-        state.gpr[reg_d_index] = reg_rdata1 | (1u << shamt);
-      } else if (funct7 == 0x24) { // bclri (Zbs)
-        state.gpr[reg_d_index] = reg_rdata1 & ~(1u << shamt);
-      } else if (funct7 == 0x34) { // binvi (Zbs)
-        state.gpr[reg_d_index] = reg_rdata1 ^ (1u << shamt);
+    case 0: wr(reg_rdata1 + imm); break;                                   // addi
+    case 2: wr(s_rdata1 < static_cast<sxlen_t>(imm) ? 1 : 0); break;       // slti
+    case 3: wr(reg_rdata1 < imm ? 1 : 0); break;                           // sltiu
+    case 4: wr(reg_rdata1 ^ imm); break;                                   // xori
+    case 6: wr(reg_rdata1 | imm); break;                                   // ori
+    case 7: wr(reg_rdata1 & imm); break;                                   // andi
+    case 1: { // slli, bseti, bclri, binvi, clz, ctz, cpop, sext.b, sext.h
+      if (funct7s == 0) {
+        wr(reg_rdata1 << shamt);
+      } else if (funct7 == 0x30) { // Zbb unary: the rs2 field selects the operation (rv64: shamt[5] must be 0)
+        if (reg_b_index == 0) wr(xlen_clz(reg_rdata1));
+        else if (reg_b_index == 1) wr(xlen_ctz(reg_rdata1));
+        else if (reg_b_index == 2) wr(xlen_cpop(reg_rdata1));
+        else if (reg_b_index == 4) wr(static_cast<xlen_t>(static_cast<sxlen_t>(static_cast<int8_t>(reg_rdata1 & 0xFF))));
+        else if (reg_b_index == 5) wr(static_cast<xlen_t>(static_cast<sxlen_t>(static_cast<int16_t>(reg_rdata1 & 0xFFFF))));
+      } else if (funct7s == 0x14) { // bseti
+        wr(reg_rdata1 | (xlen_t(1) << shamt));
+      } else if (funct7s == 0x24) { // bclri
+        wr(reg_rdata1 & ~(xlen_t(1) << shamt));
+      } else if (funct7s == 0x34) { // binvi
+        wr(reg_rdata1 ^ (xlen_t(1) << shamt));
       }
       break;
     }
-    case 5: {            // srli, srai, rori, bexti, rev8, orcb
-      if (funct7 == 0) { // srli
-        state.gpr[reg_d_index] = (uint32_t)reg_rdata1 >> shamt;
-      } else if (funct7 == 0x20) { // srai
-        state.gpr[reg_d_index] = (int32_t)reg_rdata1 >> shamt;
-      } else if (funct7 == 0x30) { // rori (Zbb)
-        state.gpr[reg_d_index] =
-            (reg_rdata1 >> shamt) | (reg_rdata1 << (32 - shamt));
-      } else if (funct7 == 0x24) { // bexti (Zbs)
-        state.gpr[reg_d_index] = (reg_rdata1 >> shamt) & 1;
-      } else if (funct7 == 0x34) { // rev8 (Zbb) - shamt must be 24?
-        // Spec says rev8 encoding is fixed.
-        // But checking sub_op (shamt/rs2) is valid.
-        // rev8: rs2=24 (11000).
-        if (reg_b_index == 24) {
-          uint32_t x = reg_rdata1;
-          state.gpr[reg_d_index] = ((x & 0xFF) << 24) | ((x & 0xFF00) << 8) |
-                                   ((x & 0xFF0000) >> 8) |
-                                   ((x & 0xFF000000) >> 24);
-        }
-      } else if (funct7 == 0x14) { // orcb (Zbb) - shamt must be 7?
-        if (reg_b_index == 7) {
-          uint32_t x = reg_rdata1;
-          uint32_t res = 0;
-          if (x & 0xFF)
-            res |= 0xFF;
-          if (x & 0xFF00)
-            res |= 0xFF00;
-          if (x & 0xFF0000)
-            res |= 0xFF0000;
-          if (x & 0xFF000000)
-            res |= 0xFF000000;
-          state.gpr[reg_d_index] = res;
-        }
+    case 5: { // srli, srai, rori, bexti, rev8, orc.b
+      if (funct7s == 0) {
+        wr(reg_rdata1 >> shamt);
+      } else if (funct7s == 0x20) {
+        wr(static_cast<xlen_t>(s_rdata1 >> shamt));
+      } else if (funct7s == 0x30) { // rori
+        wr(xlen_ror(reg_rdata1, shamt));
+      } else if (funct7s == 0x24) { // bexti
+        wr((reg_rdata1 >> shamt) & 1);
+      } else if (funct7s == 0x34) { // rev8: rv32 imm = 0x698, rv64 imm = 0x6b8 (shamt = 56)
+        if (reg_b_index == 24 && funct7 == (XLEN == 64 ? 0x35u : 0x34u)) wr(xlen_rev8(reg_rdata1));
+      } else if (funct7s == 0x14) { // orc.b
+        if (reg_b_index == 7) wr(xlen_orcb(reg_rdata1));
       }
       break;
     }
     }
+    if (!handled) illegal_exception = true;   // reserved encoding
     break;
   }
-  case number_8_opcode_add: { // add, sub, sll, slt, sltu, xor, srl, sra, or,
-                              // and
+  case number_8_opcode_add: { // OP: add, sub, sll, slt, sltu, xor, srl, sra, or, and; M; Zba/Zbb/Zbs/Zbc
     if (funct7 == 1) {        // mul div
-      int64_t s1 = (int64_t)(int32_t)reg_rdata1;
-      int64_t s2 = (int64_t)(int32_t)reg_rdata2;
-
-      uint64_t u1 = (uint32_t)reg_rdata1;
-      uint64_t u2 = (uint32_t)reg_rdata2;
-
-      // 获取 32 位操作数
-      int32_t dividend = (int32_t)reg_rdata1;
-      int32_t divisor = (int32_t)reg_rdata2;
-      uint32_t u_dividend = (uint32_t)reg_rdata1;
-      uint32_t u_divisor = (uint32_t)reg_rdata2;
-
       switch (funct3) {
-      case 0: { // mul
-        state.gpr[reg_d_index] = (int32_t)(u1 * u2);
-        break;
-      }
-      case 1: { // mulh
-        state.gpr[reg_d_index] = (uint32_t)((s1 * s2) >> 32);
-        break;
-      }
-      case 2: { // mulsu
-        state.gpr[reg_d_index] = (uint32_t)((s1 * (int64_t)u2) >> 32);
-        break;
-      }
-      case 3: { // mulhu
-        state.gpr[reg_d_index] = (uint32_t)((u1 * u2) >> 32);
-        break;
-      }
-      case 4: { // div (signed)
-        if (divisor == 0) {
-          state.gpr[reg_d_index] = -1; // RISC-V 规定：除以0结果为 -1
-        } else if (dividend == INT32_MIN && divisor == -1) {
-          state.gpr[reg_d_index] =
-              INT32_MIN; // RISC-V 规定：溢出时结果为被除数本身(INT_MIN)
-        } else {
-          state.gpr[reg_d_index] = dividend / divisor;
-        }
-        break;
-      }
-      case 5: { // divu (unsigned)
-        if (u_divisor == 0) {
-          state.gpr[reg_d_index] = 0xFFFFFFFF; // RISC-V 规定：除以0结果为最大值
-        } else {
-          state.gpr[reg_d_index] = u_dividend / u_divisor;
-        }
-        break;
-      }
-      case 6: { // rem (signed)
-        if (divisor == 0) {
-          state.gpr[reg_d_index] = dividend; // RISC-V 规定：除以0，余数为被除数
-        } else if (dividend == INT32_MIN && divisor == -1) {
-          state.gpr[reg_d_index] = 0; // RISC-V 规定：溢出时，余数为 0
-        } else {
-          state.gpr[reg_d_index] = dividend % divisor;
-        }
-        break;
-      }
-      case 7: { // remu (unsigned)
-        if (u_divisor == 0) {
-          state.gpr[reg_d_index] =
-              u_dividend; // RISC-V 规定：除以0，余数为被除数
-        } else {
-          state.gpr[reg_d_index] = u_dividend % u_divisor;
-        }
-        break;
-      }
+      case 0: wr(reg_rdata1 * reg_rdata2); break;               // mul
+      case 1: wr(mul_hi_ss(reg_rdata1, reg_rdata2)); break;     // mulh
+      case 2: wr(mul_hi_su(reg_rdata1, reg_rdata2)); break;     // mulhsu
+      case 3: wr(mul_hi_uu(reg_rdata1, reg_rdata2)); break;     // mulhu
+      case 4: wr(xlen_div(s_rdata1, s_rdata2)); break;          // div
+      case 5: wr(xlen_divu(reg_rdata1, reg_rdata2)); break;     // divu
+      case 6: wr(xlen_rem(s_rdata1, s_rdata2)); break;          // rem
+      case 7: wr(xlen_remu(reg_rdata1, reg_rdata2)); break;     // remu
       }
     } else {
       switch (funct3) {
-      case 0: {            // add, sub
-        if (funct7 == 0) { // add
-          state.gpr[reg_d_index] = reg_rdata1 + reg_rdata2;
-        } else if (funct7 == 0x20) { // sub
-          state.gpr[reg_d_index] = reg_rdata1 - reg_rdata2;
-        }
+      case 0: { // add, sub
+        if (funct7 == 0) wr(reg_rdata1 + reg_rdata2);
+        else if (funct7 == 0x20) wr(reg_rdata1 - reg_rdata2);
         break;
       }
       case 1: { // sll, rol, bclr, bset, binv, clmul
-        uint32_t shift = reg_rdata2 & 0x1F;
-        if (funct7 == 0) { // sll
-          state.gpr[reg_d_index] = reg_rdata1 << shift;
-        } else if (funct7 == 0x30) { // rol (Zbb)
-          state.gpr[reg_d_index] =
-              (reg_rdata1 << shift) | (reg_rdata1 >> (32 - shift));
-        } else if (funct7 == 0x24) { // bclr (Zbs)
-          state.gpr[reg_d_index] = reg_rdata1 & ~(1u << shift);
-        } else if (funct7 == 0x14) { // bset (Zbs)
-          state.gpr[reg_d_index] = reg_rdata1 | (1u << shift);
-        } else if (funct7 == 0x34) { // binv (Zbs)
-          state.gpr[reg_d_index] = reg_rdata1 ^ (1u << shift);
-        } else if (funct7 == 0x05) { // clmul (Zbc)
-          uint32_t output = 0;
-          for (int i = 0; i < 32; i++) {
-            if ((reg_rdata2 >> i) & 1)
-              output ^= (reg_rdata1 << i);
-          }
-          state.gpr[reg_d_index] = output;
-        }
+        const uint32_t shift = reg_rdata2 & kShamtMask;
+        if (funct7 == 0) wr(reg_rdata1 << shift);
+        else if (funct7 == 0x30) wr(xlen_rol(reg_rdata1, shift));
+        else if (funct7 == 0x24) wr(reg_rdata1 & ~(xlen_t(1) << shift));
+        else if (funct7 == 0x14) wr(reg_rdata1 | (xlen_t(1) << shift));
+        else if (funct7 == 0x34) wr(reg_rdata1 ^ (xlen_t(1) << shift));
+        else if (funct7 == 0x05) wr(xlen_clmul(reg_rdata1, reg_rdata2));
         break;
       }
-      case 2: {            // slt, sh1add, clmulr
-        if (funct7 == 0) { // slt
-          state.gpr[reg_d_index] =
-              (int32_t)reg_rdata1 < (int32_t)reg_rdata2 ? 1 : 0;
-        } else if (funct7 == 0x10) { // sh1add (Zba)
-          state.gpr[reg_d_index] = reg_rdata2 + (reg_rdata1 << 1);
-        } else if (funct7 == 0x05) { // clmulr (Zbc)
-          uint32_t output = 0;
-          for (int i = 0; i < 32; i++) {
-            if ((reg_rdata2 >> i) & 1)
-              output ^= (reg_rdata1 >> (31 - i));
-          }
-          state.gpr[reg_d_index] = output;
-        }
+      case 2: { // slt, sh1add, clmulr
+        if (funct7 == 0) wr(s_rdata1 < s_rdata2 ? 1 : 0);
+        else if (funct7 == 0x10) wr(reg_rdata2 + (reg_rdata1 << 1));
+        else if (funct7 == 0x05) wr(xlen_clmulr(reg_rdata1, reg_rdata2));
         break;
       }
-      case 3: {            // sltu, clmulh
-        if (funct7 == 0) { // sltu
-          state.gpr[reg_d_index] =
-              (uint32_t)reg_rdata1 < (uint32_t)reg_rdata2 ? 1 : 0;
-        } else if (funct7 == 0x05) { // clmulh (Zbc)
-          uint32_t output = 0;
-          for (int i = 1; i < 32; i++) {
-            if ((reg_rdata2 >> i) & 1)
-              output ^= (reg_rdata1 >> (32 - i));
-          }
-          state.gpr[reg_d_index] = output;
-        }
+      case 3: { // sltu, clmulh
+        if (funct7 == 0) wr(reg_rdata1 < reg_rdata2 ? 1 : 0);
+        else if (funct7 == 0x05) wr(xlen_clmulh(reg_rdata1, reg_rdata2));
         break;
       }
-      case 4: {            // xor, xnor, min, pack, sh2add
-        if (funct7 == 0) { // xor
-          state.gpr[reg_d_index] = reg_rdata1 ^ reg_rdata2;
-        } else if (funct7 == 0x20) { // xnor (Zbb)
-          state.gpr[reg_d_index] = ~(reg_rdata1 ^ reg_rdata2);
-        } else if (funct7 == 0x10) { // sh2add (Zba)
-          state.gpr[reg_d_index] = reg_rdata2 + (reg_rdata1 << 2);
-        } else if (funct7 == 0x05) { // min (Zbb)
-          state.gpr[reg_d_index] = ((int32_t)reg_rdata1 < (int32_t)reg_rdata2)
-                                       ? reg_rdata1
-                                       : reg_rdata2;
-        } else if (funct7 == 0x04) { // pack (Zbb)
-          state.gpr[reg_d_index] =
-              (reg_rdata1 & 0x0000FFFF) | (reg_rdata2 << 16);
+      case 4: { // xor, xnor, sh2add, min, pack
+        if (funct7 == 0) wr(reg_rdata1 ^ reg_rdata2);
+        else if (funct7 == 0x20) wr(~(reg_rdata1 ^ reg_rdata2));
+        else if (funct7 == 0x10) wr(reg_rdata2 + (reg_rdata1 << 2));
+        else if (funct7 == 0x05) wr((s_rdata1 < s_rdata2) ? reg_rdata1 : reg_rdata2);
+        else if (funct7 == 0x04) {  // pack: low XLEN/2 bits of rs1, low XLEN/2 bits of rs2 above them
+          const xlen_t lo_mask = (xlen_t(1) << (XLEN / 2)) - 1;
+          wr((reg_rdata1 & lo_mask) | (reg_rdata2 << (XLEN / 2)));
         }
         break;
       }
       case 5: { // srl, sra, ror, bext, minu
-        uint32_t shift = reg_rdata2 & 0x1F;
-        if (funct7 == 0) { // srl
-          state.gpr[reg_d_index] = (uint32_t)reg_rdata1 >> shift;
-        } else if (funct7 == 0x20) { // sra
-          state.gpr[reg_d_index] = (int32_t)reg_rdata1 >> shift;
-        } else if (funct7 == 0x30) { // ror (Zbb)
-          state.gpr[reg_d_index] =
-              (reg_rdata1 >> shift) | (reg_rdata1 << (32 - shift));
-        } else if (funct7 == 0x24) { // bext (Zbs)
-          state.gpr[reg_d_index] = (reg_rdata1 >> shift) & 1;
-        } else if (funct7 == 0x05) { // minu (Zbb)
-          state.gpr[reg_d_index] = ((uint32_t)reg_rdata1 < (uint32_t)reg_rdata2)
-                                       ? reg_rdata1
-                                       : reg_rdata2;
-        }
+        const uint32_t shift = reg_rdata2 & kShamtMask;
+        if (funct7 == 0) wr(reg_rdata1 >> shift);
+        else if (funct7 == 0x20) wr(static_cast<xlen_t>(s_rdata1 >> shift));
+        else if (funct7 == 0x30) wr(xlen_ror(reg_rdata1, shift));
+        else if (funct7 == 0x24) wr((reg_rdata1 >> shift) & 1);
+        else if (funct7 == 0x05) wr((reg_rdata1 < reg_rdata2) ? reg_rdata1 : reg_rdata2);
         break;
       }
-      case 6: {            // or, orn, max, sh3add
-        if (funct7 == 0) { // or
-          state.gpr[reg_d_index] = reg_rdata1 | reg_rdata2;
-        } else if (funct7 == 0x20) { // orn (Zbb)
-          state.gpr[reg_d_index] = reg_rdata1 | (~reg_rdata2);
-        } else if (funct7 == 0x05) { // max (Zbb)
-          state.gpr[reg_d_index] = ((int32_t)reg_rdata1 > (int32_t)reg_rdata2)
-                                       ? reg_rdata1
-                                       : reg_rdata2;
-        } else if (funct7 == 0x10) { // sh3add (Zba)
-          state.gpr[reg_d_index] = reg_rdata2 + (reg_rdata1 << 3);
-        }
+      case 6: { // or, orn, max, sh3add
+        if (funct7 == 0) wr(reg_rdata1 | reg_rdata2);
+        else if (funct7 == 0x20) wr(reg_rdata1 | (~reg_rdata2));
+        else if (funct7 == 0x05) wr((s_rdata1 > s_rdata2) ? reg_rdata1 : reg_rdata2);
+        else if (funct7 == 0x10) wr(reg_rdata2 + (reg_rdata1 << 3));
         break;
       }
-      case 7: {            // and, andn, maxu, packh
-        if (funct7 == 0) { // and
-          state.gpr[reg_d_index] = reg_rdata1 & reg_rdata2;
-        } else if (funct7 == 0x20) { // andn (Zbb)
-          state.gpr[reg_d_index] = reg_rdata1 & (~reg_rdata2);
-        } else if (funct7 == 0x05) { // maxu (Zbb)
-          state.gpr[reg_d_index] = ((uint32_t)reg_rdata1 > (uint32_t)reg_rdata2)
-                                       ? reg_rdata1
-                                       : reg_rdata2;
-        } else if (funct7 == 0x04) { // packh (Zbb)
-          state.gpr[reg_d_index] =
-              (reg_rdata1 & 0x000000FF) | ((reg_rdata2 & 0x000000FF) << 8);
-        }
+      case 7: { // and, andn, maxu, packh
+        if (funct7 == 0) wr(reg_rdata1 & reg_rdata2);
+        else if (funct7 == 0x20) wr(reg_rdata1 & (~reg_rdata2));
+        else if (funct7 == 0x05) wr((reg_rdata1 > reg_rdata2) ? reg_rdata1 : reg_rdata2);
+        else if (funct7 == 0x04) wr((reg_rdata1 & 0xFF) | ((reg_rdata2 & 0xFF) << 8));
         break;
       }
       }
     }
+    if (!handled) illegal_exception = true;   // reserved encoding
     break;
   }
+#if XLEN == 64
+  case 0b0011011: { // OP-IMM-32: addiw, slliw, srliw, sraiw, slli.uw, clzw, ctzw, cpopw, roriw
+    const xlen_t imm = static_cast<xlen_t>(immI(Instruction));
+    const uint32_t shamt = BITS(Instruction, 24, 20);
+    const uint32_t a32 = static_cast<uint32_t>(reg_rdata1);
+    switch (funct3) {
+    case 0: state.gpr[reg_d_index] = sext32(static_cast<uint32_t>(reg_rdata1 + imm)); break;   // addiw
+    case 1:
+      if (funct7 == 0) {                                // slliw
+        state.gpr[reg_d_index] = sext32(a32 << shamt);
+      } else if (funct7s == 0x04) {                     // slli.uw (6-bit shamt)
+        state.gpr[reg_d_index] = static_cast<xlen_t>(a32) << BITS(Instruction, 25, 20);
+      } else if (funct7 == 0x30) {
+        if (reg_b_index == 0) state.gpr[reg_d_index] = a32 == 0 ? 32 : __builtin_clz(a32);       // clzw
+        else if (reg_b_index == 1) state.gpr[reg_d_index] = a32 == 0 ? 32 : __builtin_ctz(a32);  // ctzw
+        else if (reg_b_index == 2) state.gpr[reg_d_index] = __builtin_popcount(a32);             // cpopw
+        else illegal_exception = true;
+      } else {
+        illegal_exception = true;
+      }
+      break;
+    case 5:
+      if (funct7 == 0) state.gpr[reg_d_index] = sext32(a32 >> shamt);                            // srliw
+      else if (funct7 == 0x20) state.gpr[reg_d_index] = sext32(static_cast<uint32_t>(static_cast<int32_t>(a32) >> shamt));  // sraiw
+      else if (funct7 == 0x30) state.gpr[reg_d_index] = sext32(w_ror(a32, shamt));               // roriw
+      else illegal_exception = true;
+      break;
+    default: illegal_exception = true; break;
+    }
+    break;
+  }
+  case 0b0111011: { // OP-32: addw, subw, sllw, srlw, sraw, mulw, divw, divuw, remw, remuw, add.uw, shNadd.uw, rolw, rorw, zext.h
+    const uint32_t a32 = static_cast<uint32_t>(reg_rdata1);
+    const uint32_t b32 = static_cast<uint32_t>(reg_rdata2);
+    const uint32_t shift = b32 & 31;
+    if (funct7 == 1) {
+      switch (funct3) {
+      case 0: state.gpr[reg_d_index] = sext32(a32 * b32); break;                                  // mulw
+      case 4: state.gpr[reg_d_index] = w_div(static_cast<int32_t>(a32), static_cast<int32_t>(b32)); break;
+      case 5: state.gpr[reg_d_index] = w_divu(a32, b32); break;
+      case 6: state.gpr[reg_d_index] = w_rem(static_cast<int32_t>(a32), static_cast<int32_t>(b32)); break;
+      case 7: state.gpr[reg_d_index] = w_remu(a32, b32); break;
+      default: illegal_exception = true; break;
+      }
+    } else {
+      switch (funct3) {
+      case 0:
+        if (funct7 == 0) state.gpr[reg_d_index] = sext32(a32 + b32);                              // addw
+        else if (funct7 == 0x20) state.gpr[reg_d_index] = sext32(a32 - b32);                      // subw
+        else if (funct7 == 0x04) state.gpr[reg_d_index] = static_cast<xlen_t>(a32) + reg_rdata2;  // add.uw
+        else illegal_exception = true;
+        break;
+      case 1:
+        if (funct7 == 0) state.gpr[reg_d_index] = sext32(a32 << shift);                           // sllw
+        else if (funct7 == 0x30) state.gpr[reg_d_index] = sext32(w_rol(a32, shift));              // rolw
+        else illegal_exception = true;
+        break;
+      case 2:
+        if (funct7 == 0x10) state.gpr[reg_d_index] = reg_rdata2 + (static_cast<xlen_t>(a32) << 1); // sh1add.uw
+        else illegal_exception = true;
+        break;
+      case 4:
+        if (funct7 == 0x10) state.gpr[reg_d_index] = reg_rdata2 + (static_cast<xlen_t>(a32) << 2); // sh2add.uw
+        else if (funct7 == 0x04) state.gpr[reg_d_index] = sext32((a32 & 0xFFFFu) | (b32 << 16));   // packw (zext.h = packw with rs2 = x0)
+        else illegal_exception = true;
+        break;
+      case 5:
+        if (funct7 == 0) state.gpr[reg_d_index] = sext32(a32 >> shift);                           // srlw
+        else if (funct7 == 0x20) state.gpr[reg_d_index] = sext32(static_cast<uint32_t>(static_cast<int32_t>(a32) >> shift));  // sraw
+        else if (funct7 == 0x30) state.gpr[reg_d_index] = sext32(w_ror(a32, shift));              // rorw
+        else illegal_exception = true;
+        break;
+      case 6:
+        if (funct7 == 0x10) state.gpr[reg_d_index] = reg_rdata2 + (static_cast<xlen_t>(a32) << 3); // sh3add.uw
+        else illegal_exception = true;
+        break;
+      default: illegal_exception = true; break;
+      }
+    }
+    break;
+  }
+#endif
   case number_9_opcode_fence: { // fence, fence.i
     break;
   }
@@ -3875,6 +3879,26 @@ void Ref_cpu::store_word(uint32_t addr, uint32_t data) {
 }
 
 void Ref_cpu::store_data() {
+  if (state.store_strb == 0xFFu) {  // sd / amo*.d: aligned 8 bytes = two word writes
+    const xlen_t d = state.store_data;
+    const uint32_t a = state.store_addr;
+    state.store_addr = a;
+    state.store_data = static_cast<uint32_t>(d);
+    state.store_strb = 0b1111;
+    store_data_word();
+    state.store_addr = a + 4;
+    state.store_data = static_cast<uint32_t>(d >> 32);
+    state.store_strb = 0b1111;
+    store_data_word();
+    state.store_addr = a;   // report the whole store
+    state.store_data = d;
+    state.store_strb = 0xFFu;
+    return;
+  }
+  store_data_word();
+}
+
+void Ref_cpu::store_data_word() {
   uint32_t p_addr = state.store_addr;
   uint32_t write_size =
       (state.store_strb == 0b1) ? 1 : ((state.store_strb == 0b11) ? 2 : 4);
@@ -3885,7 +3909,7 @@ void Ref_cpu::store_data() {
   }
   int offset = p_addr & 0x3;
   uint32_t wstrb = state.store_strb << offset;
-  uint32_t wdata = state.store_data << (offset * 8);
+  uint32_t wdata = static_cast<uint32_t>(state.store_data) << (offset * 8);
   const bool trace_uart =
       p_addr >= UART_BASE && p_addr < (UART_BASE + UART_MMIO_SIZE);
   const uint32_t trace_uart_pc = state.pc;
@@ -3981,17 +4005,17 @@ void Ref_cpu::icache_flush() {
   code_marked.clear();
 }
 
-bool Ref_cpu::va2pa(uint32_t &p_addr, uint32_t v_addr, uint32_t type) {
-  const uint32_t mstatus = state.csr[csr_mstatus];
-  const uint32_t satp = state.csr[csr_satp];
+bool Ref_cpu::va2pa(uint32_t &p_addr, xlen_t v_addr, uint32_t type) {
+  const xlen_t mstatus = state.csr[csr_mstatus];
+  const xlen_t satp = state.csr[csr_satp];
   uint32_t eff_priv = privilege;  // as in va2pa_walk: MPRV applies to everything but instruction fetch
   if (type != 0 && (mstatus & MSTATUS_MPRV)) {
     eff_priv = (mstatus >> MSTATUS_MPP_SHIFT) & 0x3;
   }
   const uint32_t ctx = (type & 3u) | (eff_priv << 2) | ((mstatus & MSTATUS_MXR) ? 16u : 0u) |
                        ((mstatus & MSTATUS_SUM) ? 32u : 0u);
-  const uint32_t vpn = v_addr >> 12;
-  TlbEntry &e = tlb[(vpn ^ (type << 7)) & (kTlbSize - 1)];
+  const uint64_t vpn = v_addr >> 12;
+  TlbEntry &e = tlb[(static_cast<uint32_t>(vpn) ^ (type << 7)) & (kTlbSize - 1)];
   if (e.epoch == tlb_epoch && e.vpn == vpn && e.satp == satp && e.ctx == ctx) {
     p_addr = (e.frame << 12) | (v_addr & 0xFFF);
     return true;
@@ -4007,7 +4031,8 @@ bool Ref_cpu::va2pa(uint32_t &p_addr, uint32_t v_addr, uint32_t type) {
   return true;
 }
 
-bool Ref_cpu::va2pa_walk(uint32_t &p_addr, uint32_t v_addr, uint32_t type) {
+#if XLEN == 32
+bool Ref_cpu::va2pa_walk(uint32_t &p_addr, xlen_t v_addr, uint32_t type) {
   uint32_t mstatus = state.csr[csr_mstatus];
   uint32_t sstatus = state.csr[csr_sstatus];
   uint32_t satp = state.csr[csr_satp];
@@ -4140,3 +4165,79 @@ bool Ref_cpu::va2pa_walk(uint32_t &p_addr, uint32_t v_addr, uint32_t type) {
 
   return false; // 如果 Level 2 还不是叶子节点，则是非法页表
 }
+#else  // XLEN == 64: Sv39
+
+// Three-level page walk (RISC-V privileged spec 4.3.2).  Accessed/dirty bits are not updated by hardware: a leaf with
+// A = 0 (or D = 0 on a store) faults, as in the Sv32 walk.  Physical addresses above 4 GiB are not backed by this SoC
+// and fault.
+bool Ref_cpu::va2pa_walk(uint32_t &p_addr, xlen_t v_addr, uint32_t type) {
+  const xlen_t mstatus = state.csr[csr_mstatus];
+  const xlen_t satp = state.csr[csr_satp];
+  const bool mxr = (mstatus & MSTATUS_MXR) != 0;
+  const bool sum = (mstatus & MSTATUS_SUM) != 0;
+  const bool mprv = (mstatus & MSTATUS_MPRV) != 0;
+  int eff_priv = privilege;
+  if (type != 0 && mprv) {
+    eff_priv = (mstatus >> MSTATUS_MPP_SHIFT) & 0x3;
+  }
+
+  // the virtual address must be sign-extended from bit 38
+  const int64_t top = static_cast<int64_t>(v_addr) >> 38;
+  if (top != 0 && top != -1) {
+    return false;
+  }
+
+  uint64_t table = (satp & 0xFFFFFFFFFFFull) << 12;  // satp.PPN (44 bits)
+  for (int level = 2; level >= 0; --level) {
+    const uint64_t vpn = (v_addr >> (12 + 9 * level)) & 0x1FF;
+    const uint64_t pte_addr = table + vpn * 8;
+    if ((pte_addr >> 32) != 0) {
+      return false;
+    }
+    check_mem_range_or_log("ptw", static_cast<uint32_t>(pte_addr), 8);
+    mark_pt_page(static_cast<uint32_t>(pte_addr));
+    const uint64_t pte = (static_cast<uint64_t>(load_word(static_cast<uint32_t>(pte_addr) + 4)) << 32) |
+                         load_word(static_cast<uint32_t>(pte_addr));
+
+    if (!(pte & PTE_V) || (!(pte & PTE_R) && (pte & PTE_W))) {
+      return false;
+    }
+    if (pte >> 54) {  // reserved bits / Svnapot / Svpbmt are not implemented: must be zero
+      return false;
+    }
+    if (!(pte & PTE_R) && !(pte & PTE_X)) {  // pointer to the next level
+      if (level == 0) {
+        return false;
+      }
+      table = ((pte >> 10) & 0xFFFFFFFFFFFull) << 12;
+      continue;
+    }
+
+    // leaf: permissions
+    if (type == 0 && !(pte & PTE_X)) return false;
+    if (type == 1 && !(pte & PTE_R) && !(mxr && (pte & PTE_X))) return false;
+    if (type == 2 && !(pte & PTE_W)) return false;
+    const bool is_user_page = (pte & PTE_U) != 0;
+    if (eff_priv == 0 && !is_user_page) return false;
+    if (eff_priv == 1 && is_user_page) {
+      if (type == 0 || !sum) return false;
+    }
+    // superpage alignment: the PPN bits below the leaf level must be zero
+    const uint64_t ppn = (pte >> 10) & 0xFFFFFFFFFFFull;
+    if (level > 0 && (ppn & ((1ull << (9 * level)) - 1)) != 0) {
+      return false;
+    }
+    if (!(pte & PTE_A)) return false;
+    if (type == 2 && !(pte & PTE_D)) return false;
+
+    const uint64_t offset_mask = (1ull << (12 + 9 * level)) - 1;
+    const uint64_t pa = ((ppn << 12) & ~offset_mask) | (v_addr & offset_mask);
+    if ((pa >> 32) != 0) {
+      return false;
+    }
+    p_addr = static_cast<uint32_t>(pa);
+    return true;
+  }
+  return false;
+}
+#endif
