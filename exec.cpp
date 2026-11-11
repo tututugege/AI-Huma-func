@@ -2943,8 +2943,8 @@ void Ref_cpu::RV32CSR() {
 
         if (csr_idx == csr_sstatus) {
           // sstatus 写入：仅修改 mstatus 中属于 sstatus 掩码范围内的位
-          state.csr[csr_mstatus] = (state.csr[csr_mstatus] & ~sstatus_mask) |
-                                   (csr_wdata & sstatus_mask);
+          state.csr[csr_mstatus] = (state.csr[csr_mstatus] & ~kSstatusWmask) |
+                                   (csr_wdata & kSstatusWmask);
         } else {
           // mstatus 写入：应用 mstatus 写掩码
           state.csr[csr_mstatus] = (state.csr[csr_mstatus] & ~mstatus_mask) |

@@ -39,3 +39,4 @@ function-model 对不在白名单里的 CSR 陷入非法指令，Spike 实现这
 - 测试有效性用变异检查：在模型的页表遍历里分别去掉 SUM、A、D、X 取指、保留位、规范地址、W-only、超页对齐、MXR、U 位检查，九个变异全部被 Spike 对拍抓到。
 - 结果：rv64 下 cpu-tests（排除浮点、`load-store`、`string`、`bitmanip-boundary`）加上述两个定向测试，只剩两个已知的平台差异（`software-interrupt-vectored` 的 MSIP、`timer-interrupt-mask` 的 MTIP）；rv32 默认构建的对拍结果与改动前一致。
 - `bitmanip-boundary` 的汇编里写死了 rv32 的 `rev8` 编码（0x698），在 rv64 上是非法指令，需要为 rv64 另写；Linux 启动对拍、BBV/检查点、快速路径还没有 rv64 版本。
+- Linux（rv64，`linux/README.md` 的 rv64 镜像）从复位一路启动到登录提示，Spike 逐条对比无不一致（修复 sstatus 写掩码之后；此前 UXL 位被内核写 sstatus 清掉，Spike 保留）。直接启动约 9 分钟里大部分是登录提示后的空转，对拍到登录提示只需几分钟。

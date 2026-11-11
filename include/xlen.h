@@ -27,10 +27,12 @@ inline bool satp_enabled(xlen_t satp) {
 // mstatus / sstatus layouts.  rv64 has no SD tracking here (no F/D yet) and UXL = SXL = 2 (64-bit) are read-only.
 #if XLEN == 64
 constexpr xlen_t kMstatusWmask = 0x00000000007FF9BBull;
-constexpr xlen_t kSstatusMask = 0x00000003000DE133ull;
+constexpr xlen_t kSstatusMask = 0x00000003000DE133ull;    // visible bits (UXL included)
+constexpr xlen_t kSstatusWmask = 0x00000000000DE133ull;   // writable bits: UXL is read-only (64-bit only)
 constexpr xlen_t kMstatusReset = 0x0000000A00000000ull;
 #else
 constexpr xlen_t kMstatusWmask = 0x807FF9BBu;
 constexpr xlen_t kSstatusMask = 0x800DE133u;
+constexpr xlen_t kSstatusWmask = 0x800DE133u;
 constexpr xlen_t kMstatusReset = 0;
 #endif
