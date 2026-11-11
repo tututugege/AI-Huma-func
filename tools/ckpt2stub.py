@@ -31,10 +31,18 @@ def read_checkpoint(path):
     f = gzip.open(path, "rb")
     magic, ver, priv, ram_size, io_count = struct.unpack("<IHHII", f.read(16))
     sdram_size = struct.unpack("<I", f.read(4))[0] if ver >= 3 else 0
-    st = f.read(236)
-    vals = struct.unpack("<32I21I4I??2xI", st[:128 + 84 + 16 + 2 + 2 + 4])
-    gpr, csr = list(vals[0:32]), list(vals[32:53])
-    pc, store_addr, store_data, store_strb, store, reserve_valid, reserve_addr = vals[53:60]
+    global XLEN
+    XLEN = 64 if ver == 4 else 32     # format version 4 = rv64 (CPU_state with 64-bit registers)
+    if XLEN == 64:
+        st = f.read(464)
+        vals = struct.unpack("<32Q21QQI4xQI??2xI", st[:456 + 4])   # gpr, csr, pc, store_addr, store_data, store_strb, store, reserve_valid, reserve_addr
+        gpr, csr = list(vals[0:32]), list(vals[32:53])
+        pc, store_addr, store_data, store_strb, store, reserve_valid, reserve_addr = vals[53:60]
+    else:
+        st = f.read(236)
+        vals = struct.unpack("<32I21I4I??2xI", st[:128 + 84 + 16 + 2 + 2 + 4])
+        gpr, csr = list(vals[0:32]), list(vals[32:53])
+        pc, store_addr, store_data, store_strb, store, reserve_valid, reserve_addr = vals[53:60]
     interval = struct.unpack("<Q", f.read(8))[0]
     left = ram_size + sdram_size
     while left:  # skip the memory (mostly zeros: fast)
@@ -59,9 +67,45 @@ def sw(rs2, rs1, off): return u32((((off >> 5) & 0x7F) << 25) | (rs2 << 20) | (r
 def sb(rs2, rs1, off): return u32((((off >> 5) & 0x7F) << 25) | (rs2 << 20) | (rs1 << 15) | (0 << 12) | ((off & 0x1F) << 7) | 0x23)
 def lr_w(rd, rs1): return u32((0b00010 << 27) | (rs1 << 15) | (2 << 12) | (rd << 7) | 0x2F)
 MRET = 0x30200073
+XLEN = 32
+
+
+def addiw(rd, rs1, imm): return u32(((imm & 0xFFF) << 20) | (rs1 << 15) | (rd << 7) | 0x1B)
+def slli(rd, rs1, sh): return u32((sh << 20) | (rs1 << 15) | (1 << 12) | (rd << 7) | 0x13)
+def lr_d(rd, rs1): return u32((0b00010 << 27) | (rs1 << 15) | (3 << 12) | (rd << 7) | 0x2F)
+
+
+def li64(rd, val):
+    """load a 64-bit constant (the standard lui/addiw/slli/addi expansion)"""
+    val &= (1 << 64) - 1
+    sval = val - (1 << 64) if val >> 63 else val
+    if -(1 << 31) <= sval < (1 << 31):
+        lo = ((sval & 0xFFF) ^ 0x800) - 0x800
+        hi = ((sval - lo) >> 12) & 0xFFFFF
+        out = []
+        if hi:
+            out.append(lui(rd, hi))
+            if lo:
+                out.append(addiw(rd, rd, lo))
+        else:
+            out.append(addi(rd, 0, lo))
+        return out
+    lo = ((sval & 0xFFF) ^ 0x800) - 0x800
+    rest = (sval - lo) >> 12                 # sval = rest * 4096 + lo
+    sh = 12
+    while rest and rest & 1 == 0 and sh < 63:  # fold trailing zeros into one shift
+        rest >>= 1
+        sh += 1
+    out = li64(rd, rest)
+    out.append(slli(rd, rd, sh))
+    if lo:
+        out.append(addi(rd, rd, lo))
+    return out
 
 
 def li(rd, val):
+    if XLEN == 64:
+        return li64(rd, val)
     val = u32(val)
     sval = val - (1 << 32) if val & 0x80000000 else val
     if -2048 <= sval < 2048:
@@ -112,6 +156,8 @@ def build(ck, warn):
     m0 = ck["csr"][CSR_IDX["mstatus"]]
     # after mret: MIE = MPIE, MPIE = 1, MPP = U, privilege = MPP. MIE stays 0 while the program runs.
     x = (m0 & ~(MSTATUS_MIE | MSTATUS_MPIE | MSTATUS_MPP)) | (prio << 11) | (MSTATUS_MPIE if m0 & MSTATUS_MIE else 0)
+    if XLEN == 64:
+        x &= 0xFFFFFFFF   # UXL/SXL (bits 63:32) are read-only
     if prio == 3:
         warn("M-mode checkpoint: mstatus.MPP/MPIE and mepc are not restored exactly (mret overwrites them)")
     csr_prog += li(T0, ck["pc"]) + [csrw(CSR_NUM["mepc"], T0)]
@@ -124,7 +170,7 @@ def build(ck, warn):
     # of instructions that still run (the store itself included, mret included).
     pre = []
     if ck["reserve_valid"]:
-        pre += li(T0, ck["reserve_addr"]) + [lr_w(0, T0)]
+        pre += li(T0, ck["reserve_addr"]) + [lr_w(0, T0)]   # lr.w and lr.d reserve the same granule here
     for i in range(1, 32):
         if i in (T0, T1):
             continue
@@ -153,7 +199,7 @@ def main():
     open(sys.argv[2], "wb").write(b"".join(struct.pack("<I", w) for w in prog))
     for w in warnings:
         print("warning:", w)
-    print("restore program: %d instructions (%d bytes); target pc=0x%08x priv=%d; mtime=%d mtimecmp=0x%x (written %d lower)"
+    print("restore program: %d instructions (%d bytes); target pc=0x%x priv=%d; mtime=%d mtimecmp=0x%x (written %d lower)"
           % (len(prog), 4 * len(prog), info["pc"], info["priv"], info["mtime"], info["cmp"], info["adj"]))
 
 

@@ -10,8 +10,10 @@
 
 namespace {
 constexpr uint32_t CKPT_MAGIC = 0x006d6552u; // "Rem\0" (little-endian)
-constexpr uint16_t CKPT_VERSION = 3u;
-constexpr uint16_t CKPT_VERSION_LEGACY = 2u;
+// Format versions: 2 = rv32 without the SDRAM size field (legacy), 3 = rv32, 4 = rv64 (CPU_state is stored as in memory, with
+// 64-bit registers: its layout depends on XLEN, so the version tells the reader which one to expect).
+constexpr uint16_t CKPT_VERSION = (XLEN == 64) ? 4u : 3u;
+constexpr uint16_t CKPT_VERSION_LEGACY = (XLEN == 64) ? 4u : 2u;
 constexpr uint32_t BOOT_IO_BASE = 0x00000000u;
 constexpr uint32_t BOOT_IO_SIZE = 0x00100000u;
 
@@ -221,7 +223,8 @@ void Ref_cpu::restore_checkpoint(const std::string &filename, bool mem_only) {
   if (checkpoint_version != CKPT_VERSION &&
       checkpoint_version != CKPT_VERSION_LEGACY) {
     std::cerr << "Error: Unsupported checkpoint version: "
-              << checkpoint_version
+              << checkpoint_version << " (this simulator is rv" << XLEN << ": versions "
+              << (XLEN == 64 ? "4" : "2 and 3") << ")"
               << std::endl;
     exit(1);
   }

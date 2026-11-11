@@ -35,3 +35,10 @@ non-zero interrupt-controller ISR).
 libquantum at 60 M and 125 M instructions (S mode, kernel) and 400 M and 700 M (U mode), xalancbmk at 300 M, omnetpp at
 1.5 G: 20 M instructions each, about 38 timer interrupts. Four M-mode checkpoints (OpenSBI): 5 M instructions each,
 identical. A checkpoint at the first instruction of OpenSBI's `_trap_handler` differs, as described above.
+
+## rv64（2026-11-11）
+
+- 检查点格式版本：rv32 为 3（旧的 2 仍可读），**rv64 为 4**：`CPU_state` 按内存布局写出，寄存器是 64 位（464 字节，rv32 是 236 字节），所以两种格式不能互读，版本号让读的一方报错而不是读错。rv64 的模拟器读 rv32 检查点会报 `Unsupported checkpoint version: 3`。
+- `ckpt2stub.py` 按版本号识别 rv64：用 `lui/addiw/slli/addi` 展开 64 位常量（对 4000 个随机和边界值用小模拟器验证过展开结果），`mstatus` 去掉只读的 UXL/SXL（高 32 位）。rv32 检查点生成的恢复程序与改动前逐字节相同。
+- BBV：`global_pc_to_id` 的键改为 `xlen_t`，rv64 的 BBV 文件格式不变（基本块编号）。rv64 Linux（`REF_INTERVAL=100000`）226 个区间，快速路径与 `REF_NO_FAST=1` 的输出逐字节相同。
+- 检查与结果（`frontdoor_check.sh`，每 9973 条比较一次状态摘要）：rv64 Linux 的 3 个 SimPoint 检查点（U 态，pc 在 0x3f…，需要 64 位常量）、3 个 S 态内核检查点（pc = 0xffffffff80…）、1 个 M 态（OpenSBI）检查点，前门恢复与后门恢复都逐个相同（300–501 个摘要）。
