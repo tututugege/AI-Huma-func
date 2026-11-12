@@ -1,203 +1,242 @@
-# RISC-V Full-System Simulator
+# RISC-V Full-System Simulator (function-model)
 
 > 在 AI-Huma 项目里，这个仓库是**架构行为的标准**：trace-model 由它提供执行“事实”，RTL 每提交一条指令都与它逐条对比；它也负责 SPEC 的 BBV / SimPoint / 检查点生成（`scripts/spec/`）。项目总览见总仓库 `README.md` 和 `docs/GUIDE.md`。
 
-这是一个轻量级、高性能的 RISC-V 32位全系统模拟器，支持 RV32IMAB + Zfinx 指令集，并集成了两类 Difftest 能力：
+轻量、高性能的 RISC-V 全系统功能模拟器（M/S/U 三个特权级，Linux 可启动）。寄存器宽度在编译时选择：
 
-- standalone 模式下基于 Spike 的 `--diff`
-- 供主模拟器链接使用的 `librefcpu.a` 静态库接口
+| | rv32（默认，`XLEN=32`） | rv64（`XLEN=64`） |
+|---|---|---|
+| 整数/乘除/原子 | RV32IMA | RV64IMA（含 `*W`、`lwu/ld/sd`、`amo*.d`、`lr/sc.d`） |
+| 位操作 | Zba/Zbb/Zbs、Zbc、Zbkb 的 `pack/packh`（无 `brev8/zip/xperm`），合称 "B" | 同左，另有 `*W` 变体 |
+| 浮点 | **Zfinx**（浮点用整数寄存器，softfloat） | **没有**（F/D 标准浮点之后再做，现在 `OP-FP` 是非法指令） |
+| 压缩指令 C | 无 | 无 |
+| 地址翻译 | Sv32 | Sv39 |
+| 检查点格式 | 版本 3（2 仍可读） | 版本 4 |
+| Spike 对拍 ISA | `rv32imab_zfinx_zbc_zbkb_zbkx` | `rv64imab_zbc_zbkb_zbkx` |
+| Linux | 5.15.170 + OpenSBI，启动到 `rv32 login:` | 同版本内核，启动到 `rv64 login:` |
+
+两个宽度共用同一份源码（`include/xlen.h` 定义 `xlen_t`）；默认的 `XLEN=32` 行为与 rv64 迁移之前一致。物理地址空间两个宽度相同（见下文），不支持 4 GiB 以上的物理地址。
+
+两类 Difftest：
+
+- standalone 模式下基于 Spike 的 `--diff`（见 `docs/SPIKE_DIFFTEST.md`）
+- 供主模拟器链接使用的 `librefcpu.a` 静态库接口（见 `docs/DIFFTEST.md`）
 
 ---
 
-## 🚀 快速开始
+## 快速开始
+
+需要 `g++`（C++20）和 `zlib` 开发库；不带 Spike 的构建不需要别的依赖（SoftFloat 用仓库内的 `lib/softfloat/softfloat.a`）。
 
 ### 1. 编译
-确保您的系统中已安装 `g++` 和 `zlib` 开发库，然后直接运行：
+
 ```bash
-make -j$(nproc)
+make -j4                    # rv32，不带 Spike，产物 a.out
+make no_spike -j4           # 同上，但产物叫 a.out.nospike（脚本和 linux/ 文档里用这个名字）
+make XLEN=64 -j4            # rv64，不带 Spike
+make librefcpu.a            # 给上层主模拟器链接的静态库（不依赖 Spike；XLEN 同样可选）
+make clean                  # 删除 a.out a.out.nospike librefcpu.a *.o *.d
 ```
 
-默认构建是 **不带 Spike**（`SPIKE=0`，可在没有 `libriscv`/`libfesvr` 的环境下编译）。
+注意：
+- **`.o` 文件不区分 XLEN**。在同一目录里切换 `XLEN` 之前必须 `make clean`，否则 rv32 和 rv64 的目标文件会混链（头文件依赖不会感知命令行的 `-DXLEN`）。
+- `make with_spike` 把 Spike 链进 `a.out`，需要 `SPIKE_SRC`（riscv-isa-sim 源码）和 `SPIKE_BUILD`（已构建好的目录），并且会和普通构建共用 `.o`。**推荐改用 `scripts/build_spike.sh`**，它在仓库外目录 `build-spike/` 构建，不污染普通构建：
+  ```bash
+  SPIKE_SRC=<riscv-isa-sim 源码> SPIKE_BUILD=<其构建目录> bash scripts/build_spike.sh             # rv32，产物 build-spike/a.out
+  XLEN=64 SPIKE_SRC=... SPIKE_BUILD=... OUT=build-spike64 bash scripts/build_spike.sh             # rv64
+  ```
+- 不带 Spike 的二进制收到 `--diff` 只打印 warning 并关闭 difftest。
+- SoftFloat：`SPIKE=0` 时链接 `lib/softfloat/softfloat.a`（只有 rv32 的 Zfinx 用到）；如果出现 ABI/行为不兼容，用 Berkeley SoftFloat 重新编译并替换该文件，头文件在 `lib/softfloat/include`。
 
-如需显式切换：
+### 2. 运行
+
+镜像是一个平铺的二进制文件，加载到 DDR 起点 `0x80000000`；复位 PC 为 `0`，那里的启动 stub 跳到 `0x80000000`。
+
 ```bash
-# 带 Spike（产物 a.out）
-make with_spike
-
-# 不带 Spike（产物 a.out.nospike）
-make no_spike
+./a.out --image path/to/image.bin                # 或简写 ./a.out path/to/image.bin（只有一个参数时当作镜像）
 ```
 
-说明：
-- `a.out.nospike` 下如果传 `--diff`，会打印 warning 并自动禁用 difftest。
-- `a.out`（with_spike）才会真正执行 Spike difftest。
-- `make -C function-model librefcpu.a` 会生成给上层主模拟器使用的静态库，不依赖 Spike。
+standalone 的行为：
+- 默认打开 UART 打印；`REF_UNBUF=1` 让输出在重定向时也实时刷新。
+- 停止条件：`ebreak`（打印退出码；OpenSBI 探测用的 semihosting 序列不算）、客户机的 SBI 关机调用（`poweroff`）、非法访存、`--max-insts` / `REF_MAX_INSTS` 到达上限。`wfi` 按可退休的 NOP 处理，不会停止。
+- 访存地址只允许落在 RAM 和已实现的 MMIO 白名单中，非法地址立即报错退出。
 
-### 1.1 SoftFloat 说明（no_spike 模式）
-- `SPIKE=0` 时，默认链接仓库内的 `lib/softfloat/softfloat.a`。
-- 如果出现 SoftFloat ABI/行为不兼容（例如链接错误或浮点结果异常），可以自行使用 Berkeley SoftFloat 重新编译静态库并替换该文件。
-- 只要保持头文件与库版本一致即可（当前 include 路径为 `lib/softfloat/include`）。
+### 3. 启动 Linux
 
-### 2. 基础运行
-最简单的运行方式，加载二进制镜像并开始执行：
+镜像由 `linux/mkimage.sh` 生成，细节见 [linux/README.md](linux/README.md)。预先构建好的内核/OpenSBI/rootfs 目录：rv32 `~/personal/llm4trace/linux_rv32`，rv64 `~/personal/AI-Huma-data/linux_rv64`。
+
 ```bash
-./a.out --image path/to/your/image.bin
+# rv32
+make no_spike -j4
+MEM=0x10000000 bash linux/mkimage.sh ~/personal/llm4trace/linux_rv32 /tmp/linux32.bin
+REF_UNBUF=1 ./a.out.nospike --image /tmp/linux32.bin         # 约 0.12 G 条指令后到 "rv32 login:"
+
+# rv64（另一个目录，或先 make clean）
+make clean && make XLEN=64 no_spike -j4
+KOFF=0x200000 DTS=ttg64.dts MEM=0x10000000 bash linux/mkimage.sh ~/personal/AI-Huma-data/linux_rv64 /tmp/linux64.bin
+REF_UNBUF=1 ./a.out.nospike --image /tmp/linux64.bin         # 到 "rv64 login:"，约 1 秒（快速路径）
 ```
 
-当前 standalone 行为：
-- 默认打开 UART 打印。
-- 遇到 `ebreak` 会打印退出码并停止。
-- 遇到可退休的 `wfi` 会直接停止。
-- 访存地址只允许落在 RAM 和已实现 MMIO 白名单中，非法地址会立即报错退出。
+登录提示之后系统空转，不会自己退出；用 `REF_MAX_INSTS=<n>` 限制，到上限会打印 `Simulation Timeout`（对只想看到登录提示的运行这是正常结束方式）。
+
+### 4. Spike 对拍
+
+用 Spike 构建（见上）后：
+
+```bash
+REF_UNBUF=1 REF_MAX_INSTS=<n> build-spike/a.out --image <image.bin> --diff
+```
+
+rv64 的定向测试（约 33 万条指令的 ISA 测试、Sv39 测试，以及 trace-model 的 cpu-tests）一次完成：
+
+```bash
+SPIKE_SRC=... SPIKE_BUILD=... bash tests/rv64/run.sh <工作目录>     # 需要 trace-model 检出在 ../trace-model（或 TRACE=<路径>）和 RISC-V 交叉编译器
+```
+
+结果：rv64 共 54 个程序，52 个一致，剩下 2 个是已知的平台差异（`software-interrupt-vectored` 的 `mip.MSIP`、`timer-interrupt-mask` 的 `mip.MTIP`：这两个中断源在平台里，Spike 里没有）。rv32 的结果和已知差异同样见 `docs/SPIKE_DIFFTEST.md`。
 
 ---
 
-## 🛠️ 参数说明
+## 命令行参数
 
-| 参数 | 说明 | 示例 |
-| :--- | :--- | :--- |
-| `--image <file>` | **必选**。指定要加载的二进制镜像文件。 | `--image linux.bin` |
-| `--mode <mode>` | 运行模式选择。可选：`normal`, `bbv`, `ckpt`, `restore`。 | `--mode normal` |
-| `--diff` | 开启 standalone Spike Difftest（**仅在 normal 模式下可用；仅 `SPIKE=1` 构建有效**）。 | `--diff` |
-| `--out-bbv <file>` | 在 `bbv` 模式下，指定产生的 BBV 文件路径。 | `--out-bbv test.bbv` |
-| `--points <file>` | 在 `ckpt` 模式下，指定输入的 SimPoint 结果文件。 | `--points test.points` |
-| `--ckpt-dir <dir>` | 指定保存 Checkpoint 文件的目录。 | `--ckpt-dir ./checkpoint` |
-| `--restore-file <file>`| 指定要恢复的 Checkpoint 文件路径。 | `--restore-file ckpt.gz` |
-| `--max-insts <num>` | 运行的最大指令条数（当前主要用于 `restore` 模式采样）。 | `--max-insts 100000000` |
+| 参数 | 说明 |
+| :--- | :--- |
+| `--image <file>` | 要加载的平铺二进制镜像（DDR 起点）。 |
+| `--flash-image <file>` | 加载到启动窗口（地址 0 起，最大 1 MiB），用于前门恢复的恢复程序（`tools/ckpt2stub.py`）。 |
+| `--sdcard-image <file>` | SD 卡镜像（OCSDC 设备）。 |
+| `--reset-pc <addr>` | 复位 PC，默认 0。 |
+| `--mode <mode>` | `normal`（默认）、`bbv`、`ckpt`、`restore`、`special-ckpt`。 |
+| `--diff` | Spike 对拍（**仅 normal 模式、仅 Spike 构建有效**，其余情况打印 warning 并关闭）。 |
+| `--out-bbv <file>` | `bbv` 模式：BBV 输出文件。 |
+| `--points <file>` | `ckpt` 模式：SimPoint 的 `.points` 文件；`special-ckpt` 模式：绝对指令数目标列表。 |
+| `--ckpt-dir <dir>` | `ckpt` / `special-ckpt` 模式：检查点输出目录。 |
+| `--restore-file <file>` | `restore` 模式：要恢复的检查点。 |
+| `--restore-mem-only` | `restore` 模式：只恢复内存，CPU 和设备从复位开始（前门恢复，见 `docs/FRONTDOOR_RESTORE.md`）。 |
+| `--max-insts <n>` | 最多执行 n 条指令（`restore` 模式从恢复点起算）。 |
+
+### 环境变量
+
+| 变量 | 作用 |
+| :--- | :--- |
+| `REF_UNBUF` | 输出不缓冲（重定向到文件时也能实时看到控制台）。 |
+| `REF_MAX_INSTS` | 所有模式的指令数上限（默认不设上限），到达打印 `Simulation Timeout`。 |
+| `REF_INTERVAL` | BBV / 检查点的区间长度，按用户态指令数计，默认 1e8；`bbv` 与 `ckpt` 必须一致。 |
+| `REF_FORCE_REF_ONLY` | 非 0 时打开 `ref_only`（参考模型专用行为）。 |
+| `REF_NO_FAST` | 关闭基本块快速路径，走通用循环（用于对照验证）。 |
+| `REF_STATE_DIGEST`、`REF_STATE_DIGEST_BLOCK`、`REF_STATE_DIGEST_FULL`、`REF_DIGEST_LIST` | 状态摘要，用于比较快速路径与通用路径、前门与后门恢复（`tools/frontdoor_check.sh`）。 |
+| `REF_PC_EVERY`、`REF_PC_RING`、`REF_TRAP_TRACE`、`REF_TRAP_EVERY`、`REF_UART_TRACE`、`REF_STOP_AT_SHELL`、`REF_FAST_STATS` 等 | 调试开关，见 `exec.cpp`。 |
 
 ---
 
-## 💡 使用示例
+## 地址空间布局（rv32、rv64 相同）
 
-### 示例 1：开启严格模式 Difftest 运行 Linux
-此模式下，模拟器会与 Spike 进行严格的 GPR 和 CSR 校验，任何逻辑偏差都会立即停止。
-```bash
-./a.out --image ../image/linux.bin --diff
-```
+当前实现采用“**256 MiB SDRAM + 2 GiB DDR + 离散 IO word 存储**”，物理地址严格白名单检查：
 
-### 示例 2：从 Checkpoint 恢复并运行采样
-恢复之前保存的状态，并限制运行 1 亿条指令后自动退出并统计。
-```bash
-./a.out --image linux.bin --mode restore --restore-file checkpoint/ckpt_sp0.gz --max-insts 100000000
-```
-
----
-
-## 🧭 地址空间布局（当前实现）
-
-当前实现采用“**256 MiB SDRAM + 2 GiB DDR + 离散 IO word 存储**”的方式，并对物理地址做严格白名单检查：
-
-### 1. RAM（两段独立分配）
+### RAM（两段独立分配）
 - SDRAM：`0x40000000 - 0x4fffffff`（256 MiB）
 - DDR：`0x80000000 - 0xffffffff`（2 GiB）
-- 两段之间的地址空洞不是 RAM，访问会触发非法访存错误
+- 两段之间的空洞不是 RAM，访问触发非法访存错误
 
-### 2. IO / Boot（离散存储）
-- `0x00000000` 附近：启动 stub（启动阶段写入）
-- `0x00001000` 附近：Boot ROM stub（启动阶段写入）
-- `0x10000000 - 0x100000ff`：UART（`tree.dts` 对应 `reg size = 0x100`）
+### IO / Boot（离散存储）
+- `0x00000000 - 0x000fffff`：启动窗口（启动 stub、`--flash-image`；`0x1000` 附近是 Boot ROM stub）
+- `0x10000000 - 0x100000ff`：UART（ns16550a）
 - `0x10000004`：OpenSBI 兼容寄存器（初始化写 `0x00006000`）
 - `0x1fb00000 - 0x1fb00fff`：XPS INTC
-- `0x1fd0e000 - 0x1fd0e0ff`：Timer MMIO 窗口
-- `0x1fd0e000`：Timer 低位寄存器（读取返回 `sim_time`）
-- `0x1fd0e004`：Timer 高位寄存器（当前返回 0）
+- `0x1fd0e000 - 0x1fd0e0ff`：Timer（`+0` 低位读取返回 `sim_time`，`+4` 高位返回 0，`+8` mtimecmp）
 - `0x1fe10000 - 0x1fe100ff`：OCSDC
 
-说明：
-- 低地址和外设地址不再占用连续大内存，而是按 `word_addr -> word_data` 离散存储。
-- 读未初始化的离散 IO word 默认返回 `0`。
-- 不在 RAM 或上述 MMIO 白名单内的访存会直接报错，例如：
-  `"[RefCPU] illegal store: addr=0x..., size=... (not in RAM or implemented MMIO)"`
+低地址和外设地址按 `word_addr -> word_data` 离散存储，读未初始化的 IO word 返回 `0`。不在 RAM 或 MMIO 白名单内的访存直接报错：
+`[RefCPU] illegal store: addr=0x..., size=... (not in RAM or implemented MMIO)`
 
 ---
 
-## 💾 Checkpoint 格式（当前实现）
+## Checkpoint 格式
 
-Checkpoint 使用 `zlib gzip`（写模式 `wb1`，文件后缀通常为 `.gz`），按如下顺序写入：
+`zlib gzip`（写模式 `wb1`，后缀 `.gz`），按顺序写入：
 
-1. `header`（固定 16 字节）
-2. v3 的 `sdram_size`（`uint32_t`，当前为 256 MiB）
-3. `CPU_state`（POD 原样二进制）
+1. `header`（16 字节）：`magic = "Rem\0"`（`uint32`）、`format_ver`（`uint16`）、特权级（`uint16`）、`ram_size`（`uint32`，DDR 字节数）、`io_range_count`（`uint32`）
+2. `sdram_size`（`uint32_t`，256 MiB；版本 2 没有这个字段）
+3. `CPU_state`（POD 原样二进制，**大小随 XLEN 变**：rv32 为 236 字节，rv64 为 464 字节）
 4. `interval_inst_count`（`uint64_t`）
-5. `DDR` 原始字节流（固定 `ram_size` 字节，当前为 2 GiB）
-6. v3 checkpoint 的 `SDRAM` 原始字节流（256 MiB）
-7. `io_ranges + io_data`（重复 `io_range_count` 次）：
-   - `io_range`：两个 `uint32_t`（`base`, `size`）
-   - `io_data`：紧随其后的 `size` 字节原始数据
+5. DDR 原始字节流（`ram_size` 字节，当前 2 GiB）
+6. SDRAM 原始字节流（256 MiB；版本 2 没有）
+7. `io_ranges + io_data`（重复 `io_range_count` 次）：`base`、`size`（各 `uint32_t`），其后是 `size` 字节原始数据。顺序固定为 `BOOT -> UART -> XPS INTC -> TIMER -> OCSDC`
 
-### 当前 checkpoint 版本
-- v3 同时保存 DDR 与 SDRAM
-- v2 checkpoint 仍可恢复，恢复时新增 SDRAM 清零
-- IO 顺序固定为：`BOOT -> UART -> XPS INTC -> TIMER -> OCSDC`
+### 版本
+- 版本 2：rv32，没有 SDRAM 段，仍可恢复（SDRAM 清零）
+- 版本 3：rv32（当前）
+- 版本 4：rv64（当前）
 
-### 兼容性
-- 当前恢复逻辑兼容 v2 和 v3；v2 文件没有 SDRAM payload。
+两个宽度的 `CPU_state` 布局不同，所以互不兼容：rv64 的模拟器读 rv32 检查点会报 `Unsupported checkpoint version: 3`，反之亦然。
 
----
+### 恢复
 
-## 🔄 如何读取与恢复
-
-### 1. 使用模拟器直接恢复（推荐）
 ```bash
 ./a.out --image linux.bin --mode restore --restore-file path/to/ckpt.gz --max-insts 100000000
 ```
 
-恢复流程：
-1. 先通过 `init()` 分配 2 GiB DDR 和 256 MiB SDRAM
-2. 读取并校验 `header`（magic/version/ram_size/io_range_count）
-3. `restore_checkpoint()` 覆盖 `CPU_state` 和 `interval_inst_count`
-4. 覆盖 DDR；v3 继续覆盖 SDRAM，v2 将 SDRAM 清零
-5. 读取并校验 IO 布局（base+size）是否与当前模拟器配置一致
-6. 读取每个 range 的 `io_data` 并恢复 IO 内容
+流程：`init()` 分配 DDR 和 SDRAM；校验 header（magic、版本、`ram_size`、`io_range_count`）；覆盖 `CPU_state` 和 `interval_inst_count`；覆盖 DDR 和 SDRAM；校验 IO 布局（base+size）并恢复 `io_data`。
 
-### 2. 离线解析 checkpoint（二次开发）
-若需要自己读取文件，按“Checkpoint 格式”中的顺序使用 `gzread` 逐段解析即可。关键点：
-- 必须先校验 `magic="Rem\0"`，当前支持 v2 和 v3
-- 必须使用与当前程序一致的 `CPU_state` 结构体布局（同编译器/ABI 假设）
-- DDR 字节数必须与运行配置一致（当前固定 2 GiB）
-- 最后按 `io_ranges` 顺序读取并校验，再读取对应 `io_data`
+自行解析时：先校验 magic 和版本，按上面顺序用 `gzread`；`CPU_state` 的布局以 `include/ref.h` 为准（同编译器/ABI 假设）。`tools/ckpt2stub.py` 是一份现成的 Python 解析器（rv32 / rv64 都支持）。
 
 ---
 
-## 🏗️ 核心函数接口说明
+## 核心接口
 
-### 1. `Ref_cpu` (主模拟器类)
-- **`init(reset_pc, image, size)`**: 初始化处理器状态，分配内存并加载 binary 镜像到指定的 DRAM 基地址。
-- **`exec(config)`**: 仿真主循环。根据 `SimConfig` 决定运行模式、处理周期计数、触发 Difftest 同步及处理检测点。
-- **`RISCV()`**: 取指、译码和分发的核心。处理取指异常，并根据 Opcode 调用不同的子执行函数。
-- **`RV32IM() / RV32A() / RV32CSR()`**: 分类处理整数、原子操作及 CSR 相关指令的执行逻辑。
-- **`save_checkpoint() / restore_checkpoint()`**: 使用 `zlib` 对 `CPU_state` 以及整个物理内存进行压缩序列化/反序列化。
+### `Ref_cpu`（`include/ref.h`、`exec.cpp`）
+- `init(reset_pc, image, size)`：分配内存、加载镜像。
+- `exec(config)`：主循环，按 `SimConfig` 处理运行模式、BBV、检查点和 Difftest。
+- `RISCV()`：取指、译码、分发；`RV32IM()`（rv64 下是 RV64IM + Zba/Zbb/Zbs/Zbc）、`RV32A()`、`RV32CSR()`、`RV32Zfinx()`（仅 rv32）分别处理整数、原子、CSR、浮点。
+- 基本块快速路径（`exec.cpp`）：XLEN 通用，`--diff` 不经过它。
+- `save_checkpoint() / restore_checkpoint()`（`simpoint.cpp`）：见上。
 
-### 2. `SpikeRef` (金标准比对类)
-- **`step(n)`**: 驱动 Spike 内部核心向前执行 `n` 条指令。
-- **`reg_check(state, priv)`**: 比对 DUT 传入的状态（PC, GPR, CSR）与 Spike 内部状态。
-- **`sync_state(state, priv)`**: 强制将 DUT 的所有架构上下文同步给 Spike（用于启动和中断对齐）。
+### `SpikeRef`（`include/spike_ref.h`，仅 Spike 构建）
+- `step(n)`、`reg_check(state, priv)`、`sync_state(state, priv)`。
 
-### 3. `refcpu_api`（供主模拟器链接的静态库接口）
-- 头文件：`include/api/refcpu_api.h`
-- 产物：`librefcpu.a`
-- 典型构建：
-```bash
-make -C function-model librefcpu.a
-```
-- 这条路径不依赖 Spike；主模拟器只链接静态库，不会触发 standalone `main.cpp`。
-- 作为库使用时，可通过 `refcpu_set_uart_print(ctx, false)` 保持静默。
+### `refcpu_api`（供主模拟器链接）
+- 头文件 `include/api/refcpu_api.h`，产物 `librefcpu.a`，不依赖 Spike，不走 `main.cpp`；默认静默，`refcpu_set_uart_print(ctx, true)` 打开 UART 打印。
+- `RefCpuState` 里的寄存器是 `refcpu_xlen_t`（rv32 为 32 位，rv64 为 64 位），所以链接方必须用同一个 `XLEN` 编译。
 
 ---
 
-## 📂 项目结构
-- `include/`: 所有的头文件，定义了指令集掩码、CSR 地址及类接口。
-- `exec.cpp`: 包含主要的指令执行逻辑以及硬件外设（如 UART/XPS INTC/OCSDC）的简易模拟。
-- `simpoint.cpp`: 负责 BBV 生成及 Checkpoint 的保存与恢复。
-- `spike_ref.h`: 处理与 Spike (`libriscv`) 的集成及状态对比。
+## 目录结构
+
+| 路径 | 内容 |
+|---|---|
+| `main.cpp` | 命令行解析 |
+| `exec.cpp` | 指令执行、MMU（Sv32/Sv39）、CSR、设备（UART/XPS INTC/OCSDC/Timer）、快速路径、Spike 对拍循环 |
+| `simpoint.cpp` | BBV 生成、检查点保存与恢复 |
+| `refcpu_api.cpp`、`include/api/refcpu_api.h` | 静态库接口 |
+| `include/` | `xlen.h`（XLEN 相关类型和掩码）、`ref.h`、`CSR.h`、`RISCV.h`（地址与操作码）、`spike_ref.h` |
+| `lib/` | `softfloat/`（`softfloat.a` 和头文件）、`include/`（Spike/fesvr/fdt 头文件，Spike 构建用） |
+| `linux/` | 设备树、rv64 内核配置片段、`mkimage.sh`（拼 Linux 镜像） |
+| `tools/` | `ckpt2stub.py`（检查点转前门恢复程序）、`frontdoor_check.sh` |
+| `tests/rv64/` | rv64 对拍用的定向测试生成器和 `run.sh` |
+| `scripts/` | `build_spike.sh`、`run_bbv.sh`、`run_ckpt.sh`；`scripts/spec/` 是现行的 SPECint2006 检查点流水线 |
+| `SimPoint/simpoint` | SimPoint 3.2 的 x86 Linux 二进制（Mac 上要自己编译，见 `scripts/spec/README.md`） |
+| `docs/` | 下面列出的文档 |
+| `build-spike/` | `scripts/build_spike.sh` 的默认输出（不进 git） |
+
+---
+
+## 已知限制
+
+- rv64 还**没有** F/D（浮点指令触发非法指令）；rv32 的 Zfinx 在 rv64 上已去掉。
+- 两个宽度都**没有**压缩指令 C。
+- rv64 的 MMIO 访问：function-model 里对 MMIO 的 `sd/ld` 读回还没有做。
+- SPEC 的 rv64 版本还没有重新生成：`scripts/spec/` 和 `~/personal/AI-Huma-data/spec-rv32imab` 都是 rv32imab；rv64 只有 Linux 启动和定向测试的检查点。
+- Spike 对拍的两个平台差异（见上）；`--diff` 不经过快速路径，所以比普通运行慢得多。
+- 物理地址限制为 32 位的上述窗口；Sv39 翻译出 4 GiB 以上的物理地址按“地址不在 RAM”处理。
+- rv64 `bitmanip-boundary`（trace-model）里写死了 rv32 的 `rev8` 编码，不能在 rv64 上跑。
 
 ---
 
 ## 文档与脚本位置
 
-- `docs/DIFFTEST.md`：Difftest 用法。
-- `docs/SIMPOINT_SPECINT2006.md`：SimPoint 原理，以及现行流程和上游流程的对照。
-- `scripts/spec/README.md`：现行 SPECint2006 检查点流程（rv32imab、Linux 镜像、ref 输入），数据在 `~/personal/AI-Huma-data/spec-rv32imab`。
-- `docs/FRONTDOOR_RESTORE.md`：front-door 检查点恢复。
-- `scripts/run_bbv.sh`、`scripts/run_ckpt.sh`：BBV 与检查点批量脚本，**在仓库根目录运行**（脚本里的 `./a.out`、`./SimPoint/simpoint` 都是相对根目录的路径）。
-
+- [docs/DIFFTEST.md](docs/DIFFTEST.md)：Difftest 用法（standalone 与静态库）。
+- [docs/SPIKE_DIFFTEST.md](docs/SPIKE_DIFFTEST.md)：Spike 对拍的构建、结果、已知差异（rv32 与 rv64）。
+- [docs/SIMPOINT_SPECINT2006.md](docs/SIMPOINT_SPECINT2006.md)：SimPoint 原理，现行流程与上游流程的对照。
+- [scripts/spec/README.md](scripts/spec/README.md)：现行 SPECint2006 检查点流程（rv32imab、Linux 镜像、ref 输入），数据在 `~/personal/AI-Huma-data/spec-rv32imab`。
+- [docs/FRONTDOOR_RESTORE.md](docs/FRONTDOOR_RESTORE.md)：前门检查点恢复（rv32 与 rv64）。
+- [linux/README.md](linux/README.md)：Linux 镜像（rv32 与 rv64）。
+- `scripts/run_bbv.sh`、`scripts/run_ckpt.sh`：上游的裸机镜像批量脚本，**在仓库根目录运行**（里面的 `./a.out`、`./SimPoint/simpoint` 是相对根目录的路径）。

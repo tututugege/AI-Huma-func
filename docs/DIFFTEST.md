@@ -13,9 +13,11 @@
 
 ### 1.1 standalone Spike Difftest
 - 入口：`main.cpp`
-- 运行方式：`./a.out --image your_image.bin --diff`
-- 依赖：需要 `SPIKE=1` 构建出的 `a.out`
+- 运行方式：`build-spike/a.out --image your_image.bin --diff`
+- 依赖：需要 Spike 构建（`SPIKE=1`，推荐用 `scripts/build_spike.sh`）；rv32 与 rv64（`XLEN=64`）都支持，Spike 的 ISA 分别是 `rv32imab_zfinx_zbc_zbkb_zbkx` 和 `rv64imab_zbc_zbkb_zbkx`
+- 详细的构建、结果、已知差异：[SPIKE_DIFFTEST.md](SPIKE_DIFFTEST.md)
 - 作用：让 `function-model` 自己作为 DUT，与 Spike 逐条比对
+- 仅 `--mode normal` 可用；`--diff` 走通用执行循环，不经过基本块快速路径
 
 ### 1.2 静态库 RefCPU Difftest
 - 入口：`include/api/refcpu_api.h`
@@ -43,13 +45,14 @@ Spike 普通 step 前会清除自身的异步 `MTIP/MEIP/SEIP` pending，CSR 比
 
 ### 2.3 构建与运行
 ```bash
-# 带 Spike 的 standalone 可执行文件
-make with_spike
+# 带 Spike 的 standalone 可执行文件，在仓库外目录 build-spike/ 构建（rv64：XLEN=64 前缀）
+SPIKE_SRC=<riscv-isa-sim 源码> SPIKE_BUILD=<其构建目录> bash scripts/build_spike.sh
 
 # 启用 standalone Spike difftest
-./a.out --image your_image.bin --diff
+REF_UNBUF=1 REF_MAX_INSTS=<n> build-spike/a.out --image your_image.bin --diff
 ```
 
+`make with_spike` 也能生成带 Spike 的 `a.out`（同样要设 `SPIKE_SRC`/`SPIKE_BUILD`），但会和普通构建共用 `.o`，不推荐。
 如果当前是 `SPIKE=0` 构建，传 `--diff` 会打印 warning 并自动禁用。
 
 ---
@@ -69,12 +72,13 @@ make with_spike
 - API 头文件：`include/api/refcpu_api.h`
 - 静态库：`librefcpu.a`
 
-构建方式：
+构建方式（在 function-model 目录里；在总仓库里是 `make -C function-model librefcpu.a`，rv64 加 `XLEN=64`）：
 ```bash
-make -C function-model librefcpu.a
+make librefcpu.a
 ```
 
 ### 3.3 常用接口
+- 寄存器类型 `refcpu_xlen_t` 随 `XLEN` 变（rv32 为 32 位，rv64 为 64 位），库和调用方必须用同一个 `XLEN` 编译
 - `refcpu_init(reset_pc, ram_size_bytes)`: 创建上下文并分配 RAM
 - `refcpu_destroy(ctx)`: 销毁上下文
 - `refcpu_step(ctx, steps)`: 执行若干条指令
@@ -90,6 +94,7 @@ make -C function-model librefcpu.a
 
 无论是 standalone 还是静态库，底层都使用同一个 `Ref_cpu`，因此以下行为一致：
 
+- rv32 与 rv64 的物理地址空间相同
 - SDRAM 窗口为 `0x40000000 .. 0x4fffffff`（256 MiB）
 - DDR 窗口为 `0x80000000 .. 0xffffffff`（2 GiB）
 - Boot/UART/XPS INTC/Timer/OCSDC 使用离散 `io_words` 存储
@@ -126,7 +131,7 @@ make -C function-model librefcpu.a
 - 静态库由上层自己驱动 `refcpu_*` API，不经过 `main.cpp`
 
 ### 5.3 停止条件
-- standalone 常见停止条件：`ebreak`、`wfi`、非法访存、超时
+- standalone 常见停止条件：`ebreak`、客户机 SBI 关机、非法访存、指令数上限（`--max-insts` / `REF_MAX_INSTS`）；`wfi` 不停止
 - 静态库常见停止条件：上层停止调用 `refcpu_step()`，或参考模型内部触发 `sim_end`
 
 ---
@@ -138,16 +143,14 @@ make -C function-model librefcpu.a
 - 修改 `include/*.h` 或 `include/api/*.h` 后会自动触发相关目标重编
 - `make librefcpu.a` 不再依赖手动删 `.o`
 
-常用命令：
+`.o` 不区分 `XLEN`：在同一目录切换 `XLEN=32/64` 之前先 `make clean`。
+
+常用命令（总仓库里的路径写法）：
 ```bash
-# 构建 standalone
-make -C function-model
-
-# 构建静态库
-make -C function-model librefcpu.a
-
-# 清理
-make -C function-model clean
+make -C function-model                      # standalone（rv32）
+make -C function-model XLEN=64              # standalone（rv64，先 clean）
+make -C function-model librefcpu.a          # 静态库
+make -C function-model clean                # 清理
 ```
 
 ---
@@ -162,7 +165,7 @@ make -C function-model clean
 
 如果要对 Spike：
 ```bash
-./a.out --image your_image.bin --diff
+build-spike/a.out --image your_image.bin --diff
 ```
 
 ### 7.2 作为主模拟器参考模型

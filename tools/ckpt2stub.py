@@ -10,6 +10,7 @@ What cannot be reproduced exactly: mret leaves mstatus.MPP = U and MPIE = 1 and 
 target this is unobservable (every M-mode trap rewrites them). For an M-mode target (checkpoint inside OpenSBI) it is not
 exact; the tool warns.
 
+Reads rv32 (format version 2/3) and rv64 (version 4) checkpoints; the version selects the CPU_state layout.
 usage: ckpt2stub.py <checkpoint.gz> <out.bin> [--info]
 """
 import gzip, struct, sys, zlib

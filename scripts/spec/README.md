@@ -3,6 +3,10 @@
 从 SPEC 源码到 trace-model 回放用的检查点的完整流程（SimPoint 原理和上游裸机流程见 [docs/SIMPOINT_SPECINT2006.md](../../docs/SIMPOINT_SPECINT2006.md)）。**生成的数据放在 `$SPECDATA`（默认
 `~/personal/AI-Huma-data/spec-rv32imab`），不放 `/tmp`（重启会清空），也不进仓库。** 公共设置在 `env.sh`。
 
+**这套流程目前只有 rv32imab 版本。** function-model 已经支持 rv64（`XLEN=64`，Linux 能启动，BBV/检查点格式 v4 可用），但 SPEC 的 rv64 版本（rv64 工具链编译、rv64 镜像、重新生成检查点）还没有做；
+`build_spec.py`、`mk_images.sh`（用 `linux_rv32`）和 `env.sh` 里的 `$FM`（默认 `<仓库>/a.out`，必须是 `XLEN=32` 的构建，用 `make` 或 `make no_spike` 生成，`FM=` 可指向 `a.out.nospike`）都按 rv32 写。
+rv32 与 rv64 的检查点互相不能读（版本 3 对 4）。
+
 ## 目录
 
 | `$SPECDATA/` 下 | 内容 | 由谁生成 |

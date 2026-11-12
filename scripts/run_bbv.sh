@@ -1,5 +1,8 @@
 #!/bin/bash
 # Run from the repository root (paths below are relative to it): bash scripts/run_bbv.sh
+# Upstream (bare-metal) flow, see docs/SIMPOINT_SPECINT2006.md; the current SPEC flow is scripts/spec/.
+# Needs ./a.out (plain `make`; XLEN must match the images) and mem/*.bin.  The interval is REF_INTERVAL (default 1e8 user-mode
+# instructions) and must be the same in run_ckpt.sh.
 
 # === 配置区域 ===
 CMD="./a.out"

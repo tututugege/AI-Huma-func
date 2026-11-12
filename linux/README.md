@@ -1,17 +1,20 @@
 # Booting Linux on the function model
 
-The standalone simulator (`a.out.nospike`, built with `make no_spike`) boots a flat DDR image: the boot stub at 0x0 jumps to
-0x80000000 with `a1 = 0x83e00000`.
+The standalone simulator (`a.out.nospike`, built with `make no_spike`; rv64: `make XLEN=64 no_spike` in a clean tree) boots a
+flat DDR image: the boot stub at 0x0 jumps to 0x80000000 with `a1 = 0x83e00000`.
 
-- `ttg.dts`: devicetree for this platform (256 MiB RAM at 0x80000000, ns16550a UART at 0x10000000, polled; an ACLINT
-  mtimer at 0x1fd0e000 with mtime at +0 and mtimecmp at +8; no PLIC; rv32ima; timebase 132 MHz).
+- `ttg.dts` (rv32) / `ttg64.dts` (rv64, `mmu-type = riscv,sv39`): devicetree for this platform (256 MiB RAM at 0x80000000,
+  ns16550a UART at 0x10000000, polled; an ACLINT mtimer at 0x1fd0e000 with mtime at +0 and mtimecmp at +8; no PLIC; timebase 132 MHz).
+- `rv64_min.fragment`: kernel config fragment for the rv64 build (see below).
 - `mkimage.sh <dir> <out.bin> [rootfs.cpio]`: builds the image from `fw_jump.bin`, `Image` and the initramfs of a
-  linux_rv32 directory: OpenSBI at 0x80000000, kernel at 0x80400000, devicetree at 0x82200000 and 0x83e00000,
-  initramfs at 0x84400000. `MEM=0x30000000` sets a larger RAM for big initramfs images (the SPEC test image needs it).
+  linux_rv32 / linux_rv64 directory: OpenSBI at 0x80000000, kernel at 0x80000000 + `KOFF` (default 0x400000; rv64:
+  `KOFF=0x200000`), devicetree at 0x82200000 and 0x83e00000, initramfs at 0x84400000. `DTS=ttg64.dts` selects the rv64
+  devicetree (default `ttg.dts`). `MEM=0x30000000` sets a larger RAM for big initramfs images (the SPEC ref images use
+  `MEM=0x70000000`).
 
 ```bash
 make no_spike
-MEM=0x10000000 bash linux/mkimage.sh ../../llm4trace/linux_rv32 /tmp/linux.bin
+MEM=0x10000000 bash linux/mkimage.sh ~/personal/llm4trace/linux_rv32 /tmp/linux.bin
 REF_UNBUF=1 ./a.out.nospike --image /tmp/linux.bin     # boots to "rv32 login:" in about 0.12 G instructions
 ```
 
@@ -22,9 +25,10 @@ Notes
 - A guest `poweroff` ends the simulation (SBI shutdown ecall from S mode).
 - Verified: Linux 5.15.170 boots; the 12 SPECint2006 `test` programs run with matching output (libquantum differs only
   by CRLF line ends, astar by about 1e-4 in two numbers, within SPEC's tolerance).
-- Debug options: `REF_PC_EVERY`, `REF_PC_RING`, `REF_TRAP_TRACE`, `REF_TRAP_EVERY`, `REF_UNBUF`.
+- Debug options: `REF_PC_EVERY`, `REF_PC_RING`, `REF_TRAP_TRACE`, `REF_TRAP_EVERY`, `REF_UNBUF` (see the README).
+- The console stays at the login prompt afterwards; use `REF_MAX_INSTS=<n>` to stop (the run ends with `Simulation Timeout`).
 
-## rv64 (2026-11-11)
+## rv64 (2026-11-11, merged to main 2026-11-12)
 
 Buildroot 2024.02.9 in the Lima VM (`~/br64`: riscv64 GCC 13.3, glibc, ABI lp64 = soft float, kernel 5.15.170, OpenSBI 1.2): start from
 `br13`'s `.config` with `BR2_RISCV_64`/`BR2_RISCV_ABI_LP64`, `BR2_ARCH="riscv64"`, `BR2_GCC_TARGET_ABI="lp64"`, the kernel config
@@ -34,8 +38,8 @@ The images are in `~/personal/AI-Huma-data/linux_rv64/` (`Image`, `fw_jump.bin`,
 
 ```bash
 KOFF=0x200000 DTS=ttg64.dts MEM=0x10000000 bash linux/mkimage.sh ~/personal/AI-Huma-data/linux_rv64 /tmp/linux64.bin
-XLEN=64 make no_spike OUT=...    # or the Spike build (scripts/build_spike.sh XLEN=64)
-REF_UNBUF=1 ./a.out --image /tmp/linux64.bin          # boots to the login prompt (the rootfs hostname still says rv32)
+make clean && make XLEN=64 no_spike -j4               # the objects do not depend on XLEN: clean when switching
+REF_UNBUF=1 ./a.out.nospike --image /tmp/linux64.bin  # boots to "rv64 login:" in about 1 s (fast path); with Spike: XLEN=64 OUT=build-spike64 scripts/build_spike.sh, then build-spike64/a.out ... --diff
 ```
 
 OpenSBI's rv64 fw_jump jumps to 0x80200000 (kernel at offset 0x200000), the devicetree is passed at 0x82200000.

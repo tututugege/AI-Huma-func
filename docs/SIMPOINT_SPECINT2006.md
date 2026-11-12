@@ -22,15 +22,15 @@ SimPoint 的目标是：
 
 ### 2.1 Interval 定义
 
-本模拟器当前 interval 大小为：
-- `INTERVAL_SIZE = 100000000`（1e8）
-- 定义位置：`include/ref.h`
-- 可以自行设置不同的 INTERVAL_SIZE，建议10M-100M
+本模拟器的 interval 大小（按用户态指令数计）：
+- 默认 `INTERVAL_SIZE = 100000000`（1e8），定义在 `include/ref.h`
+- 环境变量 `REF_INTERVAL=<n>` 覆盖默认值，不用重新编译；`bbv` 和 `ckpt` 两次运行必须用同一个值（现行流程用 1e7）
+- 建议 10M-100M
 
 ### 2.2 BBV 统计触发点
 
 在 `exec.cpp` 中：
-- 仅在 `privilege == U` 且遇到分支边界时累计 `current_bb_len`。
+- 仅在 `privilege == U` 且遇到分支边界时累计 `current_bb_len`。BBV 文件格式（基本块编号）与 XLEN 无关，rv32 与 rv64 都能生成。
 - 达到 interval 边界后在 `--mode bbv` 下 `dump_bbv()` 输出一行 `T ...`。
 
 这意味着 BBV 是“按当前实现定义的基本块/计数口径”生成的，只考虑用户态指令，后续 SimPoint 和 checkpoint 必须使用同一口径，不能混用其他工具生成的 points。
@@ -51,7 +51,7 @@ SimPoint 的目标是：
 |---|---|---|
 | 入口 | `scripts/spec/`，说明见 [scripts/spec/README.md](../scripts/spec/README.md) | `scripts/run_bbv.sh`、`scripts/run_ckpt.sh`（下面第 3.1–7 节） |
 | 运行方式 | Linux 镜像（OpenSBI + 内核 + initramfs），SPEC **ref** 输入，输出与 SPEC 参考比对 | 裸机镜像 `mem/<bench>.bin` |
-| ISA | rv32imab（GCC 13.3，`-march=rv32ima_zicsr_zifencei_zba_zbb_zbs`） | 视镜像而定 |
+| ISA | rv32imab（GCC 13.3，`-march=rv32ima_zicsr_zifencei_zba_zbb_zbs`）；rv64 的 SPEC 还没有重新生成 | 视镜像而定（模拟器要用对应的 `XLEN` 构建） |
 | SimPoint 参数 | `-maxK 100 -seedproj 0721 -seedkm 11037 -numInitSeeds 5 -iters 100 -fixedLength on`，区间 1000 万条 | `-maxK 30 ... -iters 1000` |
 | 数据位置 | `~/personal/AI-Huma-data/spec-rv32imab`（持久目录，不进仓库） | 仓库内 `bbv_log/`、`ckpts/` |
 | 使用者 | trace-model `scripts/spec/replay.sh quick|full` | — |
@@ -75,7 +75,7 @@ trace-model 和 rtl 的 SPEC 数字都来自现行流程；下面保留上游流
 ### 4.1 编译模拟器
 
 ```bash
-make -j$(nproc)
+make -j4                  # rv32；rv64 镜像用 make clean && make XLEN=64
 ```
 
 生成可执行文件：`./a.out`
@@ -181,13 +181,13 @@ bash scripts/run_ckpt.sh
 - 再确认模拟是否提前结束（程序本身很短时，后续 target 可能到不了）。
 
 4. 想改 interval 大小
-- 当前需要修改源码 `include/ref.h` 的 `INTERVAL_SIZE` 并重新编译。
+- 设环境变量 `REF_INTERVAL=<n>`（不需要重新编译；默认 1e8 在 `include/ref.h`）。
 - 修改后要重新生成 BBV、points、checkpoint，不能复用旧文件。
 
 ## 8. 针对 SPECint2006 的实践建议
 
 1. 先小规模试跑
-- 先选 2~3 个 benchmark 走通全流程，确认路径与格式无误，再全量并行，对于ref规模，429.mcf最少，约2900亿条指令，其余大部分都在1w-2w亿条指令量级，最多的是h264ref，五万亿。可以考虑使用test规模检查编译优化效果，最多的约900亿。目前简单模拟器速度约5kw指令/s。
+- 先选 2~3 个 benchmark 走通全流程，确认路径与格式无误，再全量并行，对于ref规模，429.mcf最少，约2900亿条指令，其余大部分都在1w-2w亿条指令量级，最多的是h264ref，五万亿。可以考虑使用test规模检查编译优化效果，最多的约900亿。这是早期的估计（简单模拟器约 5kw 指令/s）；基本块快速路径之后 Linux 启动的实测快得多，现行流程见 `scripts/spec/README.md` 的耗时参考。
 
 2. 控制并行度
 - `scripts/run_bbv.sh` 和 `scripts/run_ckpt.sh` 的 `MAX_JOBS` 建议根据机器内存调节，避免并发过高导致系统抖动。

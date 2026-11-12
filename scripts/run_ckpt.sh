@@ -1,5 +1,8 @@
 #!/bin/bash
 # Run from the repository root (paths below are relative to it): bash scripts/run_ckpt.sh
+# Upstream (bare-metal) flow, see docs/SIMPOINT_SPECINT2006.md; the current SPEC flow is scripts/spec/.
+# Needs ./a.out, ./SimPoint/simpoint (x86 Linux binary), mem/*.bin and the .bbv files made by run_bbv.sh.  The interval is the
+# environment variable REF_INTERVAL (default 1e8); the INTERVAL_SIZE variable below is not used.
 
 # ================= 配置区域 =================
 
