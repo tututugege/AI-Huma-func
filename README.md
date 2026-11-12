@@ -95,6 +95,8 @@ rv64 的定向测试（约 33 万条指令的 ISA 测试、Sv39 测试，以及 
 SPIKE_SRC=... SPIKE_BUILD=... bash tests/rv64/run.sh <工作目录>     # 需要 trace-model 检出在 ../trace-model（或 TRACE=<路径>）和 RISC-V 交叉编译器
 ```
 
+官方 riscv-tests 的 `rv64uf`（11 个）和 `rv64ud`（12 个）自检用例用 `tests/rv64/riscv-tests-fp.sh <工作目录>` 跑（`RISCV_TESTS` 指向带 `isa/` 的检出，默认 `~/personal/simulator/baremetal/riscv-tests`）：每个既要自检通过（`a0 = 0` 后 `ebreak`），又要和 Spike 逐条一致；23 个全部通过。
+
 同一个脚本在最后还会构建 `FP=1` 的 Spike 对拍版本，跑三个浮点测试（`FP_TESTS=0` 跳过）：`rv64-fp`（约 13 万行汇编、35 万条指令：F/D 每条指令 × 5 种舍入模式 × 特殊操作数，含 NaN-boxing、动态舍入、`fcsr` 访问、`flw/fld/fsw/fsd`）、`rv64-fp-trap`（`mstatus.FS` 为 Off 时的非法指令、保留的舍入模式/格式/编码、FS/SD 随浮点状态变化）和 `fp-kernels`（编译器生成的矩阵乘、Horner、牛顿迭代、整数和浮点互转）；每条指令之后由 Spike 逐条比对 x、f 寄存器和全部 CSR，三个全部一致。
 
 结果：rv64 共 54 个程序，52 个一致，剩下 2 个是已知的平台差异（`software-interrupt-vectored` 的 `mip.MSIP`、`timer-interrupt-mask` 的 `mip.MTIP`：这两个中断源在平台里，Spike 里没有）。rv32 的结果和已知差异同样见 `docs/SPIKE_DIFFTEST.md`。
