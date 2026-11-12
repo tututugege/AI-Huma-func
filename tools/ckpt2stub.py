@@ -33,8 +33,15 @@ def read_checkpoint(path):
     magic, ver, priv, ram_size, io_count = struct.unpack("<IHHII", f.read(16))
     sdram_size = struct.unpack("<I", f.read(4))[0] if ver >= 3 else 0
     global XLEN
-    XLEN = 64 if ver == 4 else 32     # format version 4 = rv64 (CPU_state with 64-bit registers)
-    if XLEN == 64:
+    XLEN = 64 if ver in (4, 5) else 32     # format version 4 = rv64 (CPU_state with 64-bit registers), 5 = rv64 with F/D
+    fpr, fcsr = None, 0
+    if ver == 5:
+        st = f.read(720)       # CPU_state: gpr[32], fpr[32], csr[21], pc, store_*, reserve_*
+        vals = struct.unpack("<32Q32Q21QQI4xQI??2xI", st[:716])
+        gpr, fpr, csr = list(vals[0:32]), list(vals[32:64]), list(vals[64:85])
+        pc, store_addr, store_data, store_strb, store, reserve_valid, reserve_addr = vals[85:92]
+        fcsr = struct.unpack("<I", f.read(4))[0]
+    elif XLEN == 64:
         st = f.read(464)
         vals = struct.unpack("<32Q21QQI4xQI??2xI", st[:456 + 4])   # gpr, csr, pc, store_addr, store_data, store_strb, store, reserve_valid, reserve_addr
         gpr, csr = list(vals[0:32]), list(vals[32:53])
@@ -55,7 +62,7 @@ def read_checkpoint(path):
     for _ in range(io_count):
         base, size = struct.unpack("<II", f.read(8))
         io[base] = f.read(size)
-    return dict(priv=priv & 3, gpr=gpr, csr=csr, pc=pc, reserve_valid=bool(reserve_valid), reserve_addr=reserve_addr,
+    return dict(priv=priv & 3, gpr=gpr, fpr=fpr, fcsr=fcsr, csr=csr, pc=pc, reserve_valid=bool(reserve_valid), reserve_addr=reserve_addr,
                 interval=interval, io=io)
 
 
@@ -161,6 +168,11 @@ def build(ck, warn):
         x &= 0xFFFFFFFF   # UXL/SXL (bits 63:32) are read-only
     if prio == 3:
         warn("M-mode checkpoint: mstatus.MPP/MPIE and mepc are not restored exactly (mret overwrites them)")
+    if ck.get("fpr") is not None:   # F/D: FS must be on while the FP registers are written (the mstatus write below sets the real FS)
+        csr_prog += li(T0, 0x2000) + [csrw(CSR_NUM["mstatus"], T0)]
+        csr_prog += li(T0, ck["fcsr"]) + [csrw(0x003, T0)]
+        for i, v in enumerate(ck["fpr"]):
+            csr_prog += li(T0, v) + [u32((0x79 << 25) | (T0 << 15) | (i << 7) | 0x53)]   # fmv.d.x f<i>, t0
     csr_prog += li(T0, ck["pc"]) + [csrw(CSR_NUM["mepc"], T0)]
     csr_prog += li(T0, x) + [csrw(CSR_NUM["mstatus"], T0)]
 

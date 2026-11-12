@@ -4,15 +4,15 @@
 
 轻量、高性能的 RISC-V 全系统功能模拟器（M/S/U 三个特权级，Linux 可启动）。寄存器宽度在编译时选择：
 
-| | rv32（默认，`XLEN=32`） | rv64（`XLEN=64`） |
+| | rv32（默认，`XLEN=32`） | rv64（`XLEN=64`，可加 `FP=1`） |
 |---|---|---|
 | 整数/乘除/原子 | RV32IMA | RV64IMA（含 `*W`、`lwu/ld/sd`、`amo*.d`、`lr/sc.d`） |
 | 位操作 | Zba/Zbb/Zbs、Zbc、Zbkb 的 `pack/packh`（无 `brev8/zip/xperm`），合称 "B" | 同左，另有 `*W` 变体 |
-| 浮点 | **Zfinx**（浮点用整数寄存器，softfloat） | **没有**（F/D 标准浮点之后再做，现在 `OP-FP` 是非法指令） |
+| 浮点 | **Zfinx**（浮点用整数寄存器，softfloat） | 默认**没有**（`OP-FP` 是非法指令）；`FP=1` 时是标准 **F/D**（32 个 64 位浮点寄存器、`fcsr`、`mstatus.FS/SD`，softfloat；NaN-boxing 和 Spike 一致） |
 | 压缩指令 C | 无 | 无 |
 | 地址翻译 | Sv32 | Sv39 |
-| 检查点格式 | 版本 3（2 仍可读） | 版本 4 |
-| Spike 对拍 ISA | `rv32imab_zfinx_zbc_zbkb_zbkx` | `rv64imab_zbc_zbkb_zbkx` |
+| 检查点格式 | 版本 3（2 仍可读） | 版本 4；`FP=1` 是版本 5（`CPU_state` 带浮点寄存器，其后跟 `fcsr`） |
+| Spike 对拍 ISA | `rv32imab_zfinx_zbc_zbkb_zbkx` | `rv64imab_zbc_zbkb_zbkx`；`FP=1` 是 `rv64imafdb_zbc_zbkb_zbkx` |
 | Linux | 5.15.170 + OpenSBI，启动到 `rv32 login:` | 同版本内核，启动到 `rv64 login:` |
 
 两个宽度共用同一份源码（`include/xlen.h` 定义 `xlen_t`）；默认的 `XLEN=32` 行为与 rv64 迁移之前一致。物理地址空间两个宽度相同（见下文），不支持 4 GiB 以上的物理地址。
@@ -34,19 +34,21 @@
 make -j4                    # rv32，不带 Spike，产物 a.out
 make no_spike -j4           # 同上，但产物叫 a.out.nospike（脚本和 linux/ 文档里用这个名字）
 make XLEN=64 -j4            # rv64，不带 Spike
+make XLEN=64 FP=1 -j4       # rv64 + F/D（只能和 XLEN=64 一起用）
 make librefcpu.a            # 给上层主模拟器链接的静态库（不依赖 Spike；XLEN 同样可选）
 make clean                  # 删除 a.out a.out.nospike librefcpu.a *.o *.d
 ```
 
 注意：
-- **`.o` 文件不区分 XLEN**。在同一目录里切换 `XLEN` 之前必须 `make clean`，否则 rv32 和 rv64 的目标文件会混链（头文件依赖不会感知命令行的 `-DXLEN`）。
+- **`.o` 文件不区分 XLEN 和 FP**。在同一目录里切换 `XLEN` 或 `FP` 之前必须 `make clean`，否则目标文件会混链（头文件依赖不会感知命令行的 `-DXLEN` / `-DFP`）。
 - `make with_spike` 把 Spike 链进 `a.out`，需要 `SPIKE_SRC`（riscv-isa-sim 源码）和 `SPIKE_BUILD`（已构建好的目录），并且会和普通构建共用 `.o`。**推荐改用 `scripts/build_spike.sh`**，它在仓库外目录 `build-spike/` 构建，不污染普通构建：
   ```bash
   SPIKE_SRC=<riscv-isa-sim 源码> SPIKE_BUILD=<其构建目录> bash scripts/build_spike.sh             # rv32，产物 build-spike/a.out
   XLEN=64 SPIKE_SRC=... SPIKE_BUILD=... OUT=build-spike64 bash scripts/build_spike.sh             # rv64
+  XLEN=64 FP=1 SPIKE_SRC=... SPIKE_BUILD=... OUT=build-spike64fp bash scripts/build_spike.sh       # rv64 + F/D
   ```
 - 不带 Spike 的二进制收到 `--diff` 只打印 warning 并关闭 difftest。
-- SoftFloat：`SPIKE=0` 时链接 `lib/softfloat/softfloat.a`（只有 rv32 的 Zfinx 用到）；如果出现 ABI/行为不兼容，用 Berkeley SoftFloat 重新编译并替换该文件，头文件在 `lib/softfloat/include`。
+- SoftFloat：`SPIKE=0` 时链接 `lib/softfloat/softfloat.a`（rv32 的 Zfinx 和 rv64 的 F/D 用到）；如果出现 ABI/行为不兼容，用 Berkeley SoftFloat 重新编译并替换该文件，头文件在 `lib/softfloat/include`。
 
 ### 2. 运行
 
@@ -92,6 +94,8 @@ rv64 的定向测试（约 33 万条指令的 ISA 测试、Sv39 测试，以及 
 ```bash
 SPIKE_SRC=... SPIKE_BUILD=... bash tests/rv64/run.sh <工作目录>     # 需要 trace-model 检出在 ../trace-model（或 TRACE=<路径>）和 RISC-V 交叉编译器
 ```
+
+同一个脚本在最后还会构建 `FP=1` 的 Spike 对拍版本，跑三个浮点测试（`FP_TESTS=0` 跳过）：`rv64-fp`（约 13 万行汇编、35 万条指令：F/D 每条指令 × 5 种舍入模式 × 特殊操作数，含 NaN-boxing、动态舍入、`fcsr` 访问、`flw/fld/fsw/fsd`）、`rv64-fp-trap`（`mstatus.FS` 为 Off 时的非法指令、保留的舍入模式/格式/编码、FS/SD 随浮点状态变化）和 `fp-kernels`（编译器生成的矩阵乘、Horner、牛顿迭代、整数和浮点互转）；每条指令之后由 Spike 逐条比对 x、f 寄存器和全部 CSR，三个全部一致。
 
 结果：rv64 共 54 个程序，52 个一致，剩下 2 个是已知的平台差异（`software-interrupt-vectored` 的 `mip.MSIP`、`timer-interrupt-mask` 的 `mip.MTIP`：这两个中断源在平台里，Spike 里没有）。rv32 的结果和已知差异同样见 `docs/SPIKE_DIFFTEST.md`。
 
@@ -165,7 +169,8 @@ SPIKE_SRC=... SPIKE_BUILD=... bash tests/rv64/run.sh <工作目录>     # 需要
 ### 版本
 - 版本 2：rv32，没有 SDRAM 段，仍可恢复（SDRAM 清零）
 - 版本 3：rv32（当前）
-- 版本 4：rv64（当前）
+- 版本 4：rv64（当前，`FP=0`）
+- 版本 5：rv64 + F/D（`FP=1`）：`CPU_state` 里 `gpr` 后多 32 个 `uint64_t` 浮点寄存器（整体 720 字节），其后紧跟 `uint32_t fcsr`，再是 `interval_inst_count`；`FP=0` 的模拟器读它会报版本不支持，`tools/ckpt2stub.py` 能读，并在前门恢复程序里用 `fmv.d.x` 和 `csrw fcsr` 还原浮点状态。
 
 两个宽度的 `CPU_state` 布局不同，所以互不兼容：rv64 的模拟器读 rv32 检查点会报 `Unsupported checkpoint version: 3`，反之亦然。
 
@@ -186,7 +191,7 @@ SPIKE_SRC=... SPIKE_BUILD=... bash tests/rv64/run.sh <工作目录>     # 需要
 ### `Ref_cpu`（`include/ref.h`、`exec.cpp`）
 - `init(reset_pc, image, size)`：分配内存、加载镜像。
 - `exec(config)`：主循环，按 `SimConfig` 处理运行模式、BBV、检查点和 Difftest。
-- `RISCV()`：取指、译码、分发；`RV32IM()`（rv64 下是 RV64IM + Zba/Zbb/Zbs/Zbc）、`RV32A()`、`RV32CSR()`、`RV32Zfinx()`（仅 rv32）分别处理整数、原子、CSR、浮点。
+- `RISCV()`：取指、译码、分发；`RV32IM()`（rv64 下是 RV64IM + Zba/Zbb/Zbs/Zbc）、`RV32A()`、`RV32CSR()`、`RV32Zfinx()`（仅 rv32）、`RVFD()`（`FP=1`，OP-FP 和四种融合乘加；`flw/fld/fsw/fsd` 走 `RV32IM()` 的 load/store 代码，只是换了寄存器堆）分别处理整数、原子、CSR、浮点。
 - 基本块快速路径（`exec.cpp`）：XLEN 通用，`--diff` 不经过它。
 - `save_checkpoint() / restore_checkpoint()`（`simpoint.cpp`）：见上。
 
@@ -221,7 +226,8 @@ SPIKE_SRC=... SPIKE_BUILD=... bash tests/rv64/run.sh <工作目录>     # 需要
 
 ## 已知限制
 
-- rv64 还**没有** F/D（浮点指令触发非法指令）；rv32 的 Zfinx 在 rv64 上已去掉。
+- rv64 的 F/D 是编译开关 `FP=1`（默认关，不影响现有的 rv64 和 rv32 构建）；还没有的有：半精度（Zfh）、trace-model 和 RTL 里的 F/D、F/D 的 SPEC 和 Linux 用户态验证。rv32 仍是 Zfinx。
+- `mstatus` 的写掩码保留了 WPRI 位 0、4 和 XS（15:16），和 Spike 不同；只有往 `mstatus` 写全 1 才看得出来，不影响软件。
 - 两个宽度都**没有**压缩指令 C。
 - rv64 的 MMIO 访问：function-model 里对 MMIO 的 `sd/ld` 读回还没有做。
 - SPEC 的 rv64 版本还没有重新生成：`scripts/spec/` 和 `~/personal/AI-Huma-data/spec-rv32imab` 都是 rv32imab；rv64 只有 Linux 启动和定向测试的检查点。

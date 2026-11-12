@@ -239,6 +239,15 @@ public:
       }
     }
 
+#if FP
+    for (int i = 0; i < 32; ++i) {
+      if (s->FPR[i].v[0] != dut_state.fpr[i]) {
+        reg_mismatch = true;
+        std::cout << "[SpikeRef] f" << i << " Ref=0x" << std::hex << s->FPR[i].v[0] << " DUT=0x" << dut_state.fpr[i]
+                  << std::dec << std::endl;
+      }
+    }
+#endif
     // Surgical CSR Check (the 21 implemented CSRs)
     static const uint32_t implemented_csr_addrs[21] = {
         0x305, 0x341, 0x342, 0x304, 0x344, 0x343, 0x340,
@@ -558,6 +567,9 @@ public:
     for (int i = 0; i < 32; ++i) {
       s->XPR.write(i, canonical_rv32(dut_state.gpr[i]));
     }
+#if FP
+    for (int i = 0; i < 32; ++i) s->FPR.write(i, freg_t{{dut_state.fpr[i], ~uint64_t(0)}});
+#endif
   }
 
 };

@@ -594,7 +594,11 @@ void Ref_cpu::init(uint32_t reset_pc, const char *image, uint32_t size) {
     state.csr[i] = 0;
   }
 #if XLEN == 64
+#if FP
+  state.csr[csr_misa] = (xlen_t(2) << 62) | 0x14112B;   // MXL = 2, A B D F I M S U
+#else
   state.csr[csr_misa] = (xlen_t(2) << 62) | 0x141103;   // MXL = 2, A B I M S U
+#endif
 #else
   state.csr[csr_misa] = 0x40141103;
 #endif
@@ -611,6 +615,9 @@ void Ref_cpu::init(uint32_t reset_pc, const char *image, uint32_t size) {
   state.reserve_addr = 0;
   fcsr_fflags = 0;
   fcsr_frm = 0;
+#if FP
+  for (int i = 0; i < 32; i++) state.fpr[i] = 0;
+#endif
   sim_time = 0;
   g_disable_uart_console_output = false;
   difftest_started = false;
@@ -1450,6 +1457,9 @@ void print_state_digest(uint64_t t, const CPU_state &st, uint8_t priv = 0) {
   auto mix = [&h](uint64_t v) { h = (h ^ v) * 1099511628211ull; };
   mix(st.pc);
   for (int i = 1; i < 32; i++) mix(st.gpr[i]);
+#if FP
+  for (int i = 0; i < 32; i++) mix(st.fpr[i]);
+#endif
   if (g_digest_full) {
     mix(priv);
     for (int i = 0; i < 21; i++) {
@@ -2149,7 +2159,7 @@ void Ref_cpu::exec(const SimConfig &config) {
   // Initialize Spike Reference Simulator if enabled
 #ifdef ENABLE_SPIKE
   if (config.difftest) {
-    spike_ref = std::make_unique<SpikeRef>(XLEN == 64 ? "rv64imab_zbc_zbkb_zbkx" : "rv32imab_zfinx_zbc_zbkb_zbkx", 0x80000000, 0x80000000,
+    spike_ref = std::make_unique<SpikeRef>(XLEN == 64 ? (FP ? "rv64imafdb_zbc_zbkb_zbkx" : "rv64imab_zbc_zbkb_zbkx") : "rv32imab_zfinx_zbc_zbkb_zbkx", 0x80000000, 0x80000000,
                                            config.image_file.c_str());
   }
 #else
@@ -3061,6 +3071,16 @@ void Ref_cpu::RISCV() {
       return;
     }
 #endif
+#if FP
+  } else if (opcode == number_12_opcode_float || opcode == number_13_opcode_fmadd ||
+             opcode == number_14_opcode_fmsub || opcode == number_15_opcode_fnmsub ||
+             opcode == number_16_opcode_fnmadd) {
+    RVFD();
+    if (illegal_exception) {
+      exception(Instruction);
+      return;
+    }
+#endif
   } else {
     RV32IM();
     if (illegal_exception) {
@@ -3084,9 +3104,9 @@ void Ref_cpu::RV32CSR() {
 
   xlen_t reg_rdata1 = state.gpr[rs1];
 
-  bool we = funct3 == 1 || rs1 != 0;
-  bool re = funct3 != 1 || rd != 0;
   uint32_t wcmd = funct3 & 0b11;
+  bool we = wcmd == CSR_W || rs1 != 0;   // csrrw and csrrwi always write (also with a zero operand); csrrs/csrrc[i] only when rs1/uimm != 0
+  bool re = wcmd != CSR_W || rd != 0;
   xlen_t csr_wdata = 0, wdata;
 
   if (funct3 & 0b100) {
@@ -3117,9 +3137,16 @@ void Ref_cpu::RV32CSR() {
     return;
   }
 
-#if XLEN == 32
+#if XLEN == 32 || FP
   if (csr_addr == number_fflags || csr_addr == number_frm ||
       csr_addr == number_fcsr) {
+#if FP
+    if (!fp_enabled()) {   // mstatus.FS = Off: the FP CSRs are illegal
+      illegal_exception = true;
+      exception(Instruction);
+      return;
+    }
+#endif
     uint32_t old_val = 0;
     if (csr_addr == number_fflags) {
       old_val = fcsr_fflags & 0x1Fu;
@@ -3143,6 +3170,9 @@ void Ref_cpu::RV32CSR() {
         fcsr_fflags = static_cast<uint8_t>(new_val & 0x1Fu);
         fcsr_frm = static_cast<uint8_t>((new_val >> 5) & 0x7u);
       }
+#if FP
+      fs_dirty();
+#endif
     }
     state.pc = next_pc;
     return;
@@ -3254,6 +3284,9 @@ void Ref_cpu::RV32CSR() {
           state.csr[csr_mstatus] = (state.csr[csr_mstatus] & ~mstatus_mask) |
                                    (csr_wdata & mstatus_mask);
         }
+#if FP
+        sync_sd();
+#endif
         // 同步更新 sstatus 影子值
         state.csr[csr_sstatus] = state.csr[csr_mstatus] & sstatus_mask;
 
@@ -3464,6 +3497,219 @@ void Ref_cpu::RV32Zfinx() {
 
 #endif  // XLEN == 32 (Zfinx)
 
+#if FP
+// ---------------------------------------------------------------------------------------------------------------------
+// F / D (rv64).  The FP registers are 64 bits; a single-precision value is NaN-boxed (upper word all ones), and a source
+// that is not properly boxed reads as the canonical NaN.  Flags accumulate in fcsr.fflags, and every FP-state write marks
+// mstatus.FS Dirty.  Behaviour follows Spike (the reference of --diff).
+// ---------------------------------------------------------------------------------------------------------------------
+bool Ref_cpu::fp_enabled() const { return ((state.csr[csr_mstatus] >> 13) & 3) != 0; }
+
+void Ref_cpu::sync_sd() {
+  const xlen_t sd = xlen_t(1) << 63;
+  if (((state.csr[csr_mstatus] >> 13) & 3) == 3) state.csr[csr_mstatus] |= sd;
+  else state.csr[csr_mstatus] &= ~sd;
+}
+
+void Ref_cpu::fs_dirty() {
+  state.csr[csr_mstatus] |= xlen_t(3) << 13;
+  sync_sd();
+  state.csr[csr_sstatus] = state.csr[csr_mstatus] & kSstatusMask;
+}
+
+namespace {
+constexpr uint32_t kCanonNaN32 = 0x7fc00000u;
+constexpr uint64_t kCanonNaN64 = 0x7ff8000000000000ull;
+inline uint64_t nanbox32(uint32_t v) { return 0xFFFFFFFF00000000ull | v; }
+inline uint32_t unbox32(uint64_t v) { return (v >> 32) == 0xFFFFFFFFu ? static_cast<uint32_t>(v) : kCanonNaN32; }
+inline float64_t to_f64(uint64_t v) { float64_t f; f.v = v; return f; }
+
+inline bool is_nan64(uint64_t v) { return ((v >> 52) & 0x7FFu) == 0x7FFu && (v & 0x000FFFFFFFFFFFFFull) != 0; }
+inline bool is_snan64(uint64_t v) { return is_nan64(v) && ((v >> 51) & 1u) == 0; }
+
+template <typename UInt, int EXPW, int MANTW>
+uint32_t fclass_generic(UInt bits) {
+  const UInt sign = (bits >> (EXPW + MANTW)) & 1u;
+  const UInt exp = (bits >> MANTW) & ((UInt(1) << EXPW) - 1);
+  const UInt mant = bits & ((UInt(1) << MANTW) - 1);
+  const bool expmax = exp == ((UInt(1) << EXPW) - 1);
+  const bool zero = exp == 0 && mant == 0, sub = exp == 0 && mant != 0, inf = expmax && mant == 0, nan = expmax && mant != 0;
+  if (nan) return ((mant >> (MANTW - 1)) & 1u) ? (1u << 9) : (1u << 8);
+  if (inf) return sign ? (1u << 0) : (1u << 7);
+  if (zero) return sign ? (1u << 3) : (1u << 4);
+  if (sub) return sign ? (1u << 2) : (1u << 5);
+  return sign ? (1u << 1) : (1u << 6);
+}
+
+inline uint64_t f64_min_riscv(uint64_t a, uint64_t b) {
+  if (is_snan64(a) || is_snan64(b)) softfloat_exceptionFlags |= softfloat_flag_invalid;
+  const bool an = is_nan64(a), bn = is_nan64(b);
+  if (an && bn) return kCanonNaN64;
+  if (an) return b;
+  if (bn) return a;
+  if (f64_lt(to_f64(a), to_f64(b))) return a;
+  if (f64_lt(to_f64(b), to_f64(a))) return b;
+  return a | b;   // -0.0 wins on ties
+}
+inline uint64_t f64_max_riscv(uint64_t a, uint64_t b) {
+  if (is_snan64(a) || is_snan64(b)) softfloat_exceptionFlags |= softfloat_flag_invalid;
+  const bool an = is_nan64(a), bn = is_nan64(b);
+  if (an && bn) return kCanonNaN64;
+  if (an) return b;
+  if (bn) return a;
+  if (f64_lt(to_f64(a), to_f64(b))) return b;
+  if (f64_lt(to_f64(b), to_f64(a))) return a;
+  return a & b;   // +0.0 wins on ties
+}
+}  // namespace
+
+void Ref_cpu::RVFD() {
+  const xlen_t next_pc = state.pc + 4;
+  const uint32_t opcode = BITS(Instruction, 6, 0);
+  const uint32_t rd = BITS(Instruction, 11, 7), rs1 = BITS(Instruction, 19, 15), rs2 = BITS(Instruction, 24, 20);
+  const uint32_t rs3 = BITS(Instruction, 31, 27), funct3 = BITS(Instruction, 14, 12);
+  const uint32_t fmt = BITS(Instruction, 26, 25), funct5 = BITS(Instruction, 31, 27);
+  if (!fp_enabled() || fmt > 1) { illegal_exception = true; return; }
+  const bool D = fmt == 1;
+
+  // rounding mode: the rm field, or fcsr.frm when it is 7 (dynamic); 5, 6 and a dynamic 5..7 are reserved
+  auto set_rm = [&]() -> bool {
+    const uint32_t rm = funct3 == 7 ? (fcsr_frm & 7u) : funct3;
+    switch (rm) {
+    case 0: softfloat_roundingMode = softfloat_round_near_even; return true;
+    case 1: softfloat_roundingMode = softfloat_round_minMag; return true;
+    case 2: softfloat_roundingMode = softfloat_round_min; return true;
+    case 3: softfloat_roundingMode = softfloat_round_max; return true;
+    case 4: softfloat_roundingMode = softfloat_round_near_maxMag; return true;
+    default: return false;
+    }
+  };
+  softfloat_exceptionFlags = 0;
+  auto bad = [&]() { illegal_exception = true; };
+  auto wrfS = [&](uint32_t v) { state.fpr[rd] = nanbox32(v); fs_dirty(); };
+  auto wrfD = [&](uint64_t v) { state.fpr[rd] = v; fs_dirty(); };
+  auto wrx = [&](xlen_t v) { if (rd != 0) state.gpr[rd] = v; };
+  const uint32_t a32 = unbox32(state.fpr[rs1]), b32 = unbox32(state.fpr[rs2]), c32 = unbox32(state.fpr[rs3]);
+  const uint64_t a64 = state.fpr[rs1], b64 = state.fpr[rs2], c64 = state.fpr[rs3];
+  constexpr uint32_t S32 = 0x80000000u;
+  constexpr uint64_t S64 = 0x8000000000000000ull;
+
+  if (opcode != number_12_opcode_float) {   // FMADD / FMSUB / FNMSUB / FNMADD
+    if (!set_rm()) { bad(); return; }
+    if (D) {
+      uint64_t x = a64, z = c64;
+      if (opcode == number_15_opcode_fnmsub || opcode == number_16_opcode_fnmadd) x ^= S64;
+      if (opcode == number_14_opcode_fmsub || opcode == number_16_opcode_fnmadd) z ^= S64;
+      wrfD(f64_mulAdd(to_f64(x), to_f64(b64), to_f64(z)).v);
+    } else {
+      uint32_t x = a32, z = c32;
+      if (opcode == number_15_opcode_fnmsub || opcode == number_16_opcode_fnmadd) x ^= S32;
+      if (opcode == number_14_opcode_fmsub || opcode == number_16_opcode_fnmadd) z ^= S32;
+      wrfS(f32_mulAdd(to_f32(x), to_f32(b32), to_f32(z)).v);
+    }
+  } else {
+    switch (funct5) {
+    case 0x00: case 0x01: case 0x02: case 0x03: {   // fadd fsub fmul fdiv
+      if (!set_rm()) { bad(); return; }
+      if (D) {
+        const float64_t x = to_f64(a64), y = to_f64(b64);
+        wrfD((funct5 == 0 ? f64_add(x, y) : funct5 == 1 ? f64_sub(x, y) : funct5 == 2 ? f64_mul(x, y) : f64_div(x, y)).v);
+      } else {
+        const float32_t x = to_f32(a32), y = to_f32(b32);
+        wrfS((funct5 == 0 ? f32_add(x, y) : funct5 == 1 ? f32_sub(x, y) : funct5 == 2 ? f32_mul(x, y) : f32_div(x, y)).v);
+      }
+      break;
+    }
+    case 0x0B:   // fsqrt
+      if (rs2 != 0 || !set_rm()) { bad(); return; }
+      if (D) wrfD(f64_sqrt(to_f64(a64)).v); else wrfS(f32_sqrt(to_f32(a32)).v);
+      break;
+    case 0x04:   // fsgnj fsgnjn fsgnjx
+      if (funct3 > 2) { bad(); return; }
+      if (D) {
+        const uint64_t sgn = funct3 == 0 ? (b64 & S64) : funct3 == 1 ? (~b64 & S64) : ((a64 ^ b64) & S64);
+        wrfD((a64 & ~S64) | sgn);
+      } else {
+        const uint32_t sgn = funct3 == 0 ? (b32 & S32) : funct3 == 1 ? (~b32 & S32) : ((a32 ^ b32) & S32);
+        wrfS((a32 & ~S32) | sgn);
+      }
+      break;
+    case 0x05:   // fmin fmax
+      if (funct3 > 1) { bad(); return; }
+      if (D) wrfD(funct3 == 0 ? f64_min_riscv(a64, b64) : f64_max_riscv(a64, b64));
+      else wrfS(funct3 == 0 ? f32_min_riscv(a32, b32) : f32_max_riscv(a32, b32));
+      break;
+    case 0x08:   // fcvt.s.d (fmt S, rs2 = 1) / fcvt.d.s (fmt D, rs2 = 0)
+      if (D) {
+        if (rs2 != 0 || !set_rm()) { bad(); return; }   // (Spike checks rm here too, though the conversion is exact)
+        wrfD(f32_to_f64(to_f32(a32)).v);
+      } else {
+        if (rs2 != 1 || !set_rm()) { bad(); return; }
+        wrfS(f64_to_f32(to_f64(a64)).v);
+      }
+      break;
+    case 0x14: {   // feq flt fle
+      if (funct3 > 2) { bad(); return; }
+      bool r;
+      if (D) r = funct3 == 2 ? f64_eq(to_f64(a64), to_f64(b64)) : funct3 == 1 ? f64_lt(to_f64(a64), to_f64(b64)) : f64_le(to_f64(a64), to_f64(b64));
+      else r = funct3 == 2 ? f32_eq(to_f32(a32), to_f32(b32)) : funct3 == 1 ? f32_lt(to_f32(a32), to_f32(b32)) : f32_le(to_f32(a32), to_f32(b32));
+      wrx(r ? 1 : 0);
+      break;
+    }
+    case 0x18: {   // fcvt.w / wu / l / lu . fmt
+      if (rs2 > 3 || !set_rm()) { bad(); return; }
+      const uint_fast8_t rm = softfloat_roundingMode;
+      xlen_t r;
+      if (D) {
+        const float64_t x = to_f64(a64);
+        r = rs2 == 0 ? static_cast<xlen_t>(static_cast<int64_t>(f64_to_i32(x, rm, true)))
+          : rs2 == 1 ? static_cast<xlen_t>(static_cast<int64_t>(static_cast<int32_t>(f64_to_ui32(x, rm, true))))
+          : rs2 == 2 ? static_cast<xlen_t>(f64_to_i64(x, rm, true)) : static_cast<xlen_t>(f64_to_ui64(x, rm, true));
+      } else {
+        const float32_t x = to_f32(a32);
+        r = rs2 == 0 ? static_cast<xlen_t>(static_cast<int64_t>(f32_to_i32(x, rm, true)))
+          : rs2 == 1 ? static_cast<xlen_t>(static_cast<int64_t>(static_cast<int32_t>(f32_to_ui32(x, rm, true))))
+          : rs2 == 2 ? static_cast<xlen_t>(f32_to_i64(x, rm, true)) : static_cast<xlen_t>(f32_to_ui64(x, rm, true));
+      }
+      wrx(r);
+      break;
+    }
+    case 0x1A: {   // fcvt.fmt.w / wu / l / lu
+      if (rs2 > 3) { bad(); return; }
+      if (!set_rm()) { bad(); return; }   // (Spike checks rm for fcvt.d.w / .wu too, though they are exact)
+      const xlen_t x = state.gpr[rs1];
+      if (D) {
+        wrfD((rs2 == 0 ? i32_to_f64(static_cast<int32_t>(x)) : rs2 == 1 ? ui32_to_f64(static_cast<uint32_t>(x))
+              : rs2 == 2 ? i64_to_f64(static_cast<int64_t>(x)) : ui64_to_f64(x)).v);
+      } else {
+        wrfS((rs2 == 0 ? i32_to_f32(static_cast<int32_t>(x)) : rs2 == 1 ? ui32_to_f32(static_cast<uint32_t>(x))
+              : rs2 == 2 ? i64_to_f32(static_cast<int64_t>(x)) : ui64_to_f32(x)).v);
+      }
+      break;
+    }
+    case 0x1C:   // fmv.x.w / fmv.x.d (funct3 0), fclass (funct3 1)
+      if (rs2 != 0 || funct3 > 1) { bad(); return; }
+      if (funct3 == 0) wrx(D ? static_cast<xlen_t>(state.fpr[rs1]) : static_cast<xlen_t>(static_cast<int64_t>(static_cast<int32_t>(state.fpr[rs1]))));
+      else wrx(D ? fclass_generic<uint64_t, 11, 52>(a64) : fclass_generic<uint32_t, 8, 23>(a32));
+      break;
+    case 0x1E:   // fmv.w.x / fmv.d.x
+      if (rs2 != 0 || funct3 != 0) { bad(); return; }
+      if (D) wrfD(state.gpr[rs1]); else wrfS(static_cast<uint32_t>(state.gpr[rs1]));
+      break;
+    default:
+      bad();
+      return;
+    }
+  }
+  if (softfloat_exceptionFlags) {
+    fcsr_fflags = static_cast<uint8_t>((fcsr_fflags | softfloat_exceptionFlags) & 0x1Fu);
+    fs_dirty();
+  }
+  state.pc = next_pc;
+}
+#endif  // FP
+
+
 void Ref_cpu::RV32IM() {
   // pc + 4
   xlen_t next_pc = state.pc + 4;
@@ -3473,11 +3719,28 @@ void Ref_cpu::RV32IM() {
   uint32_t reg_d_index = BITS(Instruction, 11, 7);
   uint32_t reg_a_index = BITS(Instruction, 19, 15);
   uint32_t reg_b_index = BITS(Instruction, 24, 20);
+#if FP
+  // flw/fld/fsw/fsd run the integer load/store code (same translation, faults, MMIO, store path); only the register file
+  // differs.  funct3 2 / 3 of LOAD-FP / STORE-FP equals lw / ld (sw / sd).
+  bool fp_mem = false;
+  if (opcode == 0x07 || opcode == 0x27) {
+    if (!fp_enabled() || (funct3 != 2 && funct3 != 3)) {
+      illegal_exception = true;
+      return;
+    }
+    fp_mem = true;
+    opcode = (opcode == 0x07) ? number_5_opcode_lb : number_6_opcode_sb;
+  }
+#endif
   // shift-immediate encodings: rv64 has a 6-bit shamt, so bit 25 belongs to it and only funct7[6:1] selects the operation
   const uint32_t funct7s = (XLEN == 64) ? (funct7 & ~1u) : funct7;
 
   const xlen_t reg_rdata1 = state.gpr[reg_a_index];
+#if FP
+  const xlen_t reg_rdata2 = fp_mem ? static_cast<xlen_t>(state.fpr[reg_b_index]) : state.gpr[reg_b_index];
+#else
   const xlen_t reg_rdata2 = state.gpr[reg_b_index];
+#endif
   const sxlen_t s_rdata1 = static_cast<sxlen_t>(reg_rdata1);
   const sxlen_t s_rdata2 = static_cast<sxlen_t>(reg_rdata2);
   bool handled = false;   // OP / OP-IMM: set when an encoding selects an implemented operation
@@ -3596,6 +3859,13 @@ void Ref_cpu::RV32IM() {
         if (ov != static_cast<uint32_t>(data)) data = is_unsigned ? static_cast<xlen_t>(ov) : sext32(ov);
       }
     }
+#if FP
+    if (fp_mem) {
+      state.fpr[reg_d_index] = access_size == 4 ? (0xFFFFFFFF00000000ull | static_cast<uint32_t>(data)) : data;   // flw boxes
+      fs_dirty();
+      break;
+    }
+#endif
     state.gpr[reg_d_index] = data;
     break;
   }

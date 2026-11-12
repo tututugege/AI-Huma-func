@@ -12,8 +12,9 @@ namespace {
 constexpr uint32_t CKPT_MAGIC = 0x006d6552u; // "Rem\0" (little-endian)
 // Format versions: 2 = rv32 without the SDRAM size field (legacy), 3 = rv32, 4 = rv64 (CPU_state is stored as in memory, with
 // 64-bit registers: its layout depends on XLEN, so the version tells the reader which one to expect).
-constexpr uint16_t CKPT_VERSION = (XLEN == 64) ? 4u : 3u;
-constexpr uint16_t CKPT_VERSION_LEGACY = (XLEN == 64) ? 4u : 2u;
+// rv64: 4 = integer state, 5 = F/D build (CPU_state carries the FP registers, and fcsr follows it)
+constexpr uint16_t CKPT_VERSION = (XLEN == 64) ? (FP ? 5u : 4u) : 3u;
+constexpr uint16_t CKPT_VERSION_LEGACY = (XLEN == 64) ? (FP ? 5u : 4u) : 2u;
 constexpr uint32_t BOOT_IO_BASE = 0x00000000u;
 constexpr uint32_t BOOT_IO_SIZE = 0x00100000u;
 
@@ -161,6 +162,9 @@ void Ref_cpu::save_checkpoint(const std::string &filename) {
 
   // 1. 保存 CPU 状态
   gz_write_pod(file, state);
+#if FP
+  gz_write_pod(file, static_cast<uint32_t>((fcsr_frm & 7u) << 5 | (fcsr_fflags & 0x1Fu)));
+#endif
   gz_write_pod(file, interval_inst_count);
 
   // 2. 保存 RAM
@@ -224,7 +228,7 @@ void Ref_cpu::restore_checkpoint(const std::string &filename, bool mem_only) {
       checkpoint_version != CKPT_VERSION_LEGACY) {
     std::cerr << "Error: Unsupported checkpoint version: "
               << checkpoint_version << " (this simulator is rv" << XLEN << ": versions "
-              << (XLEN == 64 ? "4" : "2 and 3") << ")"
+              << (XLEN == 64 ? (FP ? "5" : "4") : "2 and 3") << ")"
               << std::endl;
     exit(1);
   }
@@ -250,9 +254,19 @@ void Ref_cpu::restore_checkpoint(const std::string &filename, bool mem_only) {
     CPU_state discarded_state;
     uint64_t discarded_interval = 0;
     gz_read_pod(file, discarded_state);
+#if FP
+    uint32_t discarded_fcsr = 0;
+    gz_read_pod(file, discarded_fcsr);
+#endif
     gz_read_pod(file, discarded_interval);
   } else {
     gz_read_pod(file, state);
+#if FP
+    uint32_t fcsr = 0;
+    gz_read_pod(file, fcsr);
+    fcsr_fflags = static_cast<uint8_t>(fcsr & 0x1Fu);
+    fcsr_frm = static_cast<uint8_t>((fcsr >> 5) & 7u);
+#endif
     gz_read_pod(file, interval_inst_count);
   }
 

@@ -40,6 +40,6 @@ function-model 对不在白名单里的 CSR 陷入非法指令，Spike 实现这
 - `tests/rv64/gen_sv39.py`：Sv39 定向测试：16 种叶子 PTE（权限、A/D、保留位、U 位、W-only）、2 MiB 和 1 GiB 超页（对齐和不对齐）、非规范地址及其别名、MPRV + S/U 数据特权 × SUM × MXR、经 `mret` 进入 S/U 的取指，陷入后继续。
 - 测试有效性用变异检查：在模型的页表遍历里分别去掉 SUM、A、D、X 取指、保留位、规范地址、W-only、超页对齐、MXR、U 位检查，九个变异全部被 Spike 对拍抓到。
 - 结果：rv64 下 cpu-tests（排除浮点、`load-store`、`string`、`bitmanip-boundary`）加上述两个定向测试，只剩两个已知的平台差异（`software-interrupt-vectored` 的 MSIP、`timer-interrupt-mask` 的 MTIP）；rv32 默认构建的对拍结果与改动前一致。
-- `bitmanip-boundary` 的汇编里写死了 rv32 的 `rev8` 编码（0x698），在 rv64 上是非法指令，需要为 rv64 另写。rv64 还没做的：F/D 浮点（Spike 的 rv64 ISA 里也没有）、C 扩展。
+- `bitmanip-boundary` 的汇编里写死了 rv32 的 `rev8` 编码（0x698），在 rv64 上是非法指令，需要为 rv64 另写。rv64 的 F/D 在 `FP=1` 构建里（Spike ISA `rv64imafdb_…`）：`tests/rv64/gen_fp.py`、`gen_fp_trap.py` 和 `fp-kernels.c` 三个测试全部与 Spike 逐条一致（`tests/rv64/run.sh` 的最后一段）；rv64 还没做的：C 扩展。
 - Linux（rv64，`linux/README.md` 的 rv64 镜像）从复位一路启动到登录提示，Spike 逐条对比无不一致（修复 sstatus 写掩码之后；此前 UXL 位被内核写 sstatus 清掉，Spike 保留）。直接启动约 9 分钟里大部分是登录提示后的空转，对拍到登录提示只需几分钟。
 - rv64 快速路径（2026-11-11）：基本块缓存改成 XLEN 通用版，rv64 增加 `lwu/ld/sd` 和 `*W` 类指令；rv64 的 FastBlock 另存 satp（上下文字放不下）。验证方法是与 `REF_NO_FAST=1` 比较状态摘要（`REF_STATE_DIGEST_BLOCK` / `REF_DIGEST_LIST`）：rv64 Linux 启动到登录提示的 88 个摘要、`rv64-isa`、`rv64-sv39` 逐个相同；rv32 的 67 个程序输出、Linux 20 个摘要与改动前相同，速度也没有变化（100M 条指令 8.3 秒对 8.5 秒）。rv64 Linux 启动到登录提示约 0.5 秒，不开快速路径约 1.9 秒。快速路径对拍（Spike）不经过，因为 `--diff` 走通用循环。

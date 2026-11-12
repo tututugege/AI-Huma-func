@@ -166,6 +166,9 @@ struct SimConfig {
 
 typedef struct CPU_state {
   xlen_t gpr[32];
+#if FP
+  uint64_t fpr[32];   // F/D register file; a single-precision value is NaN-boxed (upper 32 bits all ones)
+#endif
   xlen_t csr[21];
   xlen_t pc;
 
@@ -325,6 +328,12 @@ public:
   uint32_t visible_mip() const;
   uint32_t visible_sip() const;
 
+#if FP
+  __attribute__((noinline)) void RVFD();   // F/D: loads/stores are folded into RV32IM(); this is OP-FP and the fused multiply-add group
+  void fs_dirty();                         // mstatus.FS = Dirty (and SD)
+  void sync_sd();                          // recompute SD from FS after a status write
+  bool fp_enabled() const;                 // mstatus.FS != Off
+#endif
   uint8_t fcsr_fflags = 0;
   uint8_t fcsr_frm = 0;
 
