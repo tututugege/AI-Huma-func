@@ -43,3 +43,17 @@ REF_UNBUF=1 ./a.out.nospike --image /tmp/linux64.bin  # boots to "rv64 login:" i
 ```
 
 OpenSBI's rv64 fw_jump jumps to 0x80200000 (kernel at offset 0x200000), the devicetree is passed at 0x82200000.
+
+## rv64g (F/D, 2026-11-13)
+
+Same Buildroot flow in `~/br64g` (Lima VM `rvbuild`): `BR2_RISCV_ISA_RVF/RVD`, `BR2_RISCV_ABI_LP64D` (hard-float glibc), no C; kernel config =
+`rv64_min.fragment` with `CONFIG_FPU=y` (`~/rv64g_kernel.config`); OpenSBI `PLATFORM_RISCV_ISA=rv64imafd_zicsr_zifencei PLATFORM_RISCV_ABI=lp64d`.
+Build with `HOSTCC=gcc-13 HOSTCXX=g++-13` (host-m4 does not build with the VM's gcc 15). `ttg64g.dts` = `ttg64.dts` with `riscv,isa = "rv64imafd"`.
+The rootfs overlay (`~/ovl`) runs `/usr/bin/fptest` at boot: libm sin / sqrt / exp, printf of float / double, and 4 forked processes
+that recompute a double result 20 times with `sched_yield` and must match the parent bit for bit (checks the FS / f-register context switch).
+Images: `~/personal/AI-Huma-data/linux_rv64g/`. Needs the FP=1 build of the model (`make XLEN=64 no_spike LDFLAGS="-lz lib/softfloat/softfloat.a"`).
+
+```bash
+KOFF=0x200000 DTS=ttg64g.dts MEM=0x10000000 bash linux/mkimage.sh ~/personal/AI-Huma-data/linux_rv64g /tmp/linux64g.bin
+REF_UNBUF=1 REF_MAX_INSTS=600000000 ./a.out.nospike --image /tmp/linux64g.bin    # OpenSBI: "Base ISA : rv64imafdb"; prints "fptest: PASS", then "rv64 login:"
+```

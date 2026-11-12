@@ -1,0 +1,64 @@
+/dts-v1/;
+
+/* Devicetree for the function-model platform (see README: address map): 256 MiB at 0x80000000, ns16550a UART at
+ * 0x10000000 (polled), an ACLINT-style MTIMER at 0x1fd0e000 (mtime at +0, mtimecmp at +8), no PLIC.
+ * The ISA is rv64ima: no C, no F/D. */
+/ {
+	#address-cells = <0x02>;
+	#size-cells = <0x02>;
+	compatible = "ttg,function-model";
+	model = "ttg,function-model";
+
+	chosen {
+		linux,initrd-start = <0x84400000>;
+		linux,initrd-end = <0x847d0000>;
+		bootargs = "console=ttyS0,115200 earlycon=uart8250,mmio,0x10000000 nokaslr root=/dev/ram init=/init";
+		stdout-path = "/soc/uart@10000000";
+	};
+
+	memory@80000000 {
+		device_type = "memory";
+		reg = <0x00 0x80000000 0x00 0x10000000>;
+	};
+
+	cpus {
+		#address-cells = <0x01>;
+		#size-cells = <0x00>;
+		timebase-frequency = <132000000>;
+
+		cpu0: cpu@0 {
+			device_type = "cpu";
+			reg = <0x00>;
+			status = "okay";
+			compatible = "riscv";
+			riscv,isa = "rv64imafd";
+			mmu-type = "riscv,sv39";
+
+			cpu0_intc: interrupt-controller {
+				#interrupt-cells = <0x01>;
+				interrupt-controller;
+				compatible = "riscv,cpu-intc";
+			};
+		};
+	};
+
+	soc {
+		#address-cells = <0x02>;
+		#size-cells = <0x02>;
+		compatible = "simple-bus";
+		ranges;
+
+		uart@10000000 {
+			reg = <0x00 0x10000000 0x00 0x100>;
+			compatible = "ns16550a";
+			clock-frequency = <1843200>;
+			current-speed = <115200>;
+		};
+
+		mtimer@1fd0e000 {
+			compatible = "riscv,aclint-mtimer";
+			reg = <0x00 0x1fd0e000 0x00 0x08>, <0x00 0x1fd0e008 0x00 0x08>;
+			interrupts-extended = <&cpu0_intc 7>;
+		};
+	};
+};
