@@ -33,9 +33,15 @@ def read_checkpoint(path):
     magic, ver, priv, ram_size, io_count = struct.unpack("<IHHII", f.read(16))
     sdram_size = struct.unpack("<I", f.read(4))[0] if ver >= 3 else 0
     global XLEN
-    XLEN = 64 if ver in (4, 5) else 32     # format version 4 = rv64 (CPU_state with 64-bit registers), 5 = rv64 with F/D
+    XLEN = 64 if ver in (4, 5) else 32     # format version 4 = rv64 (CPU_state with 64-bit registers), 5 = rv64 with F/D, 6 = rv32 with F/D
     fpr, fcsr = None, 0
-    if ver == 5:
+    if ver == 6:
+        st = f.read(496)       # rv32 CPU_state with the 64-bit FP registers: gpr[32] (4 bytes), fpr[32] (8 bytes), csr[21], pc, store_*, reserve_*
+        vals = struct.unpack("<32I32Q21I4I??2xI", st[:492])
+        gpr, fpr, csr = list(vals[0:32]), list(vals[32:64]), list(vals[64:85])
+        pc, store_addr, store_data, store_strb, store, reserve_valid, reserve_addr = vals[85:92]
+        fcsr = struct.unpack("<I", f.read(4))[0]
+    elif ver == 5:
         st = f.read(720)       # CPU_state: gpr[32], fpr[32], csr[21], pc, store_*, reserve_*
         vals = struct.unpack("<32Q32Q21QQI4xQI??2xI", st[:716])
         gpr, fpr, csr = list(vals[0:32]), list(vals[32:64]), list(vals[64:85])
@@ -172,7 +178,12 @@ def build(ck, warn):
         csr_prog += li(T0, 0x2000) + [csrw(CSR_NUM["mstatus"], T0)]
         csr_prog += li(T0, ck["fcsr"]) + [csrw(0x003, T0)]
         for i, v in enumerate(ck["fpr"]):
-            csr_prog += li(T0, v) + [u32((0x79 << 25) | (T0 << 15) | (i << 7) | 0x53)]   # fmv.d.x f<i>, t0
+            if XLEN == 64:
+                csr_prog += li(T0, v) + [u32((0x79 << 25) | (T0 << 15) | (i << 7) | 0x53)]   # fmv.d.x f<i>, t0
+            elif (v >> 32) == 0xFFFFFFFF:   # rv32 has no fmv.d.x: a NaN-boxed single is restored with fmv.w.x (boxes it), a double cannot be
+                csr_prog += li(T0, v & 0xFFFFFFFF) + [u32((0x78 << 25) | (T0 << 15) | (i << 7) | 0x53)]   # fmv.w.x f<i>, t0
+            elif v != 0:
+                warn("rv32: f%d holds a double (0x%016x): not restored (no fmv.d.x on rv32)" % (i, v))
     csr_prog += li(T0, ck["pc"]) + [csrw(CSR_NUM["mepc"], T0)]
     csr_prog += li(T0, x) + [csrw(CSR_NUM["mstatus"], T0)]
 

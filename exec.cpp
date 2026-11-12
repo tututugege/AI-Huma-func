@@ -600,7 +600,11 @@ void Ref_cpu::init(uint32_t reset_pc, const char *image, uint32_t size) {
   state.csr[csr_misa] = (xlen_t(2) << 62) | 0x141103;   // MXL = 2, A B I M S U
 #endif
 #else
+#if FP
+  state.csr[csr_misa] = 0x4014112B;   // MXL = 1, A B D F I M S U
+#else
   state.csr[csr_misa] = 0x40141103;
+#endif
 #endif
   state.csr[csr_mstatus] = kMstatusReset;
   state.csr[csr_sstatus] = kMstatusReset & kSstatusMask;
@@ -2159,7 +2163,7 @@ void Ref_cpu::exec(const SimConfig &config) {
   // Initialize Spike Reference Simulator if enabled
 #ifdef ENABLE_SPIKE
   if (config.difftest) {
-    spike_ref = std::make_unique<SpikeRef>(XLEN == 64 ? (FP ? "rv64imafdb_zbc_zbkb_zbkx" : "rv64imab_zbc_zbkb_zbkx") : "rv32imab_zfinx_zbc_zbkb_zbkx", 0x80000000, 0x80000000,
+    spike_ref = std::make_unique<SpikeRef>(XLEN == 64 ? (FP ? "rv64imafdb_zbc_zbkb_zbkx" : "rv64imab_zbc_zbkb_zbkx") : (FP ? "rv32imafdb_zbc_zbkb_zbkx" : "rv32imab_zbc_zbkb_zbkx"), 0x80000000, 0x80000000,
                                            config.image_file.c_str());
   }
 #else
@@ -3059,18 +3063,6 @@ void Ref_cpu::RISCV() {
       exception(Instruction);
       return;
     }
-#if XLEN == 32
-  } else if (opcode == number_12_opcode_float ||
-             opcode == number_13_opcode_fmadd ||
-             opcode == number_14_opcode_fmsub ||
-             opcode == number_15_opcode_fnmsub ||
-             opcode == number_16_opcode_fnmadd) {
-    RV32Zfinx();
-    if (illegal_exception) {
-      exception(Instruction);
-      return;
-    }
-#endif
 #if FP
   } else if (opcode == number_12_opcode_float || opcode == number_13_opcode_fmadd ||
              opcode == number_14_opcode_fmsub || opcode == number_15_opcode_fnmsub ||
@@ -3137,7 +3129,7 @@ void Ref_cpu::RV32CSR() {
     return;
   }
 
-#if XLEN == 32 || FP
+#if FP
   if (csr_addr == number_fflags || csr_addr == number_frm ||
       csr_addr == number_fcsr) {
 #if FP
@@ -3308,194 +3300,6 @@ void Ref_cpu::RV32CSR() {
   state.pc = next_pc;
 }
 
-#if XLEN == 32
-void Ref_cpu::RV32Zfinx() {
-  uint32_t next_pc = state.pc + 4;
-
-  uint32_t opcode = Instruction & 0x7Fu;
-  uint32_t rd = (Instruction >> 7) & 0x1Fu;
-  uint32_t funct3 = (Instruction >> 12) & 0x7u;
-  uint32_t rs1 = (Instruction >> 15) & 0x1Fu;
-  uint32_t rs2 = (Instruction >> 20) & 0x1Fu;
-  uint32_t funct7 = (Instruction >> 25) & 0x7Fu;
-  uint32_t rs3 = (Instruction >> 27) & 0x1Fu;
-
-  uint32_t val_rs1 = state.gpr[rs1];
-  uint32_t val_rs2 = state.gpr[rs2];
-  uint32_t val_rs3 = state.gpr[rs3];
-
-  uint8_t rm = static_cast<uint8_t>(funct3);
-  if (rm == 7) {
-    rm = static_cast<uint8_t>(fcsr_frm & 0x7u);
-  }
-
-  switch (rm) {
-  case 0:
-    softfloat_roundingMode = softfloat_round_near_even;
-    break;
-  case 1:
-    softfloat_roundingMode = softfloat_round_minMag;
-    break;
-  case 2:
-    softfloat_roundingMode = softfloat_round_min;
-    break;
-  case 3:
-    softfloat_roundingMode = softfloat_round_max;
-    break;
-  case 4:
-    softfloat_roundingMode = softfloat_round_near_maxMag;
-    break;
-  default:
-    illegal_exception = true;
-    return;
-  }
-
-  softfloat_exceptionFlags = 0;
-
-  float32_t f_rs1 = to_f32(val_rs1);
-  float32_t f_rs2 = to_f32(val_rs2);
-  float32_t f_rs3 = to_f32(val_rs3);
-  float32_t f_res;
-  uint32_t i_res = 0;
-  bool update_fflags = true;
-
-  switch (opcode) {
-  case number_12_opcode_float:
-    switch (funct7) {
-    case 0x00: // FADD.S
-      f_res = f32_add(f_rs1, f_rs2);
-      i_res = from_f32(f_res);
-      break;
-    case 0x04: // FSUB.S
-      f_res = f32_sub(f_rs1, f_rs2);
-      i_res = from_f32(f_res);
-      break;
-    case 0x08: // FMUL.S
-      f_res = f32_mul(f_rs1, f_rs2);
-      i_res = from_f32(f_res);
-      break;
-    case 0x0C: // FDIV.S
-      f_res = f32_div(f_rs1, f_rs2);
-      i_res = from_f32(f_res);
-      break;
-    case 0x2C: // FSQRT.S
-      if (rs2 != 0) {
-        illegal_exception = true;
-        return;
-      }
-      f_res = f32_sqrt(f_rs1);
-      i_res = from_f32(f_res);
-      break;
-    case 0x10: // FSGNJ.S/FSGNJN.S/FSGNJX.S
-      if (funct3 == 0) {
-        i_res = (val_rs1 & ~0x80000000u) | (val_rs2 & 0x80000000u);
-      } else if (funct3 == 1) {
-        i_res = (val_rs1 & ~0x80000000u) | (~val_rs2 & 0x80000000u);
-      } else if (funct3 == 2) {
-        i_res = val_rs1 ^ (val_rs2 & 0x80000000u);
-      } else {
-        illegal_exception = true;
-        return;
-      }
-      update_fflags = false;
-      break;
-    case 0x14: // FMIN.S/FMAX.S
-      if (funct3 == 0) {
-        i_res = f32_min_riscv(val_rs1, val_rs2);
-      } else if (funct3 == 1) {
-        i_res = f32_max_riscv(val_rs1, val_rs2);
-      } else {
-        illegal_exception = true;
-        return;
-      }
-      break;
-    case 0x50: // FEQ.S/FLT.S/FLE.S
-      if (funct3 == 2) {
-        i_res = f32_eq(f_rs1, f_rs2);
-      } else if (funct3 == 1) {
-        i_res = f32_lt(f_rs1, f_rs2);
-      } else if (funct3 == 0) {
-        i_res = f32_le(f_rs1, f_rs2);
-      } else {
-        illegal_exception = true;
-        return;
-      }
-      break;
-    case 0x60: // FCVT.W.S/FCVT.WU.S
-      if (rs2 == 0) {
-        i_res = static_cast<uint32_t>(
-            f32_to_i32(f_rs1, softfloat_roundingMode, true));
-      } else if (rs2 == 1) {
-        i_res = f32_to_ui32(f_rs1, softfloat_roundingMode, true);
-      } else {
-        illegal_exception = true;
-        return;
-      }
-      break;
-    case 0x68: // FCVT.S.W/FCVT.S.WU
-      if (rs2 == 0) {
-        f_res = i32_to_f32(static_cast<int32_t>(val_rs1));
-      } else if (rs2 == 1) {
-        f_res = ui32_to_f32(val_rs1);
-      } else {
-        illegal_exception = true;
-        return;
-      }
-      i_res = from_f32(f_res);
-      break;
-    case 0x70: // FCLASS.S
-      if (funct3 == 1) {
-        i_res = f32_classify_riscv(f_rs1);
-        update_fflags = false;
-      } else {
-        illegal_exception = true;
-        return;
-      }
-      break;
-    default:
-      illegal_exception = true;
-      return;
-    }
-    break;
-  case number_13_opcode_fmadd: // FMADD.S
-    f_res = f32_mulAdd(f_rs1, f_rs2, f_rs3);
-    i_res = from_f32(f_res);
-    break;
-  case number_14_opcode_fmsub: { // FMSUB.S
-    float32_t f_neg_rs3 = to_f32(val_rs3 ^ 0x80000000u);
-    f_res = f32_mulAdd(f_rs1, f_rs2, f_neg_rs3);
-    i_res = from_f32(f_res);
-    break;
-  }
-  case number_15_opcode_fnmsub: { // FNMSUB.S
-    float32_t f_neg_rs1 = to_f32(val_rs1 ^ 0x80000000u);
-    f_res = f32_mulAdd(f_neg_rs1, f_rs2, f_rs3);
-    i_res = from_f32(f_res);
-    break;
-  }
-  case number_16_opcode_fnmadd: { // FNMADD.S
-    float32_t f_neg_rs1 = to_f32(val_rs1 ^ 0x80000000u);
-    float32_t f_neg_rs3 = to_f32(val_rs3 ^ 0x80000000u);
-    f_res = f32_mulAdd(f_neg_rs1, f_rs2, f_neg_rs3);
-    i_res = from_f32(f_res);
-    break;
-  }
-  default:
-    illegal_exception = true;
-    return;
-  }
-
-  if (update_fflags) {
-    fcsr_fflags = static_cast<uint8_t>((fcsr_fflags | softfloat_exceptionFlags) &
-                                       0x1Fu);
-  }
-  if (rd != 0) {
-    state.gpr[rd] = i_res;
-  }
-  state.pc = next_pc;
-}
-
-#endif  // XLEN == 32 (Zfinx)
 
 #if FP
 // ---------------------------------------------------------------------------------------------------------------------
@@ -3506,7 +3310,7 @@ void Ref_cpu::RV32Zfinx() {
 bool Ref_cpu::fp_enabled() const { return ((state.csr[csr_mstatus] >> 13) & 3) != 0; }
 
 void Ref_cpu::sync_sd() {
-  const xlen_t sd = xlen_t(1) << 63;
+  const xlen_t sd = xlen_t(1) << (XLEN - 1);
   if (((state.csr[csr_mstatus] >> 13) & 3) == 3) state.csr[csr_mstatus] |= sd;
   else state.csr[csr_mstatus] &= ~sd;
 }
@@ -3657,7 +3461,7 @@ void Ref_cpu::RVFD() {
       break;
     }
     case 0x18: {   // fcvt.w / wu / l / lu . fmt
-      if (rs2 > 3 || !set_rm()) { bad(); return; }
+      if (rs2 > (XLEN == 64 ? 3 : 1) || !set_rm()) { bad(); return; }   // fcvt.l / lu exist on rv64 only
       const uint_fast8_t rm = softfloat_roundingMode;
       xlen_t r;
       if (D) {
@@ -3675,7 +3479,7 @@ void Ref_cpu::RVFD() {
       break;
     }
     case 0x1A: {   // fcvt.fmt.w / wu / l / lu
-      if (rs2 > 3) { bad(); return; }
+      if (rs2 > (XLEN == 64 ? 3 : 1)) { bad(); return; }
       if (!set_rm()) { bad(); return; }   // (Spike checks rm for fcvt.d.w / .wu too, though they are exact)
       const xlen_t x = state.gpr[rs1];
       if (D) {
@@ -3688,12 +3492,12 @@ void Ref_cpu::RVFD() {
       break;
     }
     case 0x1C:   // fmv.x.w / fmv.x.d (funct3 0), fclass (funct3 1)
-      if (rs2 != 0 || funct3 > 1) { bad(); return; }
+      if (rs2 != 0 || funct3 > 1 || (XLEN == 32 && D && funct3 == 0)) { bad(); return; }   // fmv.x.d: rv64 only
       if (funct3 == 0) wrx(D ? static_cast<xlen_t>(state.fpr[rs1]) : static_cast<xlen_t>(static_cast<int64_t>(static_cast<int32_t>(state.fpr[rs1]))));
       else wrx(D ? fclass_generic<uint64_t, 11, 52>(a64) : fclass_generic<uint32_t, 8, 23>(a32));
       break;
     case 0x1E:   // fmv.w.x / fmv.d.x
-      if (rs2 != 0 || funct3 != 0) { bad(); return; }
+      if (rs2 != 0 || funct3 != 0 || (XLEN == 32 && D)) { bad(); return; }   // fmv.d.x: rv64 only
       if (D) wrfD(state.gpr[rs1]); else wrfS(static_cast<uint32_t>(state.gpr[rs1]));
       break;
     default:
@@ -3803,6 +3607,9 @@ void Ref_cpu::RV32IM() {
 #else
     const uint32_t size = funct3 & 0b11;
     access_size = (size == 0b00) ? 1 : ((size == 0b01) ? 2 : 4);
+#if FP
+    if (fp_mem && funct3 == 3) access_size = 8;   // fld on rv32: 8 bytes (two words); funct3 == 3 is not a legal integer load there
+#endif
 #endif
     if (v_addr % access_size != 0) {
       std::cerr << "Misaligned Load! addr: 0x" << std::hex << v_addr << std::endl;
@@ -3827,14 +3634,14 @@ void Ref_cpu::RV32IM() {
       return;
     }
     check_mem_range_or_log("load", p_addr, access_size);
-    xlen_t data;
+    uint64_t data;   // (the FP double load is 64 bits wide on rv32 too)
     if (access_size == 8) {
       uint32_t lo = load_word(p_addr), hi = load_word(p_addr + 4);
       if (device_effects_enable) {
         lo = timer_word_override(p_addr, lo, sim_time);
         hi = timer_word_override(p_addr + 4, hi, sim_time);
       }
-      data = (static_cast<xlen_t>(hi) << 32) | lo;
+      data = (static_cast<uint64_t>(hi) << 32) | lo;
     } else {
       uint32_t word = load_word(p_addr);
       const uint32_t raw_word = word;
@@ -3850,6 +3657,7 @@ void Ref_cpu::RV32IM() {
       } else {
         data = sext32(word);   // lw
       }
+      data = static_cast<uint64_t>(static_cast<xlen_t>(data));   // (rv32: the register-width value)
       if (p_addr >= UART_BASE && p_addr < (UART_BASE + UART_MMIO_SIZE)) {
         trace_uart_load(sim_time, state.pc, p_addr, static_cast<uint8_t>(funct3), raw_word,
                         static_cast<uint32_t>(data));
@@ -3866,7 +3674,7 @@ void Ref_cpu::RV32IM() {
       break;
     }
 #endif
-    state.gpr[reg_d_index] = data;
+    state.gpr[reg_d_index] = static_cast<xlen_t>(data);
     break;
   }
   case number_6_opcode_sb: { // sb, sh, sw (rv64: sd)
@@ -3884,6 +3692,9 @@ void Ref_cpu::RV32IM() {
 #if XLEN == 64
       illegal_exception = true; return;
 #else
+#if FP
+      if (fp_mem && funct3 == 3) { access_size = 8; break; }   // fsd on rv32: 8 bytes (two words)
+#endif
       access_size = 4; break;
 #endif
     }
@@ -3911,6 +3722,23 @@ void Ref_cpu::RV32IM() {
     }
     check_mem_range_or_log("store", p_addr, access_size);
 
+#if FP && XLEN == 32
+    if (access_size == 8) {   // fsd on rv32: the double is 64 bits wide, the register width is 32: two word writes
+      const uint64_t d = state.fpr[reg_b_index];
+      state.store = true;
+      state.store_strb = 0b1111;
+      state.store_addr = p_addr;
+      state.store_data = static_cast<uint32_t>(d);
+      store_data_word();
+      state.store_addr = p_addr + 4;
+      state.store_data = static_cast<uint32_t>(d >> 32);
+      store_data_word();
+      state.store_addr = p_addr;                       // report the whole store (the low word's data)
+      state.store_data = static_cast<uint32_t>(d);
+      state.store_strb = 0xFFu;
+      break;
+    }
+#endif
     state.store = true;
     state.store_addr = p_addr;
     state.store_data = reg_rdata2;

@@ -8,7 +8,7 @@ CXXFLAGS = -O3 -march=native -funroll-loops -mtune=native -std=c++2a
 CXXFLAGS += -MMD -MP
 XLEN ?= 32
 CXXFLAGS += -DXLEN=$(XLEN)
-FP ?= 0
+FP ?= 1
 CXXFLAGS += -DFP=$(FP)
 SPIKE ?= 0
 SOFTFLOAT_LIB ?= ./lib/softfloat/softfloat.a

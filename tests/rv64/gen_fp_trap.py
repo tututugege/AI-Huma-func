@@ -2,9 +2,11 @@
 """rv64 F/D trap and status tests (function-model FP=1 vs Spike): mstatus.FS = Off makes every FP instruction and FP CSR
 access illegal, reserved rounding modes / formats trap, FS/SD track the FP state, misa shows F and D.  A machine-mode handler
 folds mcause / mepc into a checksum and skips the instruction (no oracle values here, Spike is the oracle).
-usage: gen_fp_trap.py <out-dir>      writes rv64-fp-trap.c and rv64-fp-trap-helper.S
+usage: gen_fp_trap.py <out-dir> [xlen]   writes rv<xlen>-fp-trap.c and rv<xlen>-fp-trap-helper.S
 """
 import sys, os
+XLEN = int(sys.argv[2]) if len(sys.argv) > 2 else 64
+TAG = "rv%d" % XLEN
 out = []
 A = out.append
 A("""    .section .text
@@ -28,14 +30,14 @@ handler:
     mret
 start:""")
 def fold(r="a2"):
-    A(f"    xor s10, s10, {r}\n    slli t6, s10, 1\n    srli s10, s10, 63\n    or s10, s10, t6")
+    A(f"    xor s10, s10, {r}\n    slli t6, s10, 1\n    srli s10, s10, {XLEN - 1}\n    or s10, s10, t6")
 def mst(): A("    csrr a2, mstatus"); fold(); A("    csrr a2, sstatus"); fold()
 def fs(v): A("    li t0, 0x6000\n    csrc mstatus, t0\n    li t0, %d\n    csrs mstatus, t0" % (v << 13))
 A("    csrr a2, misa"); fold()
 for v in (0, 1, 2, 3):   # every FS value: legal for v != 0
     fs(v); mst()
     for ins in ("fadd.s f1, f2, f3", "fadd.d f1, f2, f3", "flw f1, 0(sp)", "fld f1, 0(sp)", "fsw f1, -8(sp)", "fsd f1, -8(sp)",
-                "fmv.x.d a2, f1", "fmv.d.x f1, a0", "csrr a2, fflags", "csrr a2, frm", "csrr a2, fcsr", "csrw fcsr, zero",
+                *(("fmv.x.d a2, f1", "fmv.d.x f1, a0") if XLEN == 64 else (".word %d" % ((0x71 << 25) | (1 << 15) | (12 << 7) | 0x53), ".word %d" % ((0x79 << 25) | (10 << 15) | (1 << 7) | 0x53))), "csrr a2, fflags", "csrr a2, frm", "csrr a2, fcsr", "csrw fcsr, zero",
                 "csrr a2, fflags", "fclass.d a2, f1", "feq.s a2, f1, f2"):
         A(f"    li a0, 5\n    li a2, 0\n    {ins}"); fold(); mst()
     fs(v); A("    li a0, 0x3f800000\n    fmv.w.x f1, a0\n    csrr a2, mstatus"); fold(); A("    csrr a2, sstatus"); fold()
@@ -70,6 +72,6 @@ for f3 in range(8):
 A("    mv ra, s11\n    mv a0, s10\n    ret")
 d = sys.argv[1]
 os.makedirs(d, exist_ok=True)
-open(os.path.join(d, "rv64-fp-trap-helper.S"), "w").write("\n".join(out) + "\n")
-open(os.path.join(d, "rv64-fp-trap.c"), "w").write("extern long rv64_fptrap_body(void);\nint main(void) { rv64_fptrap_body(); return 0; }\n")
+open(os.path.join(d, TAG + "-fp-trap-helper.S"), "w").write("\n".join(out) + "\n")
+open(os.path.join(d, TAG + "-fp-trap.c"), "w").write("extern long rv64_fptrap_body(void);\nint main(void) { rv64_fptrap_body(); return 0; }\n")
 print(len(out), "lines")

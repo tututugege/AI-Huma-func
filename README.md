@@ -8,11 +8,11 @@
 |---|---|---|
 | 整数/乘除/原子 | RV32IMA | RV64IMA（含 `*W`、`lwu/ld/sd`、`amo*.d`、`lr/sc.d`） |
 | 位操作 | Zba/Zbb/Zbs、Zbc、Zbkb 的 `pack/packh`（无 `brev8/zip/xperm`），合称 "B" | 同左，另有 `*W` 变体 |
-| 浮点 | **Zfinx**（浮点用整数寄存器，softfloat） | 默认**没有**（`OP-FP` 是非法指令）；`FP=1` 时是标准 **F/D**（32 个 64 位浮点寄存器、`fcsr`、`mstatus.FS/SD`，softfloat；NaN-boxing 和 Spike 一致） |
+| 浮点 | 标准 **F/D**（默认 `FP=1`）：32 个 64 位浮点寄存器、`fcsr`、`mstatus.FS/SD`，softfloat，NaN-boxing 和 Spike 一致；rv32 没有 `fmv.x.d/fmv.d.x` 和 `fcvt.l/lu`，`fld/fsd` 是 8 字节访问（两个字）。`FP=0` 是没有任何浮点的核。Zfinx 已删除 | 同左 |
 | 压缩指令 C | 无 | 无 |
 | 地址翻译 | Sv32 | Sv39 |
-| 检查点格式 | 版本 3（2 仍可读） | 版本 4；`FP=1` 是版本 5（`CPU_state` 带浮点寄存器，其后跟 `fcsr`） |
-| Spike 对拍 ISA | `rv32imab_zfinx_zbc_zbkb_zbkx` | `rv64imab_zbc_zbkb_zbkx`；`FP=1` 是 `rv64imafdb_zbc_zbkb_zbkx` |
+| 检查点格式 | 版本 6（F/D）；`FP=0` 是版本 3（2 仍可读） | 版本 5（F/D）；`FP=0` 是版本 4（`CPU_state` 带浮点寄存器时其后跟 `fcsr`） |
+| Spike 对拍 ISA | `rv32imafdb_zbc_zbkb_zbkx`（`FP=0`：`rv32imab_…`） | `rv64imafdb_zbc_zbkb_zbkx`（`FP=0`：`rv64imab_…`） |
 | Linux | 5.15.170 + OpenSBI，启动到 `rv32 login:` | 同版本内核，启动到 `rv64 login:` |
 
 两个宽度共用同一份源码（`include/xlen.h` 定义 `xlen_t`）；默认的 `XLEN=32` 行为与 rv64 迁移之前一致。物理地址空间两个宽度相同（见下文），不支持 4 GiB 以上的物理地址。
@@ -34,7 +34,7 @@
 make -j4                    # rv32，不带 Spike，产物 a.out
 make no_spike -j4           # 同上，但产物叫 a.out.nospike（脚本和 linux/ 文档里用这个名字）
 make XLEN=64 -j4            # rv64，不带 Spike
-make XLEN=64 FP=1 -j4       # rv64 + F/D（只能和 XLEN=64 一起用）
+make FP=0 -j4               # 没有浮点的核（默认是 FP=1：F/D）
 make librefcpu.a            # 给上层主模拟器链接的静态库（不依赖 Spike；XLEN 同样可选）
 make clean                  # 删除 a.out a.out.nospike librefcpu.a *.o *.d
 ```
@@ -48,7 +48,7 @@ make clean                  # 删除 a.out a.out.nospike librefcpu.a *.o *.d
   XLEN=64 FP=1 SPIKE_SRC=... SPIKE_BUILD=... OUT=build-spike64fp bash scripts/build_spike.sh       # rv64 + F/D
   ```
 - 不带 Spike 的二进制收到 `--diff` 只打印 warning 并关闭 difftest。
-- SoftFloat：`SPIKE=0` 时链接 `lib/softfloat/softfloat.a`（rv32 的 Zfinx 和 rv64 的 F/D 用到）；如果出现 ABI/行为不兼容，用 Berkeley SoftFloat 重新编译并替换该文件，头文件在 `lib/softfloat/include`。
+- SoftFloat：`SPIKE=0` 时链接 `lib/softfloat/softfloat.a`（F/D 用到）；如果出现 ABI/行为不兼容，用 Berkeley SoftFloat 重新编译并替换该文件，头文件在 `lib/softfloat/include`。
 
 ### 2. 运行
 
@@ -193,7 +193,7 @@ SPIKE_SRC=... SPIKE_BUILD=... bash tests/rv64/run.sh <工作目录>     # 需要
 ### `Ref_cpu`（`include/ref.h`、`exec.cpp`）
 - `init(reset_pc, image, size)`：分配内存、加载镜像。
 - `exec(config)`：主循环，按 `SimConfig` 处理运行模式、BBV、检查点和 Difftest。
-- `RISCV()`：取指、译码、分发；`RV32IM()`（rv64 下是 RV64IM + Zba/Zbb/Zbs/Zbc）、`RV32A()`、`RV32CSR()`、`RV32Zfinx()`（仅 rv32）、`RVFD()`（`FP=1`，OP-FP 和四种融合乘加；`flw/fld/fsw/fsd` 走 `RV32IM()` 的 load/store 代码，只是换了寄存器堆）分别处理整数、原子、CSR、浮点。
+- `RISCV()`：取指、译码、分发；`RV32IM()`（rv64 下是 RV64IM + Zba/Zbb/Zbs/Zbc）、`RV32A()`、`RV32CSR()`、`RVFD()`（OP-FP 和四种融合乘加；`flw/fld/fsw/fsd` 走 `RV32IM()` 的 load/store 代码，只是换了寄存器堆）分别处理整数、原子、CSR、浮点。
 - 基本块快速路径（`exec.cpp`）：XLEN 通用，`--diff` 不经过它。
 - `save_checkpoint() / restore_checkpoint()`（`simpoint.cpp`）：见上。
 
@@ -228,7 +228,8 @@ SPIKE_SRC=... SPIKE_BUILD=... bash tests/rv64/run.sh <工作目录>     # 需要
 
 ## 已知限制
 
-- rv64 的 F/D 是编译开关 `FP=1`（默认关，不影响现有的 rv64 和 rv32 构建）；还没有的有：半精度（Zfh）、trace-model 和 RTL 里的 F/D、F/D 的 SPEC 和 Linux 用户态验证。rv32 仍是 Zfinx。
+- F/D 是默认配置（`FP=1`，rv32 和 rv64），`FP=0` 去掉全部浮点；还没有的有：半精度（Zfh）、RTL 里的 F/D、F/D 的 SPEC 和 Linux 用户态验证。Zfinx 已经删除。
+- rv32 的前门恢复（`tools/ckpt2stub.py`）只能还原 NaN-boxed 的单精度浮点寄存器（`fmv.w.x`），双精度值会被警告并跳过（rv32 没有 `fmv.d.x`）。
 - `mstatus` 的写掩码保留了 WPRI 位 0、4 和 XS（15:16），和 Spike 不同；只有往 `mstatus` 写全 1 才看得出来，不影响软件。
 - 两个宽度都**没有**压缩指令 C。
 - rv64 的 MMIO 访问：function-model 里对 MMIO 的 `sd/ld` 读回还没有做。

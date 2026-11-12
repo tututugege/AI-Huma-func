@@ -317,9 +317,6 @@ public:
   void FORCE_INLINE RV32IM();  // RV32IM, and RV64IM + Zba/Zbb/Zbs when XLEN=64
   __attribute__((noinline)) void RV32A();  // cold: keeps RISCV()'s frame small
   __attribute__((noinline)) void RV32CSR();  // cold: keeps RISCV()'s frame small
-#if XLEN == 32
-  __attribute__((noinline)) void RV32Zfinx();  // cold: keeps RISCV()'s frame small (rv32 only; rv64 has no Zfinx)
-#endif
   void exception(xlen_t trap_val);
   void store_data();
   void store_data_word();  // one aligned-word write (store_strb <= 4 bytes)

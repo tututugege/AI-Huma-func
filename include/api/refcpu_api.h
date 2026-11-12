@@ -13,12 +13,10 @@ typedef uint64_t refcpu_xlen_t;
 typedef uint32_t refcpu_xlen_t;
 #endif
 
-// F/D (rv64 only): build with -DFP=1 (the function-model's FP=1); the state then carries the FP registers and fcsr.
+// F/D (default on; rv32 and rv64): the state carries the FP registers and fcsr.  Build with -DFP=0 for a core without floating point; the
+// value must be the one librefcpu.a was built with.
 #ifndef FP
-#define FP 0
-#endif
-#if FP && XLEN != 64
-#error "FP=1 needs XLEN=64"
+#define FP 1
 #endif
 
 struct RefCpuContext;

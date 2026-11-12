@@ -9,7 +9,7 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 SPIKE_SRC=${SPIKE_SRC:?set SPIKE_SRC to a riscv-isa-sim checkout}
 SPIKE_BUILD=${SPIKE_BUILD:?set SPIKE_BUILD to the built riscv-isa-sim tree}
 XLEN=${XLEN:-32}
-FP=${FP:-0}
+FP=${FP:-1}
 OUT=${OUT:-$ROOT/build-spike}
 rm -rf "$OUT"; mkdir -p "$OUT"
 cp -R "$ROOT"/*.cpp "$ROOT"/include "$ROOT"/Makefile "$ROOT"/lib "$OUT"/

@@ -14,7 +14,7 @@
 ### 1.1 standalone Spike Difftest
 - 入口：`main.cpp`
 - 运行方式：`build-spike/a.out --image your_image.bin --diff`
-- 依赖：需要 Spike 构建（`SPIKE=1`，推荐用 `scripts/build_spike.sh`）；rv32 与 rv64（`XLEN=64`）都支持，Spike 的 ISA 分别是 `rv32imab_zfinx_zbc_zbkb_zbkx` 和 `rv64imab_zbc_zbkb_zbkx`
+- 依赖：需要 Spike 构建（`SPIKE=1`，推荐用 `scripts/build_spike.sh`）；rv32 与 rv64（`XLEN=64`）都支持，Spike 的 ISA 分别是 `rv32imafdb_zbc_zbkb_zbkx` 和 `rv64imafdb_zbc_zbkb_zbkx`（`FP=0` 时没有 `f d`）
 - 详细的构建、结果、已知差异：[SPIKE_DIFFTEST.md](SPIKE_DIFFTEST.md)
 - 作用：让 `function-model` 自己作为 DUT，与 Spike 逐条比对
 - 仅 `--mode normal` 可用；`--diff` 走通用执行循环，不经过基本块快速路径

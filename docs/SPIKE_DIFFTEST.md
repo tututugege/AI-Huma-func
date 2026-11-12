@@ -8,7 +8,7 @@ XLEN=64 OUT=build-spike64 SPIKE_SRC=... SPIKE_BUILD=... bash scripts/build_spike
 REF_UNBUF=1 REF_MAX_INSTS=<n> build-spike/a.out --image <image.bin> --diff
 ```
 
-Spike 的配置（`exec.cpp`、`include/spike_ref.h`）：rv32 是 `rv32imab_zfinx_zbc_zbkb_zbkx`、rv64 是 `rv64imab_zbc_zbkb_zbkx`（没有浮点）；特权级 MSU、**无 PMP**、重置时已启用 sv32（rv64 为 Sv39），否则 `mstatus.SUM/MXR` 写不进去。
+Spike 的配置（`exec.cpp`、`include/spike_ref.h`）：rv32 是 `rv32imafdb_zbc_zbkb_zbkx`、rv64 是 `rv64imafdb_zbc_zbkb_zbkx`（`FP=0` 时都没有 `f d`）；特权级 MSU、**无 PMP**、重置时已启用 sv32（rv64 为 Sv39），否则 `mstatus.SUM/MXR` 写不进去。
 function-model 对不在白名单里的 CSR 陷入非法指令，Spike 实现这些 CSR，所以这种指令不让 Spike 执行，改为同步 function-model 的陷入状态（`force_sync`）。
 设备/MMIO 访问和中断同样由 function-model 主导，同步给 Spike。
 

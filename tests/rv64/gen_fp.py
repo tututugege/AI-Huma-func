@@ -4,9 +4,12 @@
 Every FP instruction runs on interesting operands under every rounding mode; the result (raw 64-bit register, so NaN-boxing
 shows) and fflags are folded into a checksum.  The oracle is Spike (--diff compares x and f registers and the CSRs after every
 instruction), the tests do not check values themselves.
-usage: gen_fp.py <out-dir>      writes rv64-fp.c and rv64-fp-helper.S (build with -march=rv64imafd, -mabi=lp64d)
+usage: gen_fp.py <out-dir> [xlen]   writes rv<xlen>-fp.c and rv<xlen>-fp-helper.S (xlen 64 (default) or 32; build with -march=rv<xlen>imafd, -mabi=lp64d / ilp32d)
+rv32 has no fmv.x.d / fmv.d.x and no fcvt.l / fcvt.lu: doubles go through memory (fld / fsd) and are folded as two words
 """
 import sys, itertools, os, struct
+XLEN = int(sys.argv[2]) if len(sys.argv) > 2 else 64
+TAG = "rv%d" % XLEN
 
 def f32(x): return struct.unpack("<I", struct.pack("<f", x))[0]
 def f64(x): return struct.unpack("<Q", struct.pack("<d", x))[0]
@@ -25,15 +28,22 @@ RMS = ["rne", "rtz", "rdn", "rup", "rmm"]
 
 out = []
 A = out.append
-A("    .section .text\n    .align 2\n    .globl rv64_fp_body\nrv64_fp_body:\n    mv s11, ra\n    li s10, 0\n    li t0, 0x2000\n    csrs mstatus, t0")
+A("    .section .text\n    .align 2\n    .globl rv64_fp_body\nrv64_fp_body:\n    mv s11, ra\n    li s10, 0\n    li t0, 0x2000\n    csrs mstatus, t0\n    la s9, scratch2")
+TOP = XLEN - 1
 def fold(r="a2"):
-    A(f"    xor s10, s10, {r}\n    slli t6, s10, 1\n    srli s10, s10, 63\n    or s10, s10, t6")
+    A(f"    xor s10, s10, {r}\n    slli t6, s10, 1\n    srli s10, s10, {TOP}\n    or s10, s10, t6")
 def flags():
     A("    csrr a3, fflags\n    csrw fflags, zero"); fold("a3")
 def ldS(fr, v): A(f"    li a0, {v}\n    fmv.w.x {fr}, a0")
-def ldD(fr, v): A(f"    li a0, {v & 0xffffffffffffffff}\n    fmv.d.x {fr}, a0")
+def ldD(fr, v):
+    v &= 0xffffffffffffffff
+    if XLEN == 64: A(f"    li a0, {v}\n    fmv.d.x {fr}, a0")
+    else: A(f"    li a4, {v & 0xffffffff}\n    li a5, {v >> 32}\n    sw a4, 0(s9)\n    sw a5, 4(s9)\n    fld {fr}, 0(s9)")
 def ld(fmt, fr, v): (ldS if fmt == "s" else ldD)(fr, v)
-def res(): A("    fmv.x.d a2, f3"); fold(); flags()
+def res():
+    if XLEN == 64: A("    fmv.x.d a2, f3"); fold()
+    else: A("    fsd f3, 0(s9)\n    lw a2, 0(s9)"); fold(); A("    lw a2, 4(s9)"); fold()
+    flags()
 
 for fmt, V in (("s", S), ("d", D)):
     for op in ("fadd", "fsub", "fmul", "fdiv"):
@@ -57,15 +67,15 @@ for fmt, V in (("s", S), ("d", D)):
             ld(fmt, "f1", a); ld(fmt, "f2", b); A(f"    {op}.{fmt} a2, f1, f2"); fold(); flags()
     for a in V:
         ld(fmt, "f1", a); A(f"    fclass.{fmt} a2, f1"); fold()
-        A(f"    fmv.x.{'w' if fmt == 's' else 'd'} a2, f1"); fold()
-    for cv in ("w", "wu", "l", "lu"):
+        if fmt == "s" or XLEN == 64: A(f"    fmv.x.{'w' if fmt == 's' else 'd'} a2, f1"); fold()
+    for cv in (("w", "wu", "l", "lu") if XLEN == 64 else ("w", "wu")):
         for rm in RMS:
             for a in V:
                 ld(fmt, "f1", a); A(f"    fcvt.{cv}.{fmt} a2, f1, {rm}"); fold(); flags()
             for i in I:
-                A(f"    li a0, {i}\n    fcvt.{fmt}.{cv} f3, a0, {rm}"); res()
+                A(f"    li a0, {i if XLEN == 64 else (i & 0xffffffff)}\n    fcvt.{fmt}.{cv} f3, a0, {rm}"); res()
     for i in I[:6]:
-        A(f"    li a0, {i}\n    fmv.{'w' if fmt == 's' else 'd'}.x f3, a0"); res()
+        if fmt == "s" or XLEN == 64: A(f"    li a0, {i if XLEN == 64 else (i & 0xffffffff)}\n    fmv.{'w' if fmt == 's' else 'd'}.x f3, a0"); res()
 # S <-> D
 for rm in RMS:
     for a in D:
@@ -88,17 +98,24 @@ A("    csrwi fflags, 0x1f\n    csrr a2, fcsr"); fold(); A("    csrwi frm, 0\n   
 # loads / stores
 A("    la s0, scratch")
 for k, d in enumerate([0x0123456789abcdef, 0xfedcba9876543210, 0x7ff8000000000000, 0xffffffff7fc00000, 0x3ff0000000000000]):
-    A(f"    li a0, {d}\n    sd a0, {k*16}(s0)")
+    if XLEN == 64:
+        A(f"    li a0, {d}\n    sd a0, {k*16}(s0)")
+    else:
+        A(f"    li a0, {d & 0xffffffff}\n    sw a0, {k*16}(s0)\n    li a0, {d >> 32}\n    sw a0, {k*16+4}(s0)")
     A(f"    fld f3, {k*16}(s0)"); res()
     A(f"    flw f3, {k*16}(s0)"); res()
     A(f"    flw f3, {k*16+4}(s0)"); res()
-    A(f"    fsd f3, {k*16+8}(s0)\n    ld a2, {k*16+8}(s0)"); fold()
-    A(f"    fsw f3, {k*16+8}(s0)\n    lw a2, {k*16+8}(s0)\n    ld a3, {k*16+8}(s0)"); fold(); fold("a3")
+    A(f"    fsd f3, {k*16+8}(s0)")
+    if XLEN == 64: A(f"    ld a2, {k*16+8}(s0)"); fold()
+    else: A(f"    lw a2, {k*16+8}(s0)"); fold(); A(f"    lw a2, {k*16+12}(s0)"); fold()
+    A(f"    fsw f3, {k*16+8}(s0)\n    lw a2, {k*16+8}(s0)"); fold()
+    if XLEN == 64: A(f"    ld a3, {k*16+8}(s0)"); fold("a3")
+    else: A(f"    lw a3, {k*16+12}(s0)"); fold("a3")
 A("    mv ra, s11\n    mv a0, s10\n    ret")
-A("    .section .bss\n    .align 4\nscratch:\n    .space 256")
+A("    .section .bss\n    .align 4\nscratch:\n    .space 256\nscratch2:\n    .space 16")
 
 d = sys.argv[1]
 os.makedirs(d, exist_ok=True)
-open(os.path.join(d, "rv64-fp-helper.S"), "w").write("\n".join(out) + "\n")
-open(os.path.join(d, "rv64-fp.c"), "w").write("extern long rv64_fp_body(void);\nint main(void) { rv64_fp_body(); return 0; }\n")
+open(os.path.join(d, TAG + "-fp-helper.S"), "w").write("\n".join(out) + "\n")
+open(os.path.join(d, TAG + "-fp.c"), "w").write("extern long rv64_fp_body(void);\nint main(void) { rv64_fp_body(); return 0; }\n")
 print(len(out), "lines")
