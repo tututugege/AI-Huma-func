@@ -23,6 +23,10 @@ struct RefCpuContextImpl {
 RefCpuState export_state(const Ref_cpu &cpu) {
   RefCpuState state{};
   std::memcpy(state.gpr, cpu.state.gpr, sizeof(state.gpr));
+#if FP
+  std::memcpy(state.fpr, cpu.state.fpr, sizeof(state.fpr));
+  state.fcsr = (static_cast<uint32_t>(cpu.fcsr_frm & 7u) << 5) | (cpu.fcsr_fflags & 0x1Fu);
+#endif
   std::memcpy(state.csr, cpu.state.csr, sizeof(state.csr));
   state.csr[csr_mip] = cpu.visible_mip();
   state.csr[csr_sip] = cpu.visible_sip();
@@ -45,6 +49,11 @@ RefCpuState export_state(const Ref_cpu &cpu) {
 
 void import_state(Ref_cpu &cpu, const RefCpuState &state) {
   std::memcpy(cpu.state.gpr, state.gpr, sizeof(cpu.state.gpr));
+#if FP
+  std::memcpy(cpu.state.fpr, state.fpr, sizeof(cpu.state.fpr));
+  cpu.fcsr_fflags = static_cast<uint8_t>(state.fcsr & 0x1Fu);
+  cpu.fcsr_frm = static_cast<uint8_t>((state.fcsr >> 5) & 7u);
+#endif
   std::memcpy(cpu.state.csr, state.csr, sizeof(cpu.state.csr));
   cpu.state.pc = state.pc;
   cpu.state.store_addr = state.store_addr;

@@ -13,10 +13,22 @@ typedef uint64_t refcpu_xlen_t;
 typedef uint32_t refcpu_xlen_t;
 #endif
 
+// F/D (rv64 only): build with -DFP=1 (the function-model's FP=1); the state then carries the FP registers and fcsr.
+#ifndef FP
+#define FP 0
+#endif
+#if FP && XLEN != 64
+#error "FP=1 needs XLEN=64"
+#endif
+
 struct RefCpuContext;
 
 struct RefCpuState {
   refcpu_xlen_t gpr[32];
+#if FP
+  uint64_t fpr[32];   // single precision NaN-boxed
+  uint32_t fcsr;      // frm << 5 | fflags
+#endif
   refcpu_xlen_t csr[21];
   refcpu_xlen_t pc;
 
