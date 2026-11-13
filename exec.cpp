@@ -1,6 +1,7 @@
 #ifdef ENABLE_SPIKE
 #include "spike_ref.h"
 #endif
+#include "rvc.h"
 #include "CSR.h"
 #include "RISCV.h"
 #include "ref.h"
@@ -595,15 +596,15 @@ void Ref_cpu::init(uint32_t reset_pc, const char *image, uint32_t size) {
   }
 #if XLEN == 64
 #if FP
-  state.csr[csr_misa] = (xlen_t(2) << 62) | 0x14112B;   // MXL = 2, A B D F I M S U
+  state.csr[csr_misa] = (xlen_t(2) << 62) | (0x14112B | (RVC ? 4 : 0));   // MXL = 2, A B D F I M S U
 #else
-  state.csr[csr_misa] = (xlen_t(2) << 62) | 0x141103;   // MXL = 2, A B I M S U
+  state.csr[csr_misa] = (xlen_t(2) << 62) | (0x141103 | (RVC ? 4 : 0));   // MXL = 2, A B I M S U
 #endif
 #else
 #if FP
-  state.csr[csr_misa] = 0x4014112B;   // MXL = 1, A B D F I M S U
+  state.csr[csr_misa] = 0x4014112B | (RVC ? 4 : 0);   // MXL = 1, A B D F I M S U
 #else
-  state.csr[csr_misa] = 0x40141103;
+  state.csr[csr_misa] = 0x40141103 | (RVC ? 4 : 0);
 #endif
 #endif
   state.csr[csr_mstatus] = kMstatusReset;
@@ -1229,8 +1230,8 @@ static inline xlen_t xlen_clmulh(xlen_t a, xlen_t b) {
 }
 
 void Ref_cpu::RV32A() {
-  // pc + 4
-  xlen_t next_pc = state.pc + 4;
+  // pc + instruction length
+  xlen_t next_pc = state.pc + ilen;
   uint32_t funct5 = BITS(Instruction, 31, 27);
   uint32_t funct3 = BITS(Instruction, 14, 12);
   uint32_t reg_d_index = BITS(Instruction, 11, 7);
@@ -1836,7 +1837,7 @@ L_EXIT:
   END_CONTROL();
 #define B_JALR                                                                                                       \
   ipc = PC_OF(op);                                                                                                   \
-  v = (x[op->rs1] + op->imm) & ~xlen_t(3);                                                                           \
+  v = (x[op->rs1] + op->imm) & ~xlen_t(RVC ? 1 : 3);                                                                 \
   x[op->rd] = ipc + 4;                                                                                               \
   x[0] = 0;                                                                                                          \
   pc = v;                                                                                                            \
@@ -2022,6 +2023,7 @@ L_CSR: {
   is_io = false;
   force_sync = false;
   sync_timer_csrs(state, sim_time, device_effects_enable && interrupt_delivery_enable);
+  ilen = 4;   // the fast path only holds 32-bit instructions
   RV32CSR();
   state.gpr[0] = 0;
   sim_time = st0 + (budget0 - left);
@@ -2163,7 +2165,7 @@ void Ref_cpu::exec(const SimConfig &config) {
   // Initialize Spike Reference Simulator if enabled
 #ifdef ENABLE_SPIKE
   if (config.difftest) {
-    spike_ref = std::make_unique<SpikeRef>(XLEN == 64 ? (FP ? "rv64imafdb_zbc_zbkb_zbkx" : "rv64imab_zbc_zbkb_zbkx") : (FP ? "rv32imafdb_zbc_zbkb_zbkx" : "rv32imab_zbc_zbkb_zbkx"), 0x80000000, 0x80000000,
+    spike_ref = std::make_unique<SpikeRef>(XLEN == 64 ? (FP ? (RVC ? "rv64imafdcb_zbc_zbkb_zbkx" : "rv64imafdb_zbc_zbkb_zbkx") : (RVC ? "rv64imacb_zbc_zbkb_zbkx" : "rv64imab_zbc_zbkb_zbkx")) : (FP ? (RVC ? "rv32imafdcb_zbc_zbkb_zbkx" : "rv32imafdb_zbc_zbkb_zbkx") : (RVC ? "rv32imacb_zbc_zbkb_zbkx" : "rv32imab_zbc_zbkb_zbkx")), 0x80000000, 0x80000000,
                                            config.image_file.c_str());
   }
 #else
@@ -2505,7 +2507,7 @@ void Ref_cpu::exec(const SimConfig &config) {
 
 void Ref_cpu::exception(xlen_t trap_val) {
   is_exception = true;
-  xlen_t next_pc = state.pc + 4;
+  xlen_t next_pc = state.pc + ilen;
 
   // 重新获取当前状态（因为exec可能没传进来最新的）
   bool ecall = (Instruction == INST_ECALL);
@@ -2910,6 +2912,7 @@ void Ref_cpu::RISCV() {
   is_io = false;
   force_sync = false;
 
+  ilen = 4;
   uint32_t p_addr = static_cast<uint32_t>(state.pc);
 
   if (satp_enabled(state.csr[csr_satp]) && privilege != RISCV_MODE_M) {
@@ -2922,12 +2925,58 @@ void Ref_cpu::RISCV() {
   } else {
     p_addr = bare_pa(state.pc);
   }
+#if RVC
+  // C extension: the fetch unit is the halfword.  A 32-bit instruction may start at any 2-byte aligned address, so its second
+  // halfword can lie on the next page (translated and permission-checked on its own; the fault address is pc + 2).
+  ilen = 4;
+  {
+    auto fetch_half = [&](uint32_t pa) -> uint32_t {
+      const uint32_t wa = pa & ~3u;
+      uint32_t w;
+      if (__builtin_expect(is_ddr_range(wa, 4), 1)) {
+        w = memory[(wa - kRamBase) >> 2];
+      } else {
+        check_mem_range_or_log("instruction fetch", wa, 4);
+        w = load_word(wa);
+      }
+      return (w >> ((pa & 2u) * 8)) & 0xffffu;
+    };
+    const uint32_t lo = fetch_half(p_addr);
+    if ((lo & 3u) == 3u) {
+      uint32_t p2 = p_addr + 2;
+      if ((static_cast<uint32_t>(state.pc) & 0xfffu) == 0xffeu) {  // the second halfword is on the next page
+        if (satp_enabled(state.csr[csr_satp]) && privilege != RISCV_MODE_M) {
+          if (!va2pa(p2, state.pc + 2, 0)) {
+            page_fault_inst = true;
+            exception(state.pc + 2);
+            return;
+          }
+        } else {
+          p2 = bare_pa(state.pc + 2);
+        }
+      }
+      Instruction = lo | (fetch_half(p2) << 16);
+      inst_raw = Instruction;
+      if ((lo & 0x1fu) == 0x1fu) illegal_exception = true;  // 48-bit and longer encodings are not implemented
+    } else {
+      ilen = 2;
+      inst_raw = lo;
+      if (!rvc::expand(lo, Instruction)) {
+        Instruction = 0;
+        illegal_exception = true;
+      }
+    }
+  }
+#else
+  ilen = 4;
+  inst_raw = 0;
   if (__builtin_expect(is_ddr_range(p_addr, 4), 1)) {
     Instruction = memory[(p_addr - kRamBase) >> 2];  // same word load_word() returns for DDR
   } else {
     check_mem_range_or_log("instruction fetch", p_addr, 4);
     Instruction = load_word(p_addr);
   }
+#endif
   if (__builtin_expect(g_dbg_hot, 0)) {  // debug: ring of the last executed PCs, printed at ebreak when REF_PC_RING is set
     static uint32_t ring[64];
     static uint64_t n = 0;
@@ -2947,7 +2996,7 @@ void Ref_cpu::RISCV() {
 
   // RISC-V semihosting marker: slli x0,x0,0x1f ; ebreak ; srai x0,x0,7. OpenSBI's generic platform probes it and
   // expects a breakpoint trap; any other ebreak keeps ending the simulation (the bare-metal tests' exit).
-  if (Instruction == INST_EBREAK && load_word(p_addr - 4) == 0x01f01013u && load_word(p_addr + 4) == 0x40705013u) {
+  if (Instruction == INST_EBREAK && ilen == 4 && (p_addr & 3u) == 0 && load_word(p_addr - 4) == 0x01f01013u && load_word(p_addr + 4) == 0x40705013u) {
     if (std::getenv("REF_PC_RING")) fprintf(stderr, "[bp] pc=0x%08x mtvec=0x%08x a3=0x%08x\n", state.pc, state.csr[csr_mtvec], state.gpr[13]);
     breakpoint_exception = true;
     exception(state.pc);
@@ -2970,7 +3019,7 @@ void Ref_cpu::RISCV() {
       std::cout << "\033[1;31mTest Failed with code: " << exit_code << "\033[0m"
                 << std::endl;
     }
-    state.pc += 4;
+    state.pc += ilen;
     sim_end = true;
     return;
   }
@@ -2982,7 +3031,7 @@ void Ref_cpu::RISCV() {
     std::cout << "SBI " << (state.gpr[17] == 8u ? "shutdown" : "system reset") << " requested (a7=0x" << std::hex
               << state.gpr[17] << " a0=0x" << state.gpr[10] << std::dec << "), exiting" << std::endl;
     std::cout << "total_sim_time: " << sim_time << std::endl;
-    state.pc += 4;
+    state.pc += ilen;
     sim_end = true;
     return;
   }
@@ -3044,7 +3093,7 @@ void Ref_cpu::RISCV() {
     exception(state.pc);
     return;
   } else if (illegal_exception) {
-    exception(Instruction);
+    exception(inst_tval());
     return;
   } else if (asy || Instruction == INST_ECALL) {
     exception(0);
@@ -3060,7 +3109,7 @@ void Ref_cpu::RISCV() {
   } else if (opcode == number_11_opcode_lrw) {
     RV32A();
     if (illegal_exception) {
-      exception(Instruction);
+      exception(inst_tval());
       return;
     }
 #if FP
@@ -3069,14 +3118,14 @@ void Ref_cpu::RISCV() {
              opcode == number_16_opcode_fnmadd) {
     RVFD();
     if (illegal_exception) {
-      exception(Instruction);
+      exception(inst_tval());
       return;
     }
 #endif
   } else {
     RV32IM();
     if (illegal_exception) {
-      exception(Instruction);
+      exception(inst_tval());
       return;
     }
   }
@@ -3084,8 +3133,8 @@ void Ref_cpu::RISCV() {
 }
 
 void Ref_cpu::RV32CSR() {
-  // pc + 4
-  xlen_t next_pc = state.pc + 4;
+  // pc + instruction length
+  xlen_t next_pc = state.pc + ilen;
 
   // 使用宏直接提取，无需 copy_indice
   uint32_t rd = BITS(Instruction, 11, 7);
@@ -3125,7 +3174,7 @@ void Ref_cpu::RV32CSR() {
       return;
     }
     illegal_exception = true;
-    exception(Instruction);
+    exception(inst_tval());
     return;
   }
 
@@ -3135,7 +3184,7 @@ void Ref_cpu::RV32CSR() {
 #if FP
     if (!fp_enabled()) {   // mstatus.FS = Off: the FP CSRs are illegal
       illegal_exception = true;
-      exception(Instruction);
+      exception(inst_tval());
       return;
     }
 #endif
@@ -3187,7 +3236,7 @@ void Ref_cpu::RV32CSR() {
 #ifdef ENABLE_SPIKE
     force_sync = true;   // Spike implements CSRs this model does not (mcycle, mhpmcounter*, menvcfg, ...): it must not execute the access; take our trap state instead
 #endif
-    exception(Instruction);
+    exception(inst_tval());
     return;
   } else {
 
@@ -3286,6 +3335,10 @@ void Ref_cpu::RV32CSR() {
         state.csr[csr_mideleg] = csr_wdata & kSBits;
         refresh_sie(state);
         state.csr[csr_sip] = visible_mip() & delegated_s_bits(state);
+      } else if (RVC && csr_idx == csr_medeleg) {
+        state.csr[csr_idx] = csr_wdata & ~xlen_t(1);   // instruction-address-misaligned cannot occur with C: its delegation bit is read-only 0
+      } else if (RVC && (csr_idx == csr_mepc || csr_idx == csr_sepc)) {
+        state.csr[csr_idx] = csr_wdata & ~xlen_t(1);   // with C only bit 0 of the return address is forced to 0 (without: bits 1:0)
       } else if (csr_idx == csr_satp && XLEN == 64 && (csr_wdata >> 60) != 0 && (csr_wdata >> 60) != 8) {
         // unsupported translation mode: the write has no effect (Sv48/Sv57 are not implemented)
       } else {
@@ -3368,7 +3421,7 @@ inline uint64_t f64_max_riscv(uint64_t a, uint64_t b) {
 }  // namespace
 
 void Ref_cpu::RVFD() {
-  const xlen_t next_pc = state.pc + 4;
+  const xlen_t next_pc = state.pc + ilen;
   const uint32_t opcode = BITS(Instruction, 6, 0);
   const uint32_t rd = BITS(Instruction, 11, 7), rs1 = BITS(Instruction, 19, 15), rs2 = BITS(Instruction, 24, 20);
   const uint32_t rs3 = BITS(Instruction, 31, 27), funct3 = BITS(Instruction, 14, 12);
@@ -3515,8 +3568,8 @@ void Ref_cpu::RVFD() {
 
 
 void Ref_cpu::RV32IM() {
-  // pc + 4
-  xlen_t next_pc = state.pc + 4;
+  // pc + instruction length
+  xlen_t next_pc = state.pc + ilen;
   uint32_t opcode = BITS(Instruction, 6, 0);
   uint32_t funct3 = BITS(Instruction, 14, 12);
   uint32_t funct7 = BITS(Instruction, 31, 25);
@@ -3563,14 +3616,14 @@ void Ref_cpu::RV32IM() {
     is_br = true;
     br_taken = true;
     next_pc = state.pc + static_cast<xlen_t>(immJ(Instruction));
-    state.gpr[reg_d_index] = state.pc + 4;
+    state.gpr[reg_d_index] = state.pc + ilen;
     break;
   }
   case number_3_opcode_jalr: { // jalr
     is_br = true;
     br_taken = true;
-    next_pc = (reg_rdata1 + static_cast<xlen_t>(immI(Instruction))) & ~xlen_t(3);
-    state.gpr[reg_d_index] = state.pc + 4;
+    next_pc = (reg_rdata1 + static_cast<xlen_t>(immI(Instruction))) & ~xlen_t(RVC ? 1 : 3);
+    state.gpr[reg_d_index] = state.pc + ilen;
     break;
   }
   case number_4_opcode_beq: { // beq, bne, blt, bge, bltu, bgeu

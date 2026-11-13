@@ -125,6 +125,7 @@ void refcpu_get_step_info(const RefCpuContext *ctx, RefCpuStepInfo *info) {
     return;
   }
   info->instruction = ctx->cpu.Instruction;
+  info->inst_len = ctx->cpu.ilen;
   info->page_fault_inst = ctx->cpu.page_fault_inst;
   info->page_fault_load = ctx->cpu.page_fault_load;
   info->page_fault_store = ctx->cpu.page_fault_store;

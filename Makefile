@@ -10,6 +10,8 @@ XLEN ?= 32
 CXXFLAGS += -DXLEN=$(XLEN)
 FP ?= 1
 CXXFLAGS += -DFP=$(FP)
+RVC ?= 0
+CXXFLAGS += -DRVC=$(RVC)
 SPIKE ?= 0
 SOFTFLOAT_LIB ?= ./lib/softfloat/softfloat.a
 

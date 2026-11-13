@@ -46,7 +46,8 @@ struct RefCpuState {
 };
 
 struct RefCpuStepInfo {
-  uint32_t instruction;
+  uint32_t instruction;   // with RVC=1 a compressed instruction is given expanded (the 32-bit equivalent)
+  uint32_t inst_len;      // length in bytes of the instruction just executed: 4, or 2 for a compressed one (RVC=1)
   bool page_fault_inst;
   bool page_fault_load;
   bool page_fault_store;

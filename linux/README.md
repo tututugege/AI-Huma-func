@@ -57,3 +57,16 @@ Images: `~/personal/AI-Huma-data/linux_rv64g/`. Needs the FP=1 build of the mode
 KOFF=0x200000 DTS=ttg64g.dts MEM=0x10000000 bash linux/mkimage.sh ~/personal/AI-Huma-data/linux_rv64g /tmp/linux64g.bin
 REF_UNBUF=1 REF_MAX_INSTS=600000000 ./a.out.nospike --image /tmp/linux64g.bin    # OpenSBI: "Base ISA : rv64imafdb"; prints "fptest: PASS", then "rv64 login:"
 ```
+
+## rv64gc (kernel + OpenSBI with C, 2026-11-13)
+
+Same `~/br64g` tree with only the kernel and OpenSBI rebuilt for C: kernel config `~/rv64gc_kernel.config` = `rv64g_kernel.config` with
+`CONFIG_RISCV_ISA_C=y`, `BR2_TARGET_OPENSBI_ADDITIONAL_VARIABLES="... PLATFORM_RISCV_ISA=rv64imafdc_zicsr_zifencei PLATFORM_RISCV_ABI=lp64d"`;
+`make linux-dirclean opensbi-dirclean && make HOSTCC=gcc-13 HOSTCXX=g++-13` (the user space stays rv64g, which a core with C runs unchanged).
+`ttg64gc.dts` = `ttg64g.dts` with `riscv,isa = "rv64imafdc"`. Images: `~/personal/AI-Huma-data/linux_rv64gc/`. Needs the `RVC=1` build of the model.
+
+```bash
+KOFF=0x200000 DTS=ttg64gc.dts MEM=0x10000000 bash linux/mkimage.sh ~/personal/AI-Huma-data/linux_rv64gc /tmp/linux64gc.bin
+REF_UNBUF=1 REF_MAX_INSTS=1500000000 ./a.out.nospike --image /tmp/linux64gc.bin   # OpenSBI "Base ISA : rv64imafdcb", kernel "ISA extensions acdfim", "fptest: PASS", "rv64 login:"
+```
+Spike lockstep (`--diff` with the `RVC=1` Spike build) over the first 250 M instructions, through `rv64 login:`: 0 mismatches.

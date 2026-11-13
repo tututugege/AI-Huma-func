@@ -9,7 +9,7 @@
 | 整数/乘除/原子 | RV32IMA | RV64IMA（含 `*W`、`lwu/ld/sd`、`amo*.d`、`lr/sc.d`） |
 | 位操作 | Zba/Zbb/Zbs、Zbc、Zbkb 的 `pack/packh`（无 `brev8/zip/xperm`），合称 "B" | 同左，另有 `*W` 变体 |
 | 浮点 | 标准 **F/D**（默认 `FP=1`）：32 个 64 位浮点寄存器、`fcsr`、`mstatus.FS/SD`，softfloat，NaN-boxing 和 Spike 一致；rv32 没有 `fmv.x.d/fmv.d.x` 和 `fcvt.l/lu`，`fld/fsd` 是 8 字节访问（两个字）。`FP=0` 是没有任何浮点的核。Zfinx 已删除 | 同左 |
-| 压缩指令 C | 无 | 无 |
+| 压缩指令 C | `RVC=1` 开关（默认 0，不带 C） | 同左 |
 | 地址翻译 | Sv32 | Sv39 |
 | 检查点格式 | 版本 6（F/D）；`FP=0` 是版本 3（2 仍可读） | 版本 5（F/D）；`FP=0` 是版本 4（`CPU_state` 带浮点寄存器时其后跟 `fcsr`） |
 | Spike 对拍 ISA | `rv32imafdb_zbc_zbkb_zbkx`（`FP=0`：`rv32imab_…`） | `rv64imafdb_zbc_zbkb_zbkx`（`FP=0`：`rv64imab_…`） |
@@ -35,6 +35,7 @@ make -j4                    # rv32，不带 Spike，产物 a.out
 make no_spike -j4           # 同上，但产物叫 a.out.nospike（脚本和 linux/ 文档里用这个名字）
 make XLEN=64 -j4            # rv64，不带 Spike
 make FP=0 -j4               # 没有浮点的核（默认是 FP=1：F/D）
+make RVC=1 -j4              # 带 C 扩展（压缩指令，默认 RVC=0；见下文“C 扩展”）
 make librefcpu.a            # 给上层主模拟器链接的静态库（不依赖 Spike；XLEN 同样可选）
 make clean                  # 删除 a.out a.out.nospike librefcpu.a *.o *.d
 ```
@@ -223,6 +224,21 @@ SPIKE_SRC=... SPIKE_BUILD=... bash tests/rv64/run.sh <工作目录>     # 需要
 | `SimPoint/simpoint` | SimPoint 3.2 的 x86 Linux 二进制（Mac 上要自己编译，见 `scripts/spec/README.md`） |
 | `docs/` | 下面列出的文档 |
 | `build-spike/` | `scripts/build_spike.sh` 的默认输出（不进 git） |
+
+---
+
+## C 扩展（`RVC=1`，2026-11-13，分支 `exp/rvc`）
+
+编译开关 `RVC=1`（`XLEN=32` 和 `64` 都支持，和 F/D 可以同时开；默认 0，`RVC=0` 的行为与之前完全一致）。
+
+- 取指单位是半字：`pc` 只要求 2 字节对齐，一条 32 位指令可以从任意半字开始，第二个半字可以在下一个 cache line 或下一页（独立翻译，缺页时 `mtval` = `pc+2`）。
+- 16 位指令在取指时展开成等价的 32 位指令（`include/rvc.h`，一个纯函数），后面的执行代码不变；`ilen`（2 或 4，`RefCpuStepInfo.inst_len` 给上层；`instruction` 是展开后的 32 位）用于 `pc+ilen`、`jal/jalr` 的链接值、`ecall`/`ebreak` 之后的 pc。非法或保留的 16 位编码产生非法指令异常，`mtval` 是 16 位原编码（`inst_raw`）。
+- `misa.C` 置位；`jalr` 目标只清第 0 位；`mepc`/`sepc` 只清第 0 位；`medeleg` 第 0 位（取指地址未对齐）只读 0。
+- 快速路径（基本块缓存）只处理 4 字节对齐的 32 位指令；遇到压缩指令或 2 字节对齐的 pc 就交给 `RISCV()` 单步，所以带 C 的代码比不带 C 慢（Linux 启动实测约 50 MIPS）。给快速路径加长度信息是后续优化。
+- 不支持：48 位及更长的指令编码（当作非法指令）、`misa` 的 C 位不可写（不能关掉）、Zc*（Zcb/Zcmp 等）。
+- Spike 对拍的 ISA 串加 `c`（`rv64imafdcb_…`）；`scripts/build_spike.sh` 认 `RVC=1`。
+- 测试 `tests/rv64/rvc.sh <工作目录>`（`XLEN=32|64`）：`tests/rv64/gen_rvc.py` 生成的定向测试（全部 16 位编码里非访存、非跳转的在随机寄存器值上执行；全部访存编码，含 FS 开 / 关的浮点；`c.j` / `c.jal` / `c.beqz` / `c.bnez` 前后向多种偏移、`c.jr` / `c.jalr` 每个寄存器；32 位指令跨 cache line / 跨页；Sv39 下第二个半字缺页），trace-model 的 cpu-tests 带 C 编译，官方 `riscv-tests` 的 `rv<XLEN>uc`，每条指令与 Spike 比较。cpu-tests 里有已知的 5 个不通过项：都是测试源码假定 4 字节指令（中断向量表的 4 字节槽位、`trap-precise-store` 用 `+8` 跳过 `ecall; sw`），以及不带 C 时也有的两个平台差异。
+- Linux：`linux/ttg64gc.dts`（`riscv,isa = "rv64imafdc"`）；内核和 OpenSBI 带 C 编译（`CONFIG_RISCV_ISA_C=y`、`PLATFORM_RISCV_ISA=rv64imafdc_zicsr_zifencei`），用户态仍是 `rv64g`（不带 C）；镜像 `~/personal/AI-Huma-data/linux_rv64gc/`。
 
 ---
 

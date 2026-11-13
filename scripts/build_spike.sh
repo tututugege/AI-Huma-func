@@ -10,9 +10,10 @@ SPIKE_SRC=${SPIKE_SRC:?set SPIKE_SRC to a riscv-isa-sim checkout}
 SPIKE_BUILD=${SPIKE_BUILD:?set SPIKE_BUILD to the built riscv-isa-sim tree}
 XLEN=${XLEN:-32}
 FP=${FP:-1}
+RVC=${RVC:-0}
 OUT=${OUT:-$ROOT/build-spike}
 rm -rf "$OUT"; mkdir -p "$OUT"
 cp -R "$ROOT"/*.cpp "$ROOT"/include "$ROOT"/Makefile "$ROOT"/lib "$OUT"/
-make -C "$OUT" SPIKE=1 XLEN="$XLEN" FP="$FP" SPIKE_SRC="$SPIKE_SRC" SPIKE_BUILD="$SPIKE_BUILD" -j"${JOBS:-8}" 2>&1 | grep -E "error|undefined" || true
+make -C "$OUT" SPIKE=1 XLEN="$XLEN" FP="$FP" RVC="$RVC" SPIKE_SRC="$SPIKE_SRC" SPIKE_BUILD="$SPIKE_BUILD" -j"${JOBS:-8}" 2>&1 | grep -E "error|undefined" || true
 ls -la "$OUT/a.out"
 echo 'run: REF_UNBUF=1 REF_MAX_INSTS=<n> '"$OUT"'/a.out --image <image.bin> --diff'

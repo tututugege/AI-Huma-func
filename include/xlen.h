@@ -18,6 +18,11 @@ using sxlen_t = int32_t;
 #ifndef FP
 #define FP 1
 #endif
+// RVC=1: the C extension (16-bit compressed instructions; pc is 2-byte aligned, a 32-bit instruction may start at any halfword and
+// cross a cache line or a page).  RVC=0 (default): no C, behaviour unchanged.
+#ifndef RVC
+#define RVC 0
+#endif
 constexpr unsigned kXlen = XLEN;
 constexpr xlen_t kXlenMsb = xlen_t(1) << (XLEN - 1);   // interrupt bit of mcause/scause
 constexpr unsigned kShamtMask = XLEN - 1;

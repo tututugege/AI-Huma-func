@@ -193,7 +193,10 @@ public:
   uint32_t *sdram_memory = nullptr;
   std::unordered_map<uint32_t, uint32_t> io_words;
   uint32_t ram_size;
-  uint32_t Instruction;
+  uint32_t Instruction;     // the 32-bit instruction executed; a compressed one (RVC=1) is stored expanded
+  uint32_t ilen = 4;        // its length in bytes (2 for a compressed instruction, only with RVC=1)
+  uint32_t inst_raw = 0;    // the encoding as fetched (16 bits for a compressed instruction): the trap value of an illegal-instruction exception
+  xlen_t inst_tval() const { return (RVC && ilen == 2) ? static_cast<xlen_t>(inst_raw) : static_cast<xlen_t>(Instruction); }
   CPU_state state;
   uint8_t privilege;
   bool asy;
