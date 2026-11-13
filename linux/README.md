@@ -70,3 +70,14 @@ KOFF=0x200000 DTS=ttg64gc.dts MEM=0x10000000 bash linux/mkimage.sh ~/personal/AI
 REF_UNBUF=1 REF_MAX_INSTS=1500000000 ./a.out.nospike --image /tmp/linux64gc.bin   # OpenSBI "Base ISA : rv64imafdcb", kernel "ISA extensions acdfim", "fptest: PASS", "rv64 login:"
 ```
 Spike lockstep (`--diff` with the `RVC=1` Spike build) over the first 250 M instructions, through `rv64 login:`: 0 mismatches.
+
+## rv32 with C (kernel + OpenSBI, 2026-11-13)
+
+Same `~/br13` tree with only the kernel and OpenSBI rebuilt for C: kernel config `~/rv32c_kernel.config` = `rv32_kernel.config` with `CONFIG_RISCV_ISA_C=y`,
+`PLATFORM_RISCV_ISA=rv32imac_zicsr_zifencei`; `make linux-dirclean opensbi-dirclean && make HOSTCC=gcc-13 HOSTCXX=g++-13`. `ttg_c.dts` = `ttg.dts` with
+`riscv,isa = "rv32imac"`. Images: `~/personal/AI-Huma-data/linux_rv32c/`. Needs the `RVC=1` build.
+
+```bash
+DTS=ttg_c.dts MEM=0x10000000 bash linux/mkimage.sh ~/personal/AI-Huma-data/linux_rv32c /tmp/linux32c.bin
+REF_UNBUF=1 ./a.out.nospike --image /tmp/linux32c.bin     # "Base ISA : rv32imafdcb", kernel "ISA extensions acim", "rv32 login:"
+```
