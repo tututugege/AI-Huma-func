@@ -15,7 +15,7 @@ XLEN=$XLEN FP=1 RVC=1 OUT="$W/sp" bash "$ROOT/scripts/build_spike.sh" >/dev/null
 SP="$W/sp/a.out"
 if [ "$XLEN" = 64 ]; then export TARGET=riscv64 ABI=lp64 CMODEL=medany ARCH=rv64imac_zicsr_zifencei; else export TARGET=riscv32 ABI=ilp32 CMODEL=medlow ARCH=rv32imac_zicsr_zifencei; fi
 python3 "$ROOT/tests/rv64/gen_rvc.py" "$W/gen" $XLEN >/dev/null
-names="rvc-alu rvc-mem fd-rvc-mem rvc-flow rvc-straddle"; [ "$XLEN" = 64 ] && names="$names rvc-sv39"
+names="rvc-alu rvc-mem fd-rvc-mem rvc-flow rvc-straddle"; if [ "$XLEN" = 64 ]; then names="$names rvc-sv39"; else names="$names rvc-sv32"; fi
 EXTRA_DIR="$W/gen" bash "$TRACE/scripts/build_tests.sh" "$TRACE" "$W/t" $names | grep -v ' OK$' || true
 ct=$(cd "$TRACE/baremetal/test/cpu-tests" && ls *.c | sed 's/\.c$//' | grep -v -E '^(zfinx|matmul_|load-store$|string$|bitmanip-boundary$)')
 bash "$TRACE/scripts/build_tests.sh" "$TRACE" "$W/t" $ct | grep -v ' OK$' || true

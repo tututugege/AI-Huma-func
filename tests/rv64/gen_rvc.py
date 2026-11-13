@@ -10,7 +10,7 @@ Programs (each is rvc-<name>.c + rvc-<name>-helper.S; build with trace-model/scr
   rvc-flow     c.j / c.jal / c.beqz / c.bnez forward and backward over many offsets (taken and not taken, at 2- and 4-byte
                alignments), c.jr / c.jalr for every register, jalr / jal / branches to 2-byte aligned targets
   rvc-straddle 32-bit instructions that start at the last halfword of a cache line / a 4 KiB page (bare mode)
-  rvc-sv39     (rv64) a 32-bit instruction that starts at the last halfword of a page under Sv39 in S-mode: the second halfword's page
+  rvc-sv39 / rvc-sv32  (rv64 / rv32) a 32-bit instruction that starts at the last halfword of a page under Sv39 in S-mode: the second halfword's page
                is valid / not executable / invalid / user-only / A=0: fetch page fault with mtval = pc + 2
 usage: gen_rvc.py <out-dir> [xlen]
 """
@@ -242,37 +242,48 @@ def gen_straddle():
     write("rvc-straddle", s)
 
 
-# ---------------------------------------------------------------------------------------------------------- sv39 straddle
-def gen_sv39():
+# ---------------------------------------------------------------------------------------------------------- sv39 / sv32 straddle
+def gen_sv():
+    """A 32-bit instruction at the last halfword of a virtual page; the next virtual page is NOT the next physical page (a decoy page lies
+    between them), so a front end that reads the second half at the physically adjacent address gets garbage."""
     V, R, W_, X, U, A, D = 1, 2, 4, 8, 0x10, 0x40, 0x80
-    s = "    .section .text\n    .align 2\n    .globl rvc_sv39_body\nrvc_sv39_body:\n"
+    sv39 = XLEN == 64
+    ST = SD if sv39 else "sw"; PW = 8 if sv39 else 4
+    name = "rvc-sv39" if sv39 else "rvc-sv32"
+    s = f"    .section .text\n    .align 2\n    .globl {name.replace('-', '_')}_body\n{name.replace('-', '_')}_body:\n"
     s += "    la t0, savera\n" + "".join(f"    {SD} x{r}, {r * W}(t0)\n" for r in range(1, 32) if r != 5)
     s += "    la t0, trap\n    csrw mtvec, t0\n    j start\n    .align 2\ntrap:\n    li t0, 0x1800\n    csrs mstatus, t0\n    csrw mepc, s8\n    mret\nstart:\n"
     s += "    la s0, root\n    la s1, l1\n    la s2, l0\n"
-    s += "    srli t2, s1, 12\n    slli t2, t2, 10\n    ori t2, t2, 1\n    sd t2, 8(s0)\n"      # root[1] -> l1 (VA 0x40000000)
-    s += "    srli t2, s2, 12\n    slli t2, t2, 10\n    ori t2, t2, 1\n    sd t2, 0(s1)\n"      # l1[0] -> l0
-    s += f"    la t4, pageA\n    srli t2, t4, 12\n    slli t2, t2, 10\n    ori t2, t2, {V | R | X | A}\n    sd t2, 0(s2)\n"   # l0[0] = page A (S-mode executable)
-    s += "    srli t2, s0, 12\n    li t1, 1\n    slli t1, t1, 63\n    or t2, t2, t1\n    csrw satp, t2\n"
+    if sv39:
+        s += "    srli t2, s1, 12\n    slli t2, t2, 10\n    ori t2, t2, 1\n    sd t2, 8(s0)\n"      # root[1] -> l1 (VA 0x40000000)
+        s += "    srli t2, s2, 12\n    slli t2, t2, 10\n    ori t2, t2, 1\n    sd t2, 0(s1)\n"      # l1[0] -> l0
+    else:
+        s += "    srli t2, s2, 12\n    slli t2, t2, 10\n    ori t2, t2, 1\n    sw t2, 4(s0)\n"      # root[1] -> l0 (VA 0x00400000)
+    s += f"    la t4, pageA\n    srli t2, t4, 12\n    slli t2, t2, 10\n    ori t2, t2, {V | R | X | A}\n    {ST} t2, 0(s2)\n"   # l0[0] = page A (S-mode executable)
+    if sv39: s += "    srli t2, s0, 12\n    li t1, 1\n    slli t1, t1, 63\n    or t2, t2, t1\n    csrw satp, t2\n"
+    else: s += "    srli t2, s0, 12\n    li t1, 1\n    slli t1, t1, 31\n    or t2, t2, t1\n    csrw satp, t2\n"
     variants = [V | X | A, V | R | A, 0, V | X | U | A, V | X, V | R | X | A | D, V | R | W_ | A | D]
+    va = "0x40000ffe" if sv39 else "0x00400ffe"
     for k, fl in enumerate(variants):
         s += "    la t4, pageB\n"
         if fl == 0:
-            s += "    sd zero, 8(s2)\n"
+            s += f"    {ST} zero, {PW}(s2)\n"
         else:
-            s += f"    srli t2, t4, 12\n    slli t2, t2, 10\n    ori t2, t2, {fl}\n    sd t2, 8(s2)\n"
+            s += f"    srli t2, t4, 12\n    slli t2, t2, 10\n    ori t2, t2, {fl}\n    {ST} t2, {PW}(s2)\n"
         s += "    sfence.vma\n    li t0, 0x1800\n    csrc mstatus, t0\n    li t0, 0x800\n    csrs mstatus, t0\n"
-        s += f"    li t0, 0x40000ffe\n    csrw mepc, t0\n    la s8, D{k}\n    mret\nD{k}:\n"
+        s += f"    li t0, {va}\n    csrw mepc, t0\n    la s8, D{k}\n    mret\nD{k}:\n"
     s += "    csrw satp, zero\n"
     s += "    la t0, savera\n" + "".join(f"    {LD} x{r}, {r * W}(t0)\n" for r in range(1, 32) if r != 5) + "    ret\n"
     s += "    .balign 4096\npageA:\n    .skip 4094\n    .hword 0x0513\n"                    # first half of addi a0, a0, 1
+    s += "decoy:\n    .rept 2048\n    .hword 0xffff\n    .endr\n"                           # the physically next page: not the one mapped after A
     s += "pageB:\n    .hword 0x0015\n    .hword 0x0073\n    .hword 0x0000\n    .skip 4090\n"  # its second half, then ecall
     s += "    .section .bss\n    .balign 4096\nroot:\n    .space 4096\nl1:\n    .space 4096\nl0:\n    .space 4096\nsavera:\n    .space 256\n"
-    write("rvc-sv39", s)
+    write(name, s)
 
 n_alu = gen_alu()
 n_mem = gen_mem("rvc-mem", 0)
 gen_mem("fd-rvc-mem", 1)
 gen_flow()
 gen_straddle()
-if XLEN == 64: gen_sv39()
+gen_sv()
 print("rvc-alu", n_alu, "encodings; rvc-mem", n_mem, "encodings")
