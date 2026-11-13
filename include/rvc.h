@@ -4,7 +4,13 @@
 // trap value).  HINT encodings expand to the instruction they alias (writes to x0 are discarded by the core).
 // With XLEN = 32: c.jal, c.flw/c.fsw/c.flwsp/c.fswsp; with XLEN = 64: c.addiw/c.subw/c.addw/c.ld/c.sd/c.ldsp/c.sdsp.
 // The double-precision forms (c.fld/c.fsd/c.fldsp/c.fsdsp) exist only with FP = 1.
+// XLEN and FP are taken from the compile flags (-DXLEN, -DFP) when the including project has its own register-width header
+#ifndef XLEN
 #include "xlen.h"
+#endif
+#ifndef FP
+#define FP 1
+#endif
 #include <cstdint>
 
 namespace rvc {
