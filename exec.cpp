@@ -1683,10 +1683,10 @@ dispatch_block:
       last_digest = c;
     }
   }
-  if (pc & 3u) {
+  if (!RVC && (pc & 3u)) {
     goto out;  // misaligned pc: the general path fetches the aligned word
   }
-  b = &blocks[(pc >> 2) & (kFastBlocks - 1)];
+  b = &blocks[(pc >> (RVC ? 1 : 2)) & (kFastBlocks - 1)];
   if (__builtin_expect(b->pc != pc || b->ctx != ctx || (XLEN == 64 && b->satp != satp), 0)) {
     goto build;
   }
@@ -1728,7 +1728,38 @@ build : {
   for (;;) {
     if (n == maxlen) { end_op = F_CONT; break; }
     FastInsn &fi = b->ops[n];
+    fi.off = static_cast<uint16_t>(cpc - pc);
+    fi.len = 4;
+#if RVC
+    // halfword fetch: a compressed instruction is expanded and decoded like the 32-bit one; a 32-bit instruction that
+    // starts on the last halfword of the page (its second half is on another page) and anything illegal is left to RISCV()
+    {
+      const uint32_t hq = (q & 0x7FFFFFFFu) >> 1;
+      uint16_t h0;
+      std::memcpy(&h0, reinterpret_cast<const uint8_t *>(mem) + (hq << 1), 2);
+      uint32_t word = h0;
+      bool ok = true;
+      if ((h0 & 3u) == 3u) {
+        if ((cpc & 0xFFFu) == 0xFFEu || (h0 & 0x1Fu) == 0x1Fu) {
+          ok = false;
+        } else {
+          uint16_t h1;
+          std::memcpy(&h1, reinterpret_cast<const uint8_t *>(mem) + ((hq + 1) << 1), 2);
+          word = h0 | (static_cast<uint32_t>(h1) << 16);
+        }
+      } else {
+        fi.len = 2;
+        ok = rvc::expand(h0, word);
+      }
+      if (ok) {
+        fast_decode(word, fi);
+      } else {
+        fi.op = F_SLOW;
+      }
+    }
+#else
     fast_decode(mem[(q & 0x7FFFFFFFu) >> 2], fi);
+#endif
     if (fi.op == F_SLOW) {
       if (g_fast_stats) g_fs.slow_op[(mem[(q & 0x7FFFFFFFu) >> 2] & 0x7F) * 8 + ((mem[(q & 0x7FFFFFFFu) >> 2] >> 12) & 7)]++;
       end_op = F_EXIT;
@@ -1736,8 +1767,8 @@ build : {
     }
     fi.h = tbl[fi.op];
     n++;
-    q += 4;
-    cpc += 4;
+    q += fi.len;
+    cpc += fi.len;
     if (fast_ends_block(fi.op)) { end_op = F_NOP; break; }  // a jump, branch or CSR instruction ends the block
     if ((cpc & 0xFFFu) == 0) { end_op = F_CONT; break; }    // the next instruction is on another page
   }
@@ -1745,6 +1776,7 @@ build : {
     FastInsn &fi = b->ops[n];
     fi.op = end_op;
     fi.h = tbl[end_op];
+    fi.off = static_cast<uint16_t>(cpc - pc);
   }
   {
     // fuse adjacent pairs (greedy, left to right); slot i runs instructions i and i+1, slot i+1 stays intact
@@ -1779,14 +1811,14 @@ build : {
 }
 
 #define NEXT() do { ++op; goto *op->h; } while (0)
-#define PC_OF(o) (bpc + (xlen_t)(((o) - b->ops) << 2))
+#define PC_OF(o) (bpc + (xlen_t)(o)->off)
 // leaving the block before executing 'op': give back the budget of the instructions not executed
 #define BAIL()                                                                                                       \
   do {                                                                                                               \
     ex = (uint32_t)(op - b->ops);                                                                                    \
     left += b->n - ex;                                                                                               \
     if (U) bbl += ex;                                                                                                \
-    pc = bpc + (ex << 2);                                                                                            \
+    pc = bpc + op->off;                                                                                              \
     if (g_fast_stats) g_fs.stop[5]++;                                                                                \
     goto out;                                                                                                        \
   } while (0)
@@ -1818,11 +1850,11 @@ L_NOP:
   NEXT();
 L_CONT:
   if (U) bbl += b->n;
-  pc = bpc + (b->n << 2);
+  pc = bpc + b->ops[b->n].off;
   goto dispatch_block;
 L_EXIT:
   if (U) bbl += b->n;
-  pc = bpc + (b->n << 2);
+  pc = bpc + b->ops[b->n].off;
   if (g_fast_stats) g_fs.stop[4]++;
   goto out;
 
@@ -1831,20 +1863,20 @@ L_EXIT:
 #define B_AUIPC x[op->rd] = op->imm + PC_OF(op);
 #define B_JAL                                                                                                        \
   ipc = PC_OF(op);                                                                                                   \
-  x[op->rd] = ipc + 4;                                                                                               \
+  x[op->rd] = ipc + op->len;                                                                                         \
   x[0] = 0;                                                                                                          \
   pc = ipc + op->imm;                                                                                                \
   END_CONTROL();
 #define B_JALR                                                                                                       \
   ipc = PC_OF(op);                                                                                                   \
   v = (x[op->rs1] + op->imm) & ~xlen_t(RVC ? 1 : 3);                                                                 \
-  x[op->rd] = ipc + 4;                                                                                               \
+  x[op->rd] = ipc + op->len;                                                                                         \
   x[0] = 0;                                                                                                          \
   pc = v;                                                                                                            \
   END_CONTROL();
 #define B_BRANCH(COND)                                                                                               \
   ipc = PC_OF(op);                                                                                                   \
-  pc = (COND) ? ipc + op->imm : ipc + 4;                                                                             \
+  pc = (COND) ? ipc + op->imm : ipc + op->len;                                                                       \
   END_CONTROL();
 #define B_BEQ B_BRANCH(x[op->rs1] == x[op->rs2])
 #define B_BNE B_BRANCH(x[op->rs1] != x[op->rs2])
@@ -1920,7 +1952,7 @@ L_EXIT:
       ex = (uint32_t)(op - b->ops) + 1;                                                                              \
       left += b->n - ex;                                                                                             \
       if (U) bbl += ex;                                                                                              \
-      pc = bpc + (ex << 2);                                                                                          \
+      pc = bpc + b->ops[ex].off;                                                                                     \
       ep = icache_epoch;                                                                                             \
       ctx = ctx_base | ep;                                                                                           \
       goto dispatch_block;                                                                                           \
@@ -1956,7 +1988,7 @@ L_EXIT:
       ex = (uint32_t)(op - b->ops) + 1;                                                                              \
       left += b->n - ex;                                                                                             \
       if (U) bbl += ex;                                                                                              \
-      pc = bpc + (ex << 2);                                                                                          \
+      pc = bpc + b->ops[ex].off;                                                                                     \
       ep = icache_epoch;                                                                                             \
       ctx = ctx_base | ep;                                                                                           \
       goto dispatch_block;                                                                                           \

@@ -299,6 +299,8 @@ public:
     const void *h = nullptr;  // handler (label address)
     xlen_t imm = 0;
     uint8_t op = 0, rd = 0, rs1 = 0, rs2 = 0;
+    uint16_t off = 0;  // byte offset of the instruction from the block start (instructions are 2 or 4 bytes with RVC)
+    uint8_t len = 4;   // its length in bytes
   };
   static constexpr uint32_t kMaxBlockOps = 32;
   static constexpr uint32_t kFastBlocks = 16384;

@@ -234,7 +234,7 @@ SPIKE_SRC=... SPIKE_BUILD=... bash tests/rv64/run.sh <工作目录>     # 需要
 - 取指单位是半字：`pc` 只要求 2 字节对齐，一条 32 位指令可以从任意半字开始，第二个半字可以在下一个 cache line 或下一页（独立翻译，缺页时 `mtval` = `pc+2`）。
 - 16 位指令在取指时展开成等价的 32 位指令（`include/rvc.h`，一个纯函数），后面的执行代码不变；`ilen`（2 或 4，`RefCpuStepInfo.inst_len` 给上层；`instruction` 是展开后的 32 位）用于 `pc+ilen`、`jal/jalr` 的链接值、`ecall`/`ebreak` 之后的 pc。非法或保留的 16 位编码产生非法指令异常，`mtval` 是 16 位原编码（`inst_raw`）。
 - `misa.C` 置位；`jalr` 目标只清第 0 位；`mepc`/`sepc` 只清第 0 位；`medeleg` 第 0 位（取指地址未对齐）只读 0。
-- 快速路径（基本块缓存）只处理 4 字节对齐的 32 位指令；遇到压缩指令或 2 字节对齐的 pc 就交给 `RISCV()` 单步，所以带 C 的代码比不带 C 慢（Linux 启动实测约 50 MIPS）。给快速路径加长度信息是后续优化。
+- 快速路径（基本块缓存）也支持压缩指令：每条指令记字节偏移和长度，压缩指令展开后按 32 位指令解码；块遇到跨页的 32 位指令、48 位编码或非法编码就停下交给 `RISCV()`。带 C 的 Linux 启动实测快速路径约 300 MIPS（15 亿条指令 4.6 s），只走 `RISCV()` 单步约 50 MIPS。快速路径与单步路径的状态摘要（`REF_STATE_DIGEST_BLOCK` / `REF_NO_FAST`，含 CSR）在 Linux 前 1 亿条指令和 58 个测试程序上逐块一致。
 - 不支持：48 位及更长的指令编码（当作非法指令）、`misa` 的 C 位不可写（不能关掉）、Zc*（Zcb/Zcmp 等）。
 - Spike 对拍的 ISA 串加 `c`（`rv64imafdcb_…`）；`scripts/build_spike.sh` 认 `RVC=1`。
 - 测试 `tests/rv64/rvc.sh <工作目录>`（`XLEN=32|64`）：`tests/rv64/gen_rvc.py` 生成的定向测试（全部 16 位编码里非访存、非跳转的在随机寄存器值上执行；全部访存编码，含 FS 开 / 关的浮点；`c.j` / `c.jal` / `c.beqz` / `c.bnez` 前后向多种偏移、`c.jr` / `c.jalr` 每个寄存器；32 位指令跨 cache line / 跨页；Sv39 下第二个半字缺页），trace-model 的 cpu-tests 带 C 编译，官方 `riscv-tests` 的 `rv<XLEN>uc`，每条指令与 Spike 比较。cpu-tests 里有已知的 5 个不通过项：都是测试源码假定 4 字节指令（中断向量表的 4 字节槽位、`trap-precise-store` 用 `+8` 跳过 `ecall; sw`），以及不带 C 时也有的两个平台差异。
