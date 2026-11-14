@@ -1,3 +1,4 @@
+#include <cstring>
 #ifdef ENABLE_SPIKE
 #include "spike_ref.h"
 #endif
@@ -4290,6 +4291,7 @@ void Ref_cpu::icache_flush() {
 }
 
 bool Ref_cpu::va2pa(uint32_t &p_addr, xlen_t v_addr, uint32_t type) {
+  if (force_pf_type == int(type)) { force_pf_type = -1; return false; }
   const xlen_t mstatus = state.csr[csr_mstatus];
   const xlen_t satp = state.csr[csr_satp];
   uint32_t eff_priv = privilege;  // as in va2pa_walk: MPRV applies to everything but instruction fetch

@@ -275,6 +275,12 @@ bool refcpu_take_forced_interrupt(RefCpuContext *ctx, refcpu_xlen_t cause,
                                cause, target_privilege, pending_snapshot);
 }
 
+void refcpu_force_next_page_fault(RefCpuContext *ctx, uint32_t type) {
+  if (ctx == nullptr) return;
+  ctx->cpu.force_pf_type = int(type);
+  ++ctx->cpu.tlb_epoch;  // the inline TLB probe of loads / stores must miss so that va2pa() sees the forced fault
+}
+
 void refcpu_set_sim_end(RefCpuContext *ctx, bool value) {
   if (ctx == nullptr) {
     return;

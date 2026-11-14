@@ -240,6 +240,7 @@ public:
   void evaluate_interrupts(uint32_t mip_reg);
   bool take_forced_interrupt(xlen_t cause, uint8_t target_privilege,
                              uint32_t pending_snapshot);
+  int force_pf_type = -1;  // checker: the next va2pa of this type (0 fetch, 1 load, 2 store) faults once (a DUT TLB / walker saw a stale PTE)
   void load_flash_image(const std::string &path);
   void load_sdcard_image(const std::string &path);
   void ocsdc_reset();

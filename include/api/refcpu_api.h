@@ -94,6 +94,7 @@ void refcpu_set_next_csr_read(RefCpuContext *ctx, uint32_t csr_addr,
 bool refcpu_take_forced_interrupt(RefCpuContext *ctx, refcpu_xlen_t cause,
                                   uint8_t target_privilege,
                                   uint32_t pending_snapshot);
+void refcpu_force_next_page_fault(RefCpuContext *ctx, uint32_t type);  // type: 0 fetch, 1 load, 2 store
 void refcpu_set_sim_end(RefCpuContext *ctx, bool value);
 void refcpu_set_sim_time(RefCpuContext *ctx, uint64_t sim_time);
 
