@@ -3,9 +3,9 @@
 #include <cstddef>
 #include <cstdint>
 
-// Register width of the model this header is used with: build with -DXLEN=64 for rv64 (default 32, rv32).
+// Register width of the model this header is used with: build with -DXLEN=64 for rv64 (default 64; 32 only on branch rv32-legacy).
 #ifndef XLEN
-#define XLEN 32
+#define XLEN 64
 #endif
 #if XLEN == 64
 typedef uint64_t refcpu_xlen_t;

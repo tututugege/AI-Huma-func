@@ -3808,23 +3808,6 @@ void Ref_cpu::RV32IM() {
     }
     check_mem_range_or_log("store", p_addr, access_size);
 
-#if FP && XLEN == 32
-    if (access_size == 8) {   // fsd on rv32: the double is 64 bits wide, the register width is 32: two word writes
-      const uint64_t d = state.fpr[reg_b_index];
-      state.store = true;
-      state.store_strb = 0b1111;
-      state.store_addr = p_addr;
-      state.store_data = static_cast<uint32_t>(d);
-      store_data_word();
-      state.store_addr = p_addr + 4;
-      state.store_data = static_cast<uint32_t>(d >> 32);
-      store_data_word();
-      state.store_addr = p_addr;                       // report the whole store (the low word's data)
-      state.store_data = static_cast<uint32_t>(d);
-      state.store_strb = 0xFFu;
-      break;
-    }
-#endif
     state.store = true;
     state.store_addr = p_addr;
     state.store_data = reg_rdata2;
@@ -4317,141 +4300,6 @@ bool Ref_cpu::va2pa(uint32_t &p_addr, xlen_t v_addr, uint32_t type) {
   return true;
 }
 
-#if XLEN == 32
-bool Ref_cpu::va2pa_walk(uint32_t &p_addr, xlen_t v_addr, uint32_t type) {
-  uint32_t mstatus = state.csr[csr_mstatus];
-  uint32_t sstatus = state.csr[csr_sstatus];
-  uint32_t satp = state.csr[csr_satp];
-
-  // 1. 提取状态位 (直接位运算，极快)
-  bool mxr = (mstatus & MSTATUS_MXR) != 0;
-  bool sum = (mstatus & MSTATUS_SUM) != 0;
-  bool mprv = (mstatus & MSTATUS_MPRV) != 0;
-
-  // 确定有效特权级 (Effective Privilege Mode)
-  // 如果 MPRV=1 且不是取指(type!=0)，则使用 MPP 作为特权级进行检查
-  int eff_priv = privilege;
-  if (type != 0 && mprv) {
-    eff_priv = (mstatus >> MSTATUS_MPP_SHIFT) & 0x3;
-  }
-
-  // 2. Level 1 Page Table Walk
-  // satp 的 PPN 字段在 SV32 中是低 22 位 (0-21)
-  // VPN[1] 是 v_addr 的 [31:22] 位
-  // pte1_addr = (satp.ppn << 12) + (vpn1 * 4)
-  // 你的原代码逻辑：(satp << 12) | ((v_addr >> 20) & 0xFFC)
-  // 等价于下面的位操作：
-  uint32_t ppn_root = satp & 0x3FFFFF; // 提取 SATP 中的 PPN
-  uint32_t vpn1 = (v_addr >> 22) & 0x3FF;
-  uint32_t pte1_addr = (ppn_root << 12) | (vpn1 << 2);
-
-  // 直接读取，注意这里需要确保 memory 是按字寻址还是字节寻址
-  check_mem_range_or_log("ptw-l1", pte1_addr, 4);
-  mark_pt_page(pte1_addr);
-  uint32_t pte1 = load_word(pte1_addr);
-
-  // 3. 检查 PTE 有效性
-  // !V 或者 (!R && W) 都是无效的
-  if (!(pte1 & PTE_V) || (!(pte1 & PTE_R) && (pte1 & PTE_W))) {
-    return false;
-  }
-
-  // 4. 判断是否是叶子节点 (R=1 或 X=1)
-  if ((pte1 & PTE_R) || (pte1 & PTE_X)) {
-    // --- Superpage (4MB) ---
-
-    // 权限检查 (Permission Check)
-    // Fetch (0): 需要 X
-    if (type == 0 && !(pte1 & PTE_X))
-      return false;
-    // Load (1): 需要 R，或者 (MXR=1 且 X=1)
-    if (type == 1 && !(pte1 & PTE_R) && !(mxr && (pte1 & PTE_X)))
-      return false;
-    // Store (2): 需要 W
-    if (type == 2 && !(pte1 & PTE_W))
-      return false;
-
-    // 用户权限检查 (User/Supervisor Check)
-    bool is_user_page = (pte1 & PTE_U) != 0;
-    if (eff_priv == 0 && !is_user_page)
-      return false; // U-mode 访问 S-page -> Fault
-    if (eff_priv == 1 && is_user_page) {
-      if (type == 0 || !sum)
-        return false; // SUM never permits S-mode instruction fetch from U pages.
-    }
-
-    // 对齐检查 (Superpage 要求 PPN[0] 为 0)
-    // PPN[0] 对应 PTE 的 [19:10] 位
-    if ((pte1 >> 10) & 0x3FF)
-      return false;
-
-    // A/D 位检查
-    if (!(pte1 & PTE_A))
-      return false; // Accessed 必须为 1 (硬件不自动设置时需报错)
-    if (type == 2 && !(pte1 & PTE_D))
-      return false; // 写操作 Dirty 必须为 1
-
-    // 计算物理地址 (Superpage)
-    // PA = PPN[1] | VPN[0] | Offset
-    // PPN[1] 是 PTE[31:20]，对应 PA[31:22]
-    // v_addr & 0x3FFFFF 保留低 22 位 (VPN[0] + Offset)
-    p_addr = ((pte1 << 2) & 0xFFC00000) | (v_addr & 0x3FFFFF);
-    return true;
-  }
-
-  // 5. Level 2 Page Table Walk (非叶子节点，指向下一级页表)
-  // PPN 是 PTE 的 [31:10] 位
-  uint32_t ppn1 = (pte1 >> 10) & 0x3FFFFF;
-  uint32_t vpn0 = (v_addr >> 12) & 0x3FF;
-  uint32_t pte2_addr = (ppn1 << 12) | (vpn0 << 2);
-
-  check_mem_range_or_log("ptw-l2", pte2_addr, 4);
-  mark_pt_page(pte2_addr);
-  uint32_t pte2 = load_word(pte2_addr);
-
-  // 重复有效性检查
-  if (!(pte2 & PTE_V) || (!(pte2 & PTE_R) && (pte2 & PTE_W))) {
-    return false;
-  }
-
-  // Level 2 必须是叶子节点 (SV32 只有两级)
-  if ((pte2 & PTE_R) || (pte2 & PTE_X)) {
-    // --- 4KB Page ---
-
-    // 权限检查 (逻辑同上)
-    if (type == 0 && !(pte2 & PTE_X))
-      return false;
-    if (type == 1 && !(pte2 & PTE_R) && !(mxr && (pte2 & PTE_X)))
-      return false;
-    if (type == 2 && !(pte2 & PTE_W))
-      return false;
-
-    // 用户权限检查
-    bool is_user_page = (pte2 & PTE_U) != 0;
-    if (eff_priv == 0 && !is_user_page)
-      return false;
-    if (eff_priv == 1 && is_user_page) {
-      if (type == 0 || !sum)
-        return false;
-    }
-
-    // A/D 位检查
-    if (!(pte2 & PTE_A))
-      return false;
-    if (type == 2 && !(pte2 & PTE_D))
-      return false;
-
-    // 计算物理地址 (4KB Page)
-    // PA = PPN | Offset
-    // PPN 是 PTE[31:10]，对应 PA[31:12]
-    // Offset 是 v_addr[11:0]
-    p_addr = ((pte2 >> 10) << 12) | (v_addr & 0xFFF);
-    return true;
-  }
-
-  return false; // 如果 Level 2 还不是叶子节点，则是非法页表
-}
-#else  // XLEN == 64: Sv39
 
 // Three-level page walk (RISC-V privileged spec 4.3.2).  Accessed/dirty bits are not updated by hardware: a leaf with
 // A = 0 (or D = 0 on a store) faults, as in the Sv32 walk.  Physical addresses above 4 GiB are not backed by this SoC
@@ -4526,4 +4374,3 @@ bool Ref_cpu::va2pa_walk(uint32_t &p_addr, xlen_t v_addr, uint32_t type) {
   }
   return false;
 }
-#endif

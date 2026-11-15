@@ -1,8 +1,8 @@
 #pragma once
 #include <cstdint>
-// Architectural register width of the function model: -DXLEN=32 (default, rv32imab) or -DXLEN=64 (rv64imab).
+// Architectural register width of the function model: -DXLEN=64 (default; rv32 is no longer on main, see branch rv32-legacy).
 #ifndef XLEN
-#define XLEN 32
+#define XLEN 64
 #endif
 #if XLEN == 64
 using xlen_t = uint64_t;

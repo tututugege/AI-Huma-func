@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # Build the Spike-checked function model (a.out with --diff) OUT OF TREE, so that its objects never mix with the plain
 # build (the Makefile uses the same .o names for both and trace-model links librefcpu.a from the plain ones).
-#   usage: scripts/build_spike.sh            env: XLEN (32 or 64, default 32), FP (1 = F/D, rv64 only, default 0), SPIKE_SRC (riscv-isa-sim checkout), SPIKE_BUILD (its built tree: libriscv.a libfesvr.a
+#   usage: scripts/build_spike.sh            env: XLEN (32 or 64, default 64), FP (1 = F/D, rv64 only, default 0), SPIKE_SRC (riscv-isa-sim checkout), SPIKE_BUILD (its built tree: libriscv.a libfesvr.a
 #                                                libsoftfloat.a libdisasm.a libfdt.a config.h), OUT (default build-spike)
 # Spike here is configured without PMP; the function model traps on every CSR it does not implement (force_sync in exec.cpp).
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 SPIKE_SRC=${SPIKE_SRC:?set SPIKE_SRC to a riscv-isa-sim checkout}
 SPIKE_BUILD=${SPIKE_BUILD:?set SPIKE_BUILD to the built riscv-isa-sim tree}
-XLEN=${XLEN:-32}
+XLEN=${XLEN:-64}
 FP=${FP:-1}
 RVC=${RVC:-0}
 OUT=${OUT:-$ROOT/build-spike}

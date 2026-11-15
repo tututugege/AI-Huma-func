@@ -2,20 +2,14 @@
 
 > 在 AI-Huma 项目里，这个仓库是**架构行为的标准**：trace-model 由它提供执行“事实”，RTL 每提交一条指令都与它逐条对比；它也负责 SPEC 的 BBV / SimPoint / 检查点生成（`scripts/spec/`）。项目总览见总仓库 `README.md` 和 `docs/GUIDE.md`。
 
-轻量、高性能的 RISC-V 全系统功能模拟器（M/S/U 三个特权级，Linux 可启动）。寄存器宽度在编译时选择：
+轻量、高性能的 RISC-V 全系统功能模拟器（M/S/U 三个特权级，Linux 可启动）。寄存器宽度由 `XLEN` 编译开关决定。
+**main 上只维护 rv64（`XLEN=64`）。** rv32 的整套代码、测试、Linux 镜像脚本保留在分支 `rv32-legacy`（删除前的 main）。
 
-| | rv32（默认，`XLEN=32`） | rv64（`XLEN=64`，可加 `FP=1`） |
-|---|---|---|
-| 整数/乘除/原子 | RV32IMA | RV64IMA（含 `*W`、`lwu/ld/sd`、`amo*.d`、`lr/sc.d`） |
-| 位操作 | Zba/Zbb/Zbs、Zbc、Zbkb 的 `pack/packh`（无 `brev8/zip/xperm`），合称 "B" | 同左，另有 `*W` 变体 |
-| 浮点 | 标准 **F/D**（默认 `FP=1`）：32 个 64 位浮点寄存器、`fcsr`、`mstatus.FS/SD`，softfloat，NaN-boxing 和 Spike 一致；rv32 没有 `fmv.x.d/fmv.d.x` 和 `fcvt.l/lu`，`fld/fsd` 是 8 字节访问（两个字）。`FP=0` 是没有任何浮点的核。Zfinx 已删除 | 同左 |
-| 压缩指令 C | `RVC=1` 开关（默认 0，不带 C） | 同左 |
-| 地址翻译 | Sv32 | Sv39 |
-| 检查点格式 | 版本 6（F/D）；`FP=0` 是版本 3（2 仍可读） | 版本 5（F/D）；`FP=0` 是版本 4（`CPU_state` 带浮点寄存器时其后跟 `fcsr`） |
-| Spike 对拍 ISA | `rv32imafdb_zbc_zbkb_zbkx`（`FP=0`：`rv32imab_…`） | `rv64imafdb_zbc_zbkb_zbkx`（`FP=0`：`rv64imab_…`） |
-| Linux | 5.15.170 + OpenSBI，启动到 `rv32 login:` | 同版本内核，启动到 `rv64 login:` |
+- RV64IMA（含 `*W`、`lwu/ld/sd`、`amo*.d`、`lr/sc.d`）+ Zba/Zbb/Zbs/Zbc/Zbkb（合称 "B"），F/D（默认 `FP=1`），`RVC=1` 开 C
+- 地址翻译 Sv39；检查点格式版本 5（F/D）/ 4（`FP=0`）；Spike ISA `rv64imafdb_zbc_zbkb_zbkx`（`FP=0`：`rv64imab_…`）
+- Linux 5.15.170 + OpenSBI，启动到 `rv64 login:`
 
-两个宽度共用同一份源码（`include/xlen.h` 定义 `xlen_t`）；默认的 `XLEN=32` 行为与 rv64 迁移之前一致。物理地址空间两个宽度相同（见下文），不支持 4 GiB 以上的物理地址。
+`include/xlen.h` 仍定义 `xlen_t`，源码里还留有 `XLEN==32` 的零星条件分支（死代码，不再测试）；默认 `XLEN=64`，物理地址空间见下文，不支持 4 GiB 以上的物理地址。
 
 两类 Difftest：
 
@@ -31,9 +25,8 @@
 ### 1. 编译
 
 ```bash
-make -j4                    # rv32，不带 Spike，产物 a.out
+make -j4                    # rv64，不带 Spike，产物 a.out
 make no_spike -j4           # 同上，但产物叫 a.out.nospike（脚本和 linux/ 文档里用这个名字）
-make XLEN=64 -j4            # rv64，不带 Spike
 make FP=0 -j4               # 没有浮点的核（默认是 FP=1：F/D）
 make RVC=1 -j4              # 带 C 扩展（压缩指令，默认 RVC=0；见下文“C 扩展”）
 make librefcpu.a            # 给上层主模拟器链接的静态库（不依赖 Spike；XLEN 同样可选）
@@ -44,8 +37,7 @@ make clean                  # 删除 a.out a.out.nospike librefcpu.a *.o *.d
 - **`.o` 文件不区分 XLEN 和 FP**。在同一目录里切换 `XLEN` 或 `FP` 之前必须 `make clean`，否则目标文件会混链（头文件依赖不会感知命令行的 `-DXLEN` / `-DFP`）。
 - `make with_spike` 把 Spike 链进 `a.out`，需要 `SPIKE_SRC`（riscv-isa-sim 源码）和 `SPIKE_BUILD`（已构建好的目录），并且会和普通构建共用 `.o`。**推荐改用 `scripts/build_spike.sh`**，它在仓库外目录 `build-spike/` 构建，不污染普通构建：
   ```bash
-  SPIKE_SRC=<riscv-isa-sim 源码> SPIKE_BUILD=<其构建目录> bash scripts/build_spike.sh             # rv32，产物 build-spike/a.out
-  XLEN=64 SPIKE_SRC=... SPIKE_BUILD=... OUT=build-spike64 bash scripts/build_spike.sh             # rv64
+  SPIKE_SRC=<riscv-isa-sim 源码> SPIKE_BUILD=<其构建目录> bash scripts/build_spike.sh             # rv64，产物 build-spike/a.out
   XLEN=64 FP=1 SPIKE_SRC=... SPIKE_BUILD=... OUT=build-spike64fp bash scripts/build_spike.sh       # rv64 + F/D
   ```
 - 不带 Spike 的二进制收到 `--diff` 只打印 warning 并关闭 difftest。
@@ -69,13 +61,8 @@ standalone 的行为：
 镜像由 `linux/mkimage.sh` 生成，细节见 [linux/README.md](linux/README.md)。预先构建好的内核/OpenSBI/rootfs 目录：rv32 `~/personal/llm4trace/linux_rv32`，rv64 `~/personal/AI-Huma-data/linux_rv64`。
 
 ```bash
-# rv32
+# rv64
 make no_spike -j4
-MEM=0x10000000 bash linux/mkimage.sh ~/personal/llm4trace/linux_rv32 /tmp/linux32.bin
-REF_UNBUF=1 ./a.out.nospike --image /tmp/linux32.bin         # 约 0.12 G 条指令后到 "rv32 login:"
-
-# rv64（另一个目录，或先 make clean）
-make clean && make XLEN=64 no_spike -j4
 KOFF=0x200000 DTS=ttg64.dts MEM=0x10000000 bash linux/mkimage.sh ~/personal/AI-Huma-data/linux_rv64 /tmp/linux64.bin
 REF_UNBUF=1 ./a.out.nospike --image /tmp/linux64.bin         # 到 "rv64 login:"，约 1 秒（快速路径）
 ```
@@ -170,8 +157,7 @@ SPIKE_SRC=... SPIKE_BUILD=... bash tests/rv64/run.sh <工作目录>     # 需要
 7. `io_ranges + io_data`（重复 `io_range_count` 次）：`base`、`size`（各 `uint32_t`），其后是 `size` 字节原始数据。顺序固定为 `BOOT -> UART -> XPS INTC -> TIMER -> OCSDC`
 
 ### 版本
-- 版本 2：rv32，没有 SDRAM 段，仍可恢复（SDRAM 清零）
-- 版本 3：rv32（当前）
+- 版本 2/3：rv32（只在 `rv32-legacy` 分支支持）
 - 版本 4：rv64（当前，`FP=0`）
 - 版本 5：rv64 + F/D（`FP=1`）：`CPU_state` 里 `gpr` 后多 32 个 `uint64_t` 浮点寄存器（整体 720 字节），其后紧跟 `uint32_t fcsr`，再是 `interval_inst_count`；`FP=0` 的模拟器读它会报版本不支持，`tools/ckpt2stub.py` 能读，并在前门恢复程序里用 `fmv.d.x` 和 `csrw fcsr` 还原浮点状态。
 
