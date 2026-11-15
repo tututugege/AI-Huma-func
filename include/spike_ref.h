@@ -32,10 +32,9 @@ public:
   static constexpr uint32_t kAsyncPendingMask =
       MIP_MTIP | MIP_MEIP | MIP_SEIP;
 
-  // Spike keeps rv32 registers sign-extended to 64 bits; rv64 values are taken as they are.
+  // rv64 values are taken as they are.
   static reg_t canonical_rv32(xlen_t value) {
-    if (XLEN == 64) return static_cast<reg_t>(value);
-    return static_cast<reg_t>(static_cast<int64_t>(static_cast<int32_t>(static_cast<uint32_t>(value))));
+    return static_cast<reg_t>(value);
   }
 
   std::unique_ptr<sim_t> sim;
@@ -86,13 +85,8 @@ public:
         0x00000297, // 0x1000: auipc t0,0
         0x02828613, // 0x1004: addi a2,t0,40
         0xf1402573, // 0x1008: csrrs a0,mhartid,zero
-#if XLEN == 64
         0x0202b583, // 0x100c: ld a1,32(t0)
         0x0182b283, // 0x1010: ld t0,24(t0)
-#else
-        0x0202a583, // 0x100c: lw a1,32(t0)
-        0x0182a283, // 0x1010: lw t0,24(t0)
-#endif
         0x00028067, // 0x1014: jr              t0
         0x80000000, // 0x1018:
         0x00000000, // 0x101c: padding
@@ -146,7 +140,7 @@ public:
       }
     }
 
-    sim->get_core(0)->set_max_vaddr_bits(XLEN == 64 ? 39 : 32);   // Sv39 / Sv32 only
+    sim->get_core(0)->set_max_vaddr_bits(39);   // Sv39 only
     // mstatus.SUM / MXR are writable only if the core had an MMU when its status CSRs were built (processor_t::has_mmu): reset it
     // again now that sv32 is enabled, then set the start pc
     sim->get_core(0)->reset();
@@ -403,65 +397,8 @@ public:
         }
 
         if (has_vaddr) {
-          if (XLEN == 32 && (satp & 0x80000000)) {   // debug dump walks Sv32 only
-            uint32_t root_ppn = satp & 0x3FFFFF;
-            uint32_t vpn1 = (v_addr >> 22) & 0x3FF;
-            uint32_t vpn0 = (v_addr >> 12) & 0x3FF;
-            uint32_t pte1_addr = (root_ppn << 12) + (vpn1 << 2);
-
-            std::cout << "  [Walk] Level 1 PTE Addr (PA): 0x" << std::hex
-                      << pte1_addr << std::endl;
-
-            uint32_t pte1 = 0;
-            if (pte1_addr >= 0x80000000 &&
-                (pte1_addr - 0x80000000 + 4) <= main_mem_ptr->size()) {
-              uint8_t buf[4];
-              if (main_mem_ptr->load(pte1_addr - 0x80000000, 4, buf)) {
-                pte1 = (uint32_t)buf[0] | ((uint32_t)buf[1] << 8) |
-                       ((uint32_t)buf[2] << 16) | ((uint32_t)buf[3] << 24);
-                std::cout << "  [Walk] Level 1 PTE: 0x" << pte1 << std::endl;
-
-                if (pte1 & 0x1) {
-                  if ((pte1 & 0x2) || (pte1 & 0x8)) { // Superpage
-                    uint32_t pa =
-                        ((pte1 << 2) & 0xFFC00000) | (v_addr & 0x3FFFFF);
-                    std::cout << "  [Walk] Superpage Leaf -> Final PA: 0x" << pa
-                              << std::endl;
-                  } else {
-                    uint32_t ppn1 = (pte1 >> 10) & 0x3FFFFF;
-                    uint32_t pte0_addr = (ppn1 << 12) + (vpn0 << 2);
-                    std::cout << "  [Walk] Level 0 PTE Addr (PA): 0x"
-                              << pte0_addr << std::endl;
-                    if (pte0_addr >= 0x80000000 &&
-                        (pte0_addr - 0x80000000 + 4) <= main_mem_ptr->size()) {
-                      uint8_t buf0[4];
-                      if (main_mem_ptr->load(pte0_addr - 0x80000000, 4, buf0)) {
-                        uint32_t pte0 = (uint32_t)buf0[0] |
-                                        ((uint32_t)buf0[1] << 8) |
-                                        ((uint32_t)buf0[2] << 16) |
-                                        ((uint32_t)buf0[3] << 24);
-                        std::cout << "  [Walk] Level 0 PTE: 0x" << pte0
-                                  << std::endl;
-                        if (pte0 & 0x1) {
-                          uint32_t pa = ((pte0 >> 10) << 12) | (v_addr & 0xFFF);
-                          std::cout << "  [Walk] Final PA: 0x" << pa
-                                    << std::endl;
-                        } else {
-                          std::cout << "  [Walk] Level 0 PTE INVALID!"
-                                    << std::endl;
-                        }
-                      }
-                    }
-                  }
-                } else {
-                  std::cout << "  [Walk] Level 1 PTE INVALID!" << std::endl;
-                }
-              }
-            }
-          } else {
-            std::cout << "  [Walk] MMU Off -> Final PA: 0x" << std::hex
-                      << v_addr << std::endl;
-          }
+          std::cout << "  [Walk] MMU Off -> Final PA: 0x" << std::hex
+                    << v_addr << std::endl;
         }
         std::cout << std::dec << std::endl;
       }

@@ -7,11 +7,7 @@
 #ifndef XLEN
 #define XLEN 64
 #endif
-#if XLEN == 64
 typedef uint64_t refcpu_xlen_t;
-#else
-typedef uint32_t refcpu_xlen_t;
-#endif
 
 // F/D (default on; rv32 and rv64): the state carries the FP registers and fcsr.  Build with -DFP=0 for a core without floating point; the
 // value must be the one librefcpu.a was built with.

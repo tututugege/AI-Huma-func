@@ -313,7 +313,7 @@ bool refcpu_translate_data(RefCpuContext *ctx, refcpu_xlen_t v_addr, uint32_t ty
                            uint32_t *p_addr) {
   // untranslated: identity, but an address above the 32-bit physical space must not alias into RAM: report an address
   // outside every region (0x7fffffff: between SDRAM and DDR)
-  uint32_t p = (XLEN == 64 && (v_addr >> 32) != 0) ? 0x7fffffffu : static_cast<uint32_t>(v_addr);
+  uint32_t p = ((v_addr >> 32) != 0) ? 0x7fffffffu : static_cast<uint32_t>(v_addr);
   bool ok = true;
   if (ctx != nullptr) {
     const uint32_t mstatus = ctx->cpu.state.csr[csr_mstatus];

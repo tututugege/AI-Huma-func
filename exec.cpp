@@ -362,7 +362,7 @@ static inline void ref_write_timer_value(uint64_t value, uint64_t now) {
 
 // Physical address of an untranslated (bare / M-mode) access: this SoC's physical space is below 4 GiB.
 static inline uint32_t bare_pa(xlen_t a) {
-  if (XLEN == 64 && (a >> 32) != 0) {
+  if ((a >> 32) != 0) {
     std::cerr << "[RefCPU] untranslated address outside the 32-bit physical space: 0x" << std::hex << a << std::dec << std::endl;
     exit(-1);
   }
@@ -573,7 +573,6 @@ void Ref_cpu::init(uint32_t reset_pc, const char *image, uint32_t size) {
 
   store_word(0x10000004, 0x00006000); // 和进入 OpenSBI 相关
   if (image != nullptr) {
-#if XLEN == 64
     // boot ROM: a0 = mhartid, a1 = 0x83e00000, jump to 0x80000000 (lui would sign-extend into the upper 32 bits)
     store_word(0x0, 0xf1402573);   // csrr a0, mhartid
     store_word(0x4, 0x41f00593);   // li   a1, 0x41f
@@ -581,12 +580,6 @@ void Ref_cpu::init(uint32_t reset_pc, const char *image, uint32_t size) {
     store_word(0xc, 0x00100293);   // li   t0, 1
     store_word(0x10, 0x01f29293);  // slli t0, t0, 31
     store_word(0x14, 0x00028067);  // jr   t0
-#else
-    store_word(0x0, 0xf1402573);
-    store_word(0x4, 0x83e005b7);
-    store_word(0x8, 0x800002b7);
-    store_word(0xc, 0x00028067);
-#endif
   }
 
   for (int i = 0; i < 32; i++) {
@@ -595,18 +588,10 @@ void Ref_cpu::init(uint32_t reset_pc, const char *image, uint32_t size) {
   for (int i = 0; i < 21; i++) {
     state.csr[i] = 0;
   }
-#if XLEN == 64
 #if FP
   state.csr[csr_misa] = (xlen_t(2) << 62) | (0x14112B | (RVC ? 4 : 0));   // MXL = 2, A B D F I M S U
 #else
   state.csr[csr_misa] = (xlen_t(2) << 62) | (0x141103 | (RVC ? 4 : 0));   // MXL = 2, A B I M S U
-#endif
-#else
-#if FP
-  state.csr[csr_misa] = 0x4014112B | (RVC ? 4 : 0);   // MXL = 1, A B D F I M S U
-#else
-  state.csr[csr_misa] = 0x40141103 | (RVC ? 4 : 0);
-#endif
 #endif
   state.csr[csr_mstatus] = kMstatusReset;
   state.csr[csr_sstatus] = kMstatusReset & kSstatusMask;
@@ -1157,35 +1142,23 @@ void Ref_cpu::checkpoint_mmio_sync_devices() {
 static inline xlen_t sext32(uint32_t v) { return static_cast<xlen_t>(static_cast<sxlen_t>(static_cast<int32_t>(v))); }
 static inline xlen_t xlen_rol(xlen_t v, unsigned s) { s &= kShamtMask; return s ? (v << s) | (v >> (XLEN - s)) : v; }
 static inline xlen_t xlen_ror(xlen_t v, unsigned s) { s &= kShamtMask; return s ? (v >> s) | (v << (XLEN - s)) : v; }
-static inline xlen_t xlen_clz(xlen_t v) { return v == 0 ? XLEN : (XLEN == 64 ? __builtin_clzll(v) : __builtin_clz(static_cast<uint32_t>(v))); }
-static inline xlen_t xlen_ctz(xlen_t v) { return v == 0 ? XLEN : (XLEN == 64 ? __builtin_ctzll(v) : __builtin_ctz(static_cast<uint32_t>(v))); }
-static inline xlen_t xlen_cpop(xlen_t v) { return XLEN == 64 ? __builtin_popcountll(v) : __builtin_popcount(static_cast<uint32_t>(v)); }
-static inline xlen_t xlen_rev8(xlen_t v) { return XLEN == 64 ? __builtin_bswap64(v) : __builtin_bswap32(static_cast<uint32_t>(v)); }
+static inline xlen_t xlen_clz(xlen_t v) { return v == 0 ? XLEN : __builtin_clzll(v); }
+static inline xlen_t xlen_ctz(xlen_t v) { return v == 0 ? XLEN : __builtin_ctzll(v); }
+static inline xlen_t xlen_cpop(xlen_t v) { return __builtin_popcountll(v); }
+static inline xlen_t xlen_rev8(xlen_t v) { return __builtin_bswap64(v); }
 static inline xlen_t xlen_orcb(xlen_t v) {
   xlen_t r = 0;
   for (unsigned i = 0; i < XLEN; i += 8) if ((v >> i) & 0xFF) r |= xlen_t(0xFF) << i;
   return r;
 }
 static inline xlen_t mul_hi_ss(xlen_t a, xlen_t b) {
-#if XLEN == 64
   return static_cast<xlen_t>((static_cast<__int128>(static_cast<int64_t>(a)) * static_cast<int64_t>(b)) >> 64);
-#else
-  return static_cast<uint32_t>((static_cast<int64_t>(static_cast<int32_t>(a)) * static_cast<int64_t>(static_cast<int32_t>(b))) >> 32);
-#endif
 }
 static inline xlen_t mul_hi_su(xlen_t a, xlen_t b) {
-#if XLEN == 64
   return static_cast<xlen_t>((static_cast<__int128>(static_cast<int64_t>(a)) * static_cast<__int128>(static_cast<unsigned __int128>(b))) >> 64);
-#else
-  return static_cast<uint32_t>((static_cast<int64_t>(static_cast<int32_t>(a)) * static_cast<int64_t>(static_cast<uint64_t>(b))) >> 32);
-#endif
 }
 static inline xlen_t mul_hi_uu(xlen_t a, xlen_t b) {
-#if XLEN == 64
   return static_cast<xlen_t>((static_cast<unsigned __int128>(a) * b) >> 64);
-#else
-  return static_cast<uint32_t>((static_cast<uint64_t>(a) * static_cast<uint64_t>(b)) >> 32);
-#endif
 }
 static inline xlen_t xlen_div(sxlen_t a, sxlen_t b) {
   if (b == 0) return static_cast<xlen_t>(-1);
@@ -1242,16 +1215,11 @@ void Ref_cpu::RV32A() {
   const xlen_t reg_rdata1 = state.gpr[reg_a_index];
   const xlen_t reg_rdata2 = state.gpr[reg_b_index];
 
-#if XLEN == 64
   const bool dword = funct3 == 3;
   if (funct3 != 2 && funct3 != 3) {
     illegal_exception = true;
     return;
   }
-#else
-  const bool dword = false;
-  (void)funct3;
-#endif
   const uint32_t amo_size = dword ? 8 : 4;
 
   xlen_t v_addr = reg_rdata1;
@@ -1486,7 +1454,7 @@ void fast_decode(uint32_t in, Ref_cpu::FastInsn &e) {
   e.rs2 = BITS(in, 24, 20);
   e.imm = 0;
   const uint32_t opc = BITS(in, 6, 0), f3 = BITS(in, 14, 12), f7 = BITS(in, 31, 25);
-  const uint32_t f7s = (XLEN == 64) ? (f7 & ~1u) : f7;   // shift immediates: rv64 has a 6-bit shamt
+  const uint32_t f7s = (f7 & ~1u);   // shift immediates: rv64 has a 6-bit shamt
   uint8_t op = F_SLOW;
   switch (opc) {
   case number_0_opcode_lui: op = F_LUI; e.imm = immU(in); break;
@@ -1512,10 +1480,8 @@ void fast_decode(uint32_t in, Ref_cpu::FastInsn &e) {
     case 2: op = F_LW; break;
     case 4: op = F_LBU; break;
     case 5: op = F_LHU; break;
-#if XLEN == 64
     case 6: op = F_LWU; break;
     case 3: op = F_LD; break;
-#endif
     }
     break;
   case number_6_opcode_sb:
@@ -1524,9 +1490,7 @@ void fast_decode(uint32_t in, Ref_cpu::FastInsn &e) {
     case 0: op = F_SB; break;
     case 1: op = F_SH; break;
     case 2: op = F_SW; break;
-#if XLEN == 64
     case 3: op = F_SD; break;
-#endif
     }
     break;
   case number_7_opcode_addi:
@@ -1557,7 +1521,6 @@ void fast_decode(uint32_t in, Ref_cpu::FastInsn &e) {
       else if (f3 == 5) op = F_SRA;
     }
     break;
-#if XLEN == 64
   case 0b0011011:  // OP-IMM-32
     e.imm = immI(in);
     switch (f3) {
@@ -1587,7 +1550,6 @@ void fast_decode(uint32_t in, Ref_cpu::FastInsn &e) {
       else if (f3 == 5) op = F_SRAW;
     }
     break;
-#endif
   case number_9_opcode_fence: op = F_NOP; break;
   case number_10_opcode_ecall:
     if (f3 != 0 && f3 != 4) { op = F_CSR; e.imm = in; }  // executed by RV32CSR(); funct3 0 (ecall, mret, wfi, ...) is slow
@@ -1634,7 +1596,7 @@ void Ref_cpu::fast_run_impl(uint32_t &finished_intervals, uint64_t budget, uint3
   const uint32_t priv = privilege;
   const bool fetch_translate = satp_enabled(satp) && priv != RISCV_MODE_M;
   // rv32: satp fits in the context word; rv64: FastBlock::satp is compared separately
-  const uint64_t ctx_base = (XLEN == 32 ? (static_cast<uint64_t>(satp) << 32) : 0) | (static_cast<uint64_t>(priv) << 30);
+  const uint64_t ctx_base = (static_cast<uint64_t>(priv) << 30);
   const uint32_t maxlen = g_digest_every ? 1u : kMaxBlockOps;
   FastBlock *const blocks = fblocks.data();
 
@@ -1688,7 +1650,7 @@ dispatch_block:
     goto out;  // misaligned pc: the general path fetches the aligned word
   }
   b = &blocks[(pc >> (RVC ? 1 : 2)) & (kFastBlocks - 1)];
-  if (__builtin_expect(b->pc != pc || b->ctx != ctx || (XLEN == 64 && b->satp != satp), 0)) {
+  if (__builtin_expect(b->pc != pc || b->ctx != ctx || b->satp != satp, 0)) {
     goto build;
   }
 run_block:
@@ -1715,7 +1677,7 @@ build : {
       if (g_fast_stats) g_fs.stop[3]++;
       goto out;  // instruction page fault: RISCV() raises it
     }
-  } else if (XLEN == 64 && (pc >> 32) != 0) {
+  } else if ((pc >> 32) != 0) {
     goto out;  // outside the 32-bit physical space: RISCV() reports it
   }
   if ((int32_t)p >= 0) {
@@ -1901,7 +1863,7 @@ L_EXIT:
 #define B_LOAD(ALIGN_MASK, EXPR)                                                                                     \
   v = x[op->rs1] + op->imm;                                                                                          \
   if (v & (ALIGN_MASK)) BAIL();                                                                                      \
-  if (!DX && XLEN == 64 && (v >> 32) != 0) BAIL();                                                                   \
+  if (!DX && (v >> 32) != 0) BAIL();                                                                   \
   p = static_cast<uint32_t>(v);                                                                                      \
   FAST_XLATE(1u, tctx_ld)                                                                                            \
   if ((int32_t)p >= 0) BAIL();                                                                                       \
@@ -1931,7 +1893,7 @@ L_EXIT:
 #define B_STORE(ALIGN_MASK, SIZE_MASK)                                                                               \
   v = x[op->rs1] + op->imm;                                                                                          \
   if (v & (ALIGN_MASK)) BAIL();                                                                                      \
-  if (!DX && XLEN == 64 && (v >> 32) != 0) BAIL();                                                                   \
+  if (!DX && (v >> 32) != 0) BAIL();                                                                   \
   p = static_cast<uint32_t>(v);                                                                                      \
   FAST_XLATE(2u, tctx_st)                                                                                            \
   if ((int32_t)p >= 0) BAIL();                                                                                       \
@@ -2023,7 +1985,6 @@ L_EXIT:
 #define B_DIVU x[op->rd] = xlen_divu(x[op->rs1], x[op->rs2]);
 #define B_REM x[op->rd] = xlen_rem((sxlen_t)x[op->rs1], (sxlen_t)x[op->rs2]);
 #define B_REMU x[op->rd] = xlen_remu(x[op->rs1], x[op->rs2]);
-#if XLEN == 64
 #define B_ADDIW x[op->rd] = sext32((uint32_t)(x[op->rs1] + op->imm));
 #define B_SLLIW x[op->rd] = sext32((uint32_t)x[op->rs1] << op->imm);
 #define B_SRLIW x[op->rd] = sext32((uint32_t)x[op->rs1] >> op->imm);
@@ -2038,7 +1999,6 @@ L_EXIT:
 #define B_DIVUW x[op->rd] = w_divu((uint32_t)x[op->rs1], (uint32_t)x[op->rs2]);
 #define B_REMW x[op->rd] = w_rem((int32_t)(uint32_t)x[op->rs1], (int32_t)(uint32_t)x[op->rs2]);
 #define B_REMUW x[op->rd] = w_remu((uint32_t)x[op->rs1], (uint32_t)x[op->rs2]);
-#endif
 
 // CSR instruction: run the general implementation for it (same code RISCV() would call), then continue in the fast path
 // only if nothing the fast path assumes has changed.
@@ -2087,13 +2047,8 @@ L_CSR: {
 #define HC(NAME) L_##NAME: B_##NAME
 H(LUI) H(AUIPC) HC(JAL) HC(JALR) HC(BEQ) HC(BNE) HC(BLT) HC(BGE) HC(BLTU) HC(BGEU)
 H(LB) H(LH) H(LW) H(LBU) H(LHU) H(SB) H(SH) H(SW)
-#if XLEN == 64
 H(LWU) H(LD) H(SD)
 H(ADDIW) H(SLLIW) H(SRLIW) H(SRAIW) H(ADDW) H(SUBW) H(SLLW) H(SRLW) H(SRAW) H(MULW) H(DIVW) H(DIVUW) H(REMW) H(REMUW)
-#else
-L_LWU: L_LD: L_SD: L_ADDIW: L_SLLIW: L_SRLIW: L_SRAIW: L_ADDW: L_SUBW: L_SLLW: L_SRLW: L_SRAW: L_MULW: L_DIVW: L_DIVUW:
-L_REMW: L_REMUW: goto out;   // never produced by the rv32 decode
-#endif
 H(ADDI) H(SLTI) H(SLTIU) H(XORI) H(ORI) H(ANDI) H(SLLI) H(SRLI) H(SRAI)
 H(ADD) H(SUB) H(SLL) H(SLT) H(SLTU) H(XOR) H(SRL) H(SRA) H(OR) H(AND)
 H(MUL) H(MULH) H(MULHSU) H(MULHU) H(DIV) H(DIVU) H(REM) H(REMU)
@@ -2198,7 +2153,7 @@ void Ref_cpu::exec(const SimConfig &config) {
   // Initialize Spike Reference Simulator if enabled
 #ifdef ENABLE_SPIKE
   if (config.difftest) {
-    spike_ref = std::make_unique<SpikeRef>(XLEN == 64 ? (FP ? (RVC ? "rv64imafdcb_zbc_zbkb_zbkx" : "rv64imafdb_zbc_zbkb_zbkx") : (RVC ? "rv64imacb_zbc_zbkb_zbkx" : "rv64imab_zbc_zbkb_zbkx")) : (FP ? (RVC ? "rv32imafdcb_zbc_zbkb_zbkx" : "rv32imafdb_zbc_zbkb_zbkx") : (RVC ? "rv32imacb_zbc_zbkb_zbkx" : "rv32imab_zbc_zbkb_zbkx")), 0x80000000, 0x80000000,
+    spike_ref = std::make_unique<SpikeRef>((FP ? (RVC ? "rv64imafdcb_zbc_zbkb_zbkx" : "rv64imafdb_zbc_zbkb_zbkx") : (RVC ? "rv64imacb_zbc_zbkb_zbkx" : "rv64imab_zbc_zbkb_zbkx")), 0x80000000, 0x80000000,
                                            config.image_file.c_str());
   }
 #else
@@ -3372,7 +3327,7 @@ void Ref_cpu::RV32CSR() {
         state.csr[csr_idx] = csr_wdata & ~xlen_t(1);   // instruction-address-misaligned cannot occur with C: its delegation bit is read-only 0
       } else if (RVC && (csr_idx == csr_mepc || csr_idx == csr_sepc)) {
         state.csr[csr_idx] = csr_wdata & ~xlen_t(1);   // with C only bit 0 of the return address is forced to 0 (without: bits 1:0)
-      } else if (csr_idx == csr_satp && XLEN == 64 && (csr_wdata >> 60) != 0 && (csr_wdata >> 60) != 8) {
+      } else if (csr_idx == csr_satp && (csr_wdata >> 60) != 0 && (csr_wdata >> 60) != 8) {
         // unsupported translation mode: the write has no effect (Sv48/Sv57 are not implemented)
       } else {
         state.csr[csr_idx] = csr_wdata;
@@ -3547,7 +3502,7 @@ void Ref_cpu::RVFD() {
       break;
     }
     case 0x18: {   // fcvt.w / wu / l / lu . fmt
-      if (rs2 > (XLEN == 64 ? 3 : 1) || !set_rm()) { bad(); return; }   // fcvt.l / lu exist on rv64 only
+      if (rs2 > 3 || !set_rm()) { bad(); return; }   // fcvt.l / lu exist on rv64 only
       const uint_fast8_t rm = softfloat_roundingMode;
       xlen_t r;
       if (D) {
@@ -3565,7 +3520,7 @@ void Ref_cpu::RVFD() {
       break;
     }
     case 0x1A: {   // fcvt.fmt.w / wu / l / lu
-      if (rs2 > (XLEN == 64 ? 3 : 1)) { bad(); return; }
+      if (rs2 > 3) { bad(); return; }
       if (!set_rm()) { bad(); return; }   // (Spike checks rm for fcvt.d.w / .wu too, though they are exact)
       const xlen_t x = state.gpr[rs1];
       if (D) {
@@ -3578,12 +3533,12 @@ void Ref_cpu::RVFD() {
       break;
     }
     case 0x1C:   // fmv.x.w / fmv.x.d (funct3 0), fclass (funct3 1)
-      if (rs2 != 0 || funct3 > 1 || (XLEN == 32 && D && funct3 == 0)) { bad(); return; }   // fmv.x.d: rv64 only
+      if (rs2 != 0 || funct3 > 1) { bad(); return; }   // fmv.x.d: rv64 only
       if (funct3 == 0) wrx(D ? static_cast<xlen_t>(state.fpr[rs1]) : static_cast<xlen_t>(static_cast<int64_t>(static_cast<int32_t>(state.fpr[rs1]))));
       else wrx(D ? fclass_generic<uint64_t, 11, 52>(a64) : fclass_generic<uint32_t, 8, 23>(a32));
       break;
     case 0x1E:   // fmv.w.x / fmv.d.x
-      if (rs2 != 0 || funct3 != 0 || (XLEN == 32 && D)) { bad(); return; }   // fmv.d.x: rv64 only
+      if (rs2 != 0 || funct3 != 0) { bad(); return; }   // fmv.d.x: rv64 only
       if (D) wrfD(state.gpr[rs1]); else wrfS(static_cast<uint32_t>(state.gpr[rs1]));
       break;
     default:
@@ -3623,7 +3578,7 @@ void Ref_cpu::RV32IM() {
   }
 #endif
   // shift-immediate encodings: rv64 has a 6-bit shamt, so bit 25 belongs to it and only funct7[6:1] selects the operation
-  const uint32_t funct7s = (XLEN == 64) ? (funct7 & ~1u) : funct7;
+  const uint32_t funct7s = (funct7 & ~1u);
 
   const xlen_t reg_rdata1 = state.gpr[reg_a_index];
 #if FP
@@ -3682,7 +3637,6 @@ void Ref_cpu::RV32IM() {
     uint32_t p_addr = static_cast<uint32_t>(v_addr);
     uint32_t access_size;
     bool is_unsigned = (funct3 & 0b100) != 0;
-#if XLEN == 64
     switch (funct3) {
     case 0: case 4: access_size = 1; break;
     case 1: case 5: access_size = 2; break;
@@ -3690,13 +3644,6 @@ void Ref_cpu::RV32IM() {
     case 3: access_size = 8; break;
     default: illegal_exception = true; return;
     }
-#else
-    const uint32_t size = funct3 & 0b11;
-    access_size = (size == 0b00) ? 1 : ((size == 0b01) ? 2 : 4);
-#if FP
-    if (fp_mem && funct3 == 3) access_size = 8;   // fld on rv32: 8 bytes (two words); funct3 == 3 is not a legal integer load there
-#endif
-#endif
     if (v_addr % access_size != 0) {
       std::cerr << "Misaligned Load! addr: 0x" << std::hex << v_addr << std::endl;
       exit(-1);
@@ -3771,18 +3718,9 @@ void Ref_cpu::RV32IM() {
     case 0: access_size = 1; break;
     case 1: access_size = 2; break;
     case 2: access_size = 4; break;
-#if XLEN == 64
     case 3: access_size = 8; break;
-#endif
     default:
-#if XLEN == 64
       illegal_exception = true; return;
-#else
-#if FP
-      if (fp_mem && funct3 == 3) { access_size = 8; break; }   // fsd on rv32: 8 bytes (two words)
-#endif
-      access_size = 4; break;
-#endif
     }
     if (v_addr % access_size != 0) {
       std::cerr << "Misaligned Store! addr: 0x" << std::hex << v_addr << std::endl;
@@ -3828,7 +3766,7 @@ void Ref_cpu::RV32IM() {
   }
   case number_7_opcode_addi: { // OP-IMM: addi, slti, sltiu, xori, ori, andi, slli, srli, srai, Zbb/Zbs immediates
     const xlen_t imm = static_cast<xlen_t>(immI(Instruction));
-    const uint32_t shamt = (XLEN == 64) ? BITS(Instruction, 25, 20) : BITS(Instruction, 24, 20);
+    const uint32_t shamt = BITS(Instruction, 25, 20);
     switch (funct3) {
     case 0: wr(reg_rdata1 + imm); break;                                   // addi
     case 2: wr(s_rdata1 < static_cast<sxlen_t>(imm) ? 1 : 0); break;       // slti
@@ -3864,7 +3802,7 @@ void Ref_cpu::RV32IM() {
       } else if (funct7s == 0x24) { // bexti
         wr((reg_rdata1 >> shamt) & 1);
       } else if (funct7s == 0x34) { // rev8: rv32 imm = 0x698, rv64 imm = 0x6b8 (shamt = 56)
-        if (reg_b_index == 24 && funct7 == (XLEN == 64 ? 0x35u : 0x34u)) wr(xlen_rev8(reg_rdata1));
+        if (reg_b_index == 24 && funct7 == 0x35u) wr(xlen_rev8(reg_rdata1));
       } else if (funct7s == 0x14) { // orc.b
         if (reg_b_index == 7) wr(xlen_orcb(reg_rdata1));
       }
@@ -3953,7 +3891,6 @@ void Ref_cpu::RV32IM() {
     if (!handled) illegal_exception = true;   // reserved encoding
     break;
   }
-#if XLEN == 64
   case 0b0011011: { // OP-IMM-32: addiw, slliw, srliw, sraiw, slli.uw, clzw, ctzw, cpopw, roriw
     const xlen_t imm = static_cast<xlen_t>(immI(Instruction));
     const uint32_t shamt = BITS(Instruction, 24, 20);
@@ -4034,7 +3971,6 @@ void Ref_cpu::RV32IM() {
     }
     break;
   }
-#endif
   case number_9_opcode_fence: { // fence, fence.i
     break;
   }
