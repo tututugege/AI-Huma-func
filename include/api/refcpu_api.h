@@ -63,6 +63,12 @@ void refcpu_load_sdcard_image(RefCpuContext *ctx, const char *path);
 
 void refcpu_get_state(const RefCpuContext *ctx, RefCpuState *state);
 void refcpu_set_state(RefCpuContext *ctx, const RefCpuState *state);
+// Restore a checkpoint written by --mode ckpt / special-ckpt: RAM, SDRAM and, unless mem_only, the CPU state and the
+// device registers (mem_only: a front-door restore, the restore program sets them). Returns the checkpoint's interval
+// length (instructions; 0 for a special checkpoint). Exits on a malformed or incompatible file. restored (may be null; not
+// filled with mem_only): the state as the checkpoint has it, mip / sip as stored (refcpu_get_state() gives the
+// device-visible values instead).
+uint64_t refcpu_restore_checkpoint(RefCpuContext *ctx, const char *path, bool mem_only, RefCpuState *restored);
 void refcpu_get_step_info(const RefCpuContext *ctx, RefCpuStepInfo *info);
 
 // Single fields without a copy of the whole state (a caller's per-instruction path). The arrays are the model's own
@@ -95,6 +101,8 @@ void refcpu_store_word(RefCpuContext *ctx, uint32_t addr, uint32_t data);
 void refcpu_clear_io_words(RefCpuContext *ctx);
 void refcpu_set_io_word(RefCpuContext *ctx, uint32_t addr, uint32_t data);
 uint32_t refcpu_get_io_word(const RefCpuContext *ctx, uint32_t addr);
+// the device register word as stored (a checkpoint's / a loader's value), not the device's live read
+uint32_t refcpu_get_io_backing_word(const RefCpuContext *ctx, uint32_t addr);
 void refcpu_sync_mmio_devices_from_backing(RefCpuContext *ctx);
 
 void refcpu_set_uart_print(RefCpuContext *ctx, bool enable);

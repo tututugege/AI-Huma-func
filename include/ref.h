@@ -360,7 +360,8 @@ public:
   void bbv_init_file(const char *filename);
   void dump_bbv();
   void save_checkpoint(const std::string &filename);
-  void restore_checkpoint(const std::string &filename, bool mem_only = false);
+  // returns the checkpoint's interval length (instructions; 0 for a special checkpoint)
+  uint64_t restore_checkpoint(const std::string &filename, bool mem_only = false);
 
 #ifdef ENABLE_SPIKE
   std::unique_ptr<SpikeRef> spike_ref;

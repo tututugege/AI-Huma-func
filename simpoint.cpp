@@ -85,6 +85,34 @@ void gz_read_bytes(gzFile file, void *buf, size_t len) {
     len -= chunk;
   }
 }
+// Read len bytes into buf, writing only the 4 KiB pages that change: restoring into a freshly allocated (zero, unmapped)
+// buffer leaves the zero pages of the checkpoint unmapped (the same contents as a plain read, a smaller resident size).
+void gz_read_sparse(gzFile file, void *buf, size_t len) {
+  constexpr size_t kPage = 4096;
+  std::vector<uint8_t> chunk(1u << 20);
+  auto *dst = static_cast<uint8_t *>(buf);
+  size_t done = 0;
+  while (done < len) {
+    const size_t want = std::min(chunk.size(), len - done);
+    gz_read_bytes(file, chunk.data(), want);
+    for (size_t off = 0; off < want; off += kPage) {
+      const size_t n = std::min(kPage, want - off);
+      if (std::memcmp(dst + done + off, chunk.data() + off, n) != 0) std::memcpy(dst + done + off, chunk.data() + off, n);
+    }
+    done += want;
+  }
+}
+
+// Zero len bytes, touching only the pages that are not zero already.
+void clear_sparse(void *buf, size_t len) {
+  constexpr size_t kPage = 4096;
+  static const uint8_t zeros[kPage] = {};
+  auto *p = static_cast<uint8_t *>(buf);
+  for (size_t off = 0; off < len; off += kPage) {
+    const size_t n = std::min(kPage, len - off);
+    if (std::memcmp(p + off, zeros, n) != 0) std::memset(p + off, 0, n);
+  }
+}
 } // namespace
 
 void Ref_cpu::bbv_init_file(const char *filename) {
@@ -201,7 +229,7 @@ void Ref_cpu::save_checkpoint(const std::string &filename) {
   std::cout << "Checkpoint saved to " << final_name << std::endl;
 }
 
-void Ref_cpu::restore_checkpoint(const std::string &filename, bool mem_only) {
+uint64_t Ref_cpu::restore_checkpoint(const std::string &filename, bool mem_only) {
   std::string final_name = filename;
   gzFile file = gzopen(final_name.c_str(), "rb");
   if (!file && final_name.find(".gz") == std::string::npos) {
@@ -242,7 +270,7 @@ void Ref_cpu::restore_checkpoint(const std::string &filename, bool mem_only) {
       exit(1);
     }
   }
-  if (header.ram_size != ram_size) {
+  if (header.ram_size == 0 || header.ram_size > ram_size) {   // a smaller RAM image: the rest of the RAM is zero
     std::cerr << "Error: Checkpoint RAM size mismatch. file=0x" << std::hex
               << header.ram_size << " sim=0x" << ram_size << std::dec
               << std::endl;
@@ -250,15 +278,15 @@ void Ref_cpu::restore_checkpoint(const std::string &filename, bool mem_only) {
   }
 
   // 1. 恢复 CPU 状态 (front-door restore: read and discard, the restore program sets the state)
+  uint64_t file_interval = 0;
   if (mem_only) {
     CPU_state discarded_state;
-    uint64_t discarded_interval = 0;
     gz_read_pod(file, discarded_state);
 #if FP
     uint32_t discarded_fcsr = 0;
     gz_read_pod(file, discarded_fcsr);
 #endif
-    gz_read_pod(file, discarded_interval);
+    gz_read_pod(file, file_interval);
   } else {
     gz_read_pod(file, state);
 #if FP
@@ -268,6 +296,7 @@ void Ref_cpu::restore_checkpoint(const std::string &filename, bool mem_only) {
     fcsr_frm = static_cast<uint8_t>((fcsr >> 5) & 7u);
 #endif
     gz_read_pod(file, interval_inst_count);
+    file_interval = interval_inst_count;
   }
 
   // 2. 恢复 RAM
@@ -276,16 +305,16 @@ void Ref_cpu::restore_checkpoint(const std::string &filename, bool mem_only) {
     exit(1);
   }
   std::cout << "Restoring Memory..." << std::endl;
-  gz_read_bytes(file, reinterpret_cast<uint8_t *>(memory), ram_size);
+  gz_read_sparse(file, memory, header.ram_size);
+  clear_sparse(reinterpret_cast<uint8_t *>(memory) + header.ram_size, ram_size - header.ram_size);
   if (sdram_memory == nullptr) {
     std::cerr << "Error: SDRAM not allocated." << std::endl;
     exit(1);
   }
   if (checkpoint_sdram_size != 0) {
-    gz_read_bytes(file, reinterpret_cast<uint8_t *>(sdram_memory),
-                  checkpoint_sdram_size);
+    gz_read_sparse(file, sdram_memory, checkpoint_sdram_size);
   } else {
-    std::memset(sdram_memory, 0, SDRAM_SIZE);
+    clear_sparse(sdram_memory, SDRAM_SIZE);
   }
 
   if (mem_only) {  // devices are restored by the restore program
@@ -293,7 +322,7 @@ void Ref_cpu::restore_checkpoint(const std::string &filename, bool mem_only) {
     tlb_flush();
     std::cout << "Checkpoint memory restored from " << final_name << " (front-door restore: CPU and devices at reset)"
               << std::endl;
-    return;
+    return file_interval;
   }
 
   // 3. 恢复并校验 IO 布局（base + size）
@@ -330,6 +359,7 @@ void Ref_cpu::restore_checkpoint(const std::string &filename, bool mem_only) {
   gzclose(file);
   tlb_flush();  // memory and state were overwritten
   std::cout << "Checkpoint restored from " << final_name << std::endl;
+  return file_interval;
 }
 
 // 辅助结构：记录 SimPoint ID 和 对应的 Interval ID

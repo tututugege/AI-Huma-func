@@ -217,6 +217,16 @@ void refcpu_sync_sdram_from_dut(RefCpuContext *ctx,
   ctx->cpu.tlb_flush();
 }
 
+uint64_t refcpu_restore_checkpoint(RefCpuContext *ctx, const char *path, bool mem_only, RefCpuState *restored) {
+  const uint64_t interval = ctx->cpu.restore_checkpoint(path, mem_only);
+  if (restored != nullptr && !mem_only) {
+    *restored = export_state(ctx->cpu);
+    restored->csr[csr_mip] = ctx->cpu.state.csr[csr_mip];
+    restored->csr[csr_sip] = ctx->cpu.state.csr[csr_sip];
+  }
+  return interval;
+}
+
 uint32_t *refcpu_get_ram_ptr(RefCpuContext *ctx) {
   if (ctx != nullptr) ctx->cpu.tlb_flush();  // the caller may write through the pointer
   return ctx == nullptr ? nullptr : ctx->cpu.memory;
@@ -254,6 +264,12 @@ void refcpu_set_io_word(RefCpuContext *ctx, uint32_t addr, uint32_t data) {
 
 uint32_t refcpu_get_io_word(const RefCpuContext *ctx, uint32_t addr) {
   return ctx == nullptr ? 0u : ctx->cpu.checkpoint_mmio_read_word(addr);
+}
+
+uint32_t refcpu_get_io_backing_word(const RefCpuContext *ctx, uint32_t addr) {
+  if (ctx == nullptr) return 0u;
+  const auto it = ctx->cpu.io_words.find(addr & ~0x3u);
+  return it == ctx->cpu.io_words.end() ? 0u : it->second;
 }
 
 void refcpu_sync_mmio_devices_from_backing(RefCpuContext *ctx) {

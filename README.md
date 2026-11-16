@@ -169,7 +169,9 @@ SPIKE_SRC=... SPIKE_BUILD=... bash tests/rv64/run.sh <工作目录>     # 需要
 ./a.out --image linux.bin --mode restore --restore-file path/to/ckpt.gz --max-insts 100000000
 ```
 
-流程：`init()` 分配 DDR 和 SDRAM；校验 header（magic、版本、`ram_size`、`io_range_count`）；覆盖 `CPU_state` 和 `interval_inst_count`；覆盖 DDR 和 SDRAM；校验 IO 布局（base+size）并恢复 `io_data`。
+流程：`init()` 分配 DDR 和 SDRAM；校验 header（magic、版本、`ram_size`、`io_range_count`）；覆盖 `CPU_state` 和 `interval_inst_count`；覆盖 DDR 和 SDRAM；校验 IO 布局（base+size）并恢复 `io_data`。检查点的 `ram_size` 可以小于模拟器的（其余 RAM 清零）；内存按页比较后只写有变化的页，全零页不会被分配。
+
+链接 `librefcpu.a` 的上层模拟器用 `refcpu_restore_checkpoint(ctx, path, mem_only, &restored)` 恢复，不要自己解析文件：返回区间长度（特殊检查点为 0），`restored` 是文件里的状态（mip / sip 为存储值，`refcpu_get_state` 给的是设备可见值）；`mem_only` 对应前门恢复（只恢复内存）。设备寄存器的存储值用 `refcpu_get_io_backing_word` 读（`refcpu_get_io_word` 是设备的实时读数）。trace-model 从 2026-11-16 起这样做（`driver/Load.cpp`）。
 
 自行解析时：先校验 magic 和版本，按上面顺序用 `gzread`；`CPU_state` 的布局以 `include/ref.h` 为准（同编译器/ABI 假设）。`tools/ckpt2stub.py` 是一份现成的 Python 解析器（rv32 / rv64 都支持）。
 
