@@ -65,6 +65,22 @@ void refcpu_get_state(const RefCpuContext *ctx, RefCpuState *state);
 void refcpu_set_state(RefCpuContext *ctx, const RefCpuState *state);
 void refcpu_get_step_info(const RefCpuContext *ctx, RefCpuStepInfo *info);
 
+// Single fields without a copy of the whole state (a caller's per-instruction path). The arrays are the model's own
+// (valid until the model changes them); the values are those refcpu_get_state() would give.
+const refcpu_xlen_t *refcpu_gpr(const RefCpuContext *ctx);          // 32 integer registers
+#if FP
+const uint64_t *refcpu_fpr(const RefCpuContext *ctx);               // 32 FP registers
+uint32_t refcpu_fcsr(const RefCpuContext *ctx);                     // frm << 5 | fflags
+#endif
+refcpu_xlen_t refcpu_csr(const RefCpuContext *ctx, int idx);        // RefCpuState::csr[idx] (mip / sip: the visible values)
+refcpu_xlen_t refcpu_pc(const RefCpuContext *ctx);
+uint8_t refcpu_privilege(const RefCpuContext *ctx);
+void refcpu_reservation(const RefCpuContext *ctx, bool *valid, uint32_t *addr);
+void refcpu_store_info(const RefCpuContext *ctx, bool *store, uint32_t *addr);   // the last step's store
+// refcpu_set_state() of the current state with pc changed (so the visible mip / sip are latched and the external CSR
+// read override is cleared, as that round trip does), without the copies.
+void refcpu_set_pc(RefCpuContext *ctx, refcpu_xlen_t pc);
+
 void refcpu_step(RefCpuContext *ctx, uint64_t steps);
 void refcpu_sync_ram_from_dut(RefCpuContext *ctx, const uint32_t *ram_src,
                               size_t size_bytes);

@@ -120,6 +120,37 @@ void refcpu_set_state(RefCpuContext *ctx, const RefCpuState *state) {
   ctx->cpu.external_csr_read = {};
 }
 
+const refcpu_xlen_t *refcpu_gpr(const RefCpuContext *ctx) { return ctx->cpu.state.gpr; }
+#if FP
+const uint64_t *refcpu_fpr(const RefCpuContext *ctx) { return ctx->cpu.state.fpr; }
+uint32_t refcpu_fcsr(const RefCpuContext *ctx) {
+  return (static_cast<uint32_t>(ctx->cpu.fcsr_frm & 7u) << 5) | (ctx->cpu.fcsr_fflags & 0x1Fu);
+}
+#endif
+refcpu_xlen_t refcpu_csr(const RefCpuContext *ctx, int idx) {
+  if (idx == csr_mip) return ctx->cpu.visible_mip();
+  if (idx == csr_sip) return ctx->cpu.visible_sip();
+  return ctx->cpu.state.csr[idx];
+}
+refcpu_xlen_t refcpu_pc(const RefCpuContext *ctx) { return ctx->cpu.state.pc; }
+uint8_t refcpu_privilege(const RefCpuContext *ctx) { return ctx->cpu.privilege; }
+void refcpu_reservation(const RefCpuContext *ctx, bool *valid, uint32_t *addr) {
+  *valid = ctx->cpu.state.reserve_valid;
+  *addr = ctx->cpu.state.reserve_addr;
+}
+void refcpu_store_info(const RefCpuContext *ctx, bool *store, uint32_t *addr) {
+  *store = ctx->cpu.state.store;
+  *addr = ctx->cpu.state.store_addr;
+}
+void refcpu_set_pc(RefCpuContext *ctx, refcpu_xlen_t pc) {
+  // what import_state(export_state()) changes besides pc: the visible mip / sip into the CSR file
+  const refcpu_xlen_t mip = ctx->cpu.visible_mip(), sip = ctx->cpu.visible_sip();
+  ctx->cpu.state.csr[csr_mip] = mip;
+  ctx->cpu.state.csr[csr_sip] = sip;
+  ctx->cpu.state.pc = pc;
+  ctx->cpu.external_csr_read = {};
+}
+
 void refcpu_get_step_info(const RefCpuContext *ctx, RefCpuStepInfo *info) {
   if (ctx == nullptr || info == nullptr) {
     return;
