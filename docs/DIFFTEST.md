@@ -143,13 +143,10 @@ make librefcpu.a
 - 修改 `include/*.h` 或 `include/api/*.h` 后会自动触发相关目标重编
 - `make librefcpu.a` 不再依赖手动删 `.o`
 
-`.o` 不区分 `XLEN`：在同一目录切换 `XLEN=32/64` 之前先 `make clean`。
-
-常用命令（总仓库里的路径写法）：
+常用命令（总仓库里的路径写法，现行默认 `XLEN=64 FP=1`）：
 ```bash
-make -C function-model                      # standalone（rv32）
-make -C function-model XLEN=64              # standalone（rv64，先 clean）
-make -C function-model librefcpu.a          # 静态库
+make -C function-model RVC=1 no_spike       # standalone（rv64gc）
+make -C function-model RVC=1 librefcpu.a    # 静态库（供 trace-model / rtl 链接）
 make -C function-model clean                # 清理
 ```
 

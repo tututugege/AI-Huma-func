@@ -51,9 +51,9 @@ SimPoint 的目标是：
 |---|---|---|
 | 入口 | `scripts/spec/`，说明见 [scripts/spec/README.md](../scripts/spec/README.md) | `scripts/run_bbv.sh`、`scripts/run_ckpt.sh`（下面第 3.1–7 节） |
 | 运行方式 | Linux 镜像（OpenSBI + 内核 + initramfs），SPEC **ref** 输入，输出与 SPEC 参考比对 | 裸机镜像 `mem/<bench>.bin` |
-| ISA | rv32imab（GCC 13.3，`-march=rv32ima_zicsr_zifencei_zba_zbb_zbs`）；rv64 的 SPEC 还没有重新生成 | 视镜像而定（模拟器要用对应的 `XLEN` 构建） |
+| ISA | 现行集群库为 **rv64gcb**（`/nfs_global/S/houruyao/spec06_rv64gc/`，535 点 / 标准 386 点 `jobs95.txt`，格式版本 5）；早期 `scripts/spec/` 脚本为 rv32imab 归档 | 视镜像而定（模拟器要用对应的 `XLEN` 构建） |
 | SimPoint 参数 | `-maxK 100 -seedproj 0721 -seedkm 11037 -numInitSeeds 5 -iters 100 -fixedLength on`，区间 1000 万条 | `-maxK 30 ... -iters 1000` |
-| 数据位置 | `~/personal/AI-Huma-data/spec-rv32imab`（持久目录，不进仓库） | 仓库内 `bbv_log/`、`ckpts/` |
+| 数据位置 | 集群 `/nfs_global/S/houruyao/spec06_rv64gc/`（持久 NFS，详见总仓 `docs/SERVER.md`） | 仓库内 `bbv_log/`、`ckpts/` |
 | 使用者 | trace-model `scripts/spec/replay.sh quick|full` | — |
 
 trace-model 和 rtl 的 SPEC 数字都来自现行流程；下面保留上游流程的说明，供查阅。

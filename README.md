@@ -232,24 +232,20 @@ SPIKE_SRC=... SPIKE_BUILD=... bash tests/rv64/run.sh <工作目录>     # 需要
 
 ## 已知限制
 
-- F/D 是默认配置（`FP=1`，rv32 和 rv64），`FP=0` 去掉全部浮点；还没有的有：半精度（Zfh）、RTL 里的 F/D、F/D 的 SPEC 和 Linux 用户态验证。Zfinx 已经删除。
-- rv32 的前门恢复（`tools/ckpt2stub.py`）只能还原 NaN-boxed 的单精度浮点寄存器（`fmv.w.x`），双精度值会被警告并跳过（rv32 没有 `fmv.d.x`）。
-- `mstatus` 的写掩码保留了 WPRI 位 0、4 和 XS（15:16），和 Spike 不同；只有往 `mstatus` 写全 1 才看得出来，不影响软件。
-- 两个宽度都**没有**压缩指令 C。
-- rv64 的 MMIO 访问：function-model 里对 MMIO 的 `sd/ld` 读回还没有做。
-- SPEC 的 rv64 版本还没有重新生成：`scripts/spec/` 和 `~/personal/AI-Huma-data/spec-rv32imab` 都是 rv32imab；rv64 只有 Linux 启动和定向测试的检查点。
-- Spike 对拍的两个平台差异（见上）；`--diff` 不经过快速路径，所以比普通运行慢得多。
-- 物理地址限制为 32 位的上述窗口；Sv39 翻译出 4 GiB 以上的物理地址按“地址不在 RAM”处理。
-- rv64 `bitmanip-boundary`（trace-model）里写死了 rv32 的 `rev8` 编码，不能在 rv64 上跑。
+- 当前 `main` 默认配置为 **`rv64gc`**（`XLEN=64 FP=1 RVC=1`，`rv32` 已归档至 `rv32-legacy`）；未支持半精度（Zfh）、48 位以上编码、Zc* 压缩扩展及非对齐普通访存。
+- `mstatus` 的写掩码保留了 WPRI 位 0、4 和 XS（15:16），与 Spike 略有差异，不影响正常软件。
+- 物理地址限制为 32 位（4 GiB）；Sv39 翻译出 4 GiB 以上的物理地址按越界处理。
+- Spike 对拍存在 2 个已知平台差异（`timer-interrupt-mask` 的 `mip.MTIP`、`software-interrupt-vectored` 的 `mip.MSIP`）；`--diff` 走单步循环，不经快速路径。
+- 异步中断注入（`refcpu_take_forced_interrupt`）当前未清 `reserve_valid`，与 RTL 推测 `sc_clr` 存在分歧（登记在总仓 `docs/TODO.md` R-7）。
 
 ---
 
 ## 文档与脚本位置
 
 - [docs/DIFFTEST.md](docs/DIFFTEST.md)：Difftest 用法（standalone 与静态库）。
-- [docs/SPIKE_DIFFTEST.md](docs/SPIKE_DIFFTEST.md)：Spike 对拍的构建、结果、已知差异（rv32 与 rv64）。
-- [docs/SIMPOINT_SPECINT2006.md](docs/SIMPOINT_SPECINT2006.md)：SimPoint 原理，现行流程与上游流程的对照。
-- [scripts/spec/README.md](scripts/spec/README.md)：现行 SPECint2006 检查点流程（rv32imab、Linux 镜像、ref 输入），数据在 `~/personal/AI-Huma-data/spec-rv32imab`。
-- [docs/FRONTDOOR_RESTORE.md](docs/FRONTDOOR_RESTORE.md)：前门检查点恢复（rv32 与 rv64）。
-- [linux/README.md](linux/README.md)：Linux 镜像（rv32 与 rv64）。
-- `scripts/run_bbv.sh`、`scripts/run_ckpt.sh`：上游的裸机镜像批量脚本，**在仓库根目录运行**（里面的 `./a.out`、`./SimPoint/simpoint` 是相对根目录的路径）。
+- [docs/SPIKE_DIFFTEST.md](docs/SPIKE_DIFFTEST.md)：Spike 对拍构建、NFS 静态版与验证范围（rv64gc）。
+- [docs/SIMPOINT_SPECINT2006.md](docs/SIMPOINT_SPECINT2006.md)：SimPoint 原理，现行流程与上游流程对照。
+- [scripts/spec/README.md](scripts/spec/README.md)：早期 SPEC 检查点脚本说明（现行 rv64gc 535 点库位于集群 `/nfs_global/S/houruyao/spec06_rv64gc/`）。
+- [docs/FRONTDOOR_RESTORE.md](docs/FRONTDOOR_RESTORE.md)：前门检查点恢复（rv64gc 格式版本 5）。
+- [linux/README.md](linux/README.md)：Linux 镜像构建说明。
+- `scripts/run_bbv.sh`、`scripts/run_ckpt.sh`：上游裸机镜像批量脚本（须在仓库根目录运行）。
